@@ -284,6 +284,10 @@ func TestV4SymlinkAndHardLink(t *testing.T) {
 		t.Fatalf("READLINK of a file: status %d, want INVAL", s)
 	}
 
+	// Give the directory an old mtime so a link is observable on coarse clocks.
+	if err := os.Chtimes(fs.host(""), time.Unix(1, 0), time.Unix(1, 0)); err != nil {
+		t.Fatal(err)
+	}
 	link := []v4op{v4Root(), v4Look("target"), v4Save(), v4Root(), v4Link("hl")}
 	r = c.run(link...)
 	r.skip(op4PutRootFH, op4Lookup, op4SaveFH, op4PutRootFH)
