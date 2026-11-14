@@ -307,10 +307,20 @@ func cacheWriteRequest(f *leaseStateFixture, o *open, off uint64, data []byte) *
 	return &request{c: f.c, sess: f.sess, tree: f.tree, raw: raw, body: b}
 }
 
+// cacheTestFS returns a host filesystem for files handed to f's opens. The
+// connection's shutdown, which closes those files, runs before the directory
+// is removed: Windows refuses to delete files that are still open.
+func cacheTestFS(t *testing.T, f *leaseStateFixture) billy.Filesystem {
+	t.Helper()
+	fs := osfs.New(t.TempDir())
+	t.Cleanup(f.c.shutdown)
+	return fs
+}
+
 func cacheFixtureFile(t *testing.T, f *leaseStateFixture) (*open, *cacheTestFile) {
 	t.Helper()
 	o, _, _ := f.open("file", leaseStateArgs(52, 1, 7, 0))
-	file, err := osfs.New(t.TempDir()).OpenFile("file", os.O_CREATE|os.O_RDWR, 0600)
+	file, err := cacheTestFS(t, f).OpenFile("file", os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,7 +406,7 @@ func TestSMBWriteCacheBackendFailuresStayFenced(t *testing.T) {
 func TestSMBWriteCacheSharedLeaseConcurrentSeekWrites(t *testing.T) {
 	f := newLeaseStateFixture(t)
 	enableWriteCache(f.c.srv)
-	fs := osfs.New(t.TempDir())
+	fs := cacheTestFS(t, f)
 	var opens []*open
 	for range 2 {
 		o, _, _ := f.open("file", leaseStateArgs(52, 1, 7, 0))
@@ -622,9 +632,11 @@ func TestSMBWriteCacheOwnerOverwriteCreateKeepsLease(t *testing.T) {
 }
 
 func TestSMBWriteCacheDirectoryRenamePreservesOwnAndDrainsForeign(t *testing.T) {
+	// Lower files copy up into memory, so no host handle beneath parent
+	// blocks its rename, which Windows refuses.
 	fixture := startSMBWith(t, enableWriteCache, func(lower, upper string) {
-		putDiskFile(t, upper, "parent/own", "own")
-		putDiskFile(t, upper, "parent/foreign", "old")
+		putDiskFile(t, lower, "parent/own", "own")
+		putDiskFile(t, lower, "parent/foreign", "old")
 	})
 	owner, other := guestClient(t, fixture), guestClient(t, fixture)
 	key, foreignKey := [16]byte{84}, [16]byte{85}

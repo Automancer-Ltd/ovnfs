@@ -791,7 +791,11 @@ func TestOpenMigratesUnsortedIndex(t *testing.T) {
 	}
 	s.packs.mu.Unlock()
 	nextPack(t, s)
-	idx := s.packs.idxPath(0)
+	root := filepath.Dir(s.objects)
+	idxRel, err := filepath.Rel(root, s.packs.idxPath(0))
+	if err != nil {
+		t.Fatal(err)
+	}
 	pack, err := os.Stat(s.packs.packPath(0))
 	if err != nil {
 		t.Fatal(err)
@@ -817,10 +821,21 @@ func TestOpenMigratesUnsortedIndex(t *testing.T) {
 		if damaged {
 			data[3] ^= 1
 		}
+		// Each old index goes into a copy of the store, as a restarted
+		// process finds it: Windows cannot rewrite an index a live store
+		// (s, or the copy migrated before) still maps.
+		dir := t.TempDir()
+		if err := os.CopyFS(dir, os.DirFS(root)); err != nil {
+			t.Fatal(err)
+		}
+		idx := filepath.Join(dir, idxRel)
 		if err := os.WriteFile(idx, data, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		again := reopen(t, s)
+		again, err := Open(dir, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
 		for id, want := range bodies {
 			mustRead(t, again, id, want)
 		}

@@ -562,7 +562,20 @@ func TestOpenMigratesCaptureFiles(t *testing.T) {
 		}
 	}
 	reopen("index")
+	// The bases opened above keep the capture index mapped until they are
+	// unreachable, and Windows cannot remove or rewrite a mapped file; each
+	// older state goes into a copy no base has opened, as a restarted process
+	// finds it.
+	relocate := func() {
+		t.Helper()
+		dir := filepath.Join(t.TempDir(), "base")
+		if err := os.CopyFS(dir, os.DirFS(c.StateDir)); err != nil {
+			t.Fatal(err)
+		}
+		c.StateDir = dir
+	}
 
+	relocate()
 	legacy, err := json.Marshal(res)
 	if err != nil {
 		t.Fatal(err)
@@ -579,6 +592,7 @@ func TestOpenMigratesCaptureFiles(t *testing.T) {
 	}
 	reopen("after migration")
 
+	relocate()
 	if err := os.WriteFile(filepath.Join(c.StateDir, captureIndexFile), []byte(captureMagic+"truncated"), 0o600); err != nil {
 		t.Fatal(err)
 	}

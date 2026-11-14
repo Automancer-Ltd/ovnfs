@@ -89,8 +89,10 @@ func TestNodeIndexClosePartial(t *testing.T) {
 			if err := x.close(); err != nil {
 				t.Fatal(err)
 			}
+			// Closing again reports os.ErrClosed on every OS; Stat on
+			// Windows queries the stale handle instead.
 			for _, f := range files[:opened] {
-				if _, err := (*f).Stat(); !errors.Is(err, os.ErrClosed) {
+				if err := (*f).Close(); !errors.Is(err, os.ErrClosed) {
 					t.Fatalf("partial construction leaked a file: %v", err)
 				}
 			}
