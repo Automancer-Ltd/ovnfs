@@ -136,7 +136,7 @@ func TestStatusRowsShowMemoryError(t *testing.T) {
 		}
 		return -1, ""
 	}
-	rows := statusRows(api.Status{MemoryParked: 2, MemoryError: "no space left on device"})
+	rows := statusRows(api.Status{MemoryParked: 2, MemoryError: "no space left on device"}, "")
 	i, got := row(rows, "memory error")
 	if got != "2 parked: no space left on device" {
 		t.Fatalf("memory error row = %q", got)
@@ -144,7 +144,7 @@ func TestStatusRowsShowMemoryError(t *testing.T) {
 	if m, _ := row(rows, "memory"); i != m+1 {
 		t.Fatalf("memory error row at %d, memory row at %d", i, m)
 	}
-	if i, _ := row(statusRows(api.Status{}), "memory error"); i != -1 {
+	if i, _ := row(statusRows(api.Status{}, ""), "memory error"); i != -1 {
 		t.Fatal("memory error row shown with no parked file")
 	}
 }

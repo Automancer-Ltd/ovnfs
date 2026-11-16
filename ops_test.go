@@ -30,6 +30,21 @@ func TestOpsStatusAndEmptyLs(t *testing.T) {
 	if s := status.(api.Status); s.Version != protocolVersion || s.Port != 1234 || s.Proto != "nfs" {
 		t.Fatalf("status: %#v", s)
 	}
+	rawStatus, err := json.Marshal(status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Keep the wire protocol version numeric and the daemon's build separate.
+	var wire struct {
+		Version      int    `json:"version"`
+		BuildVersion string `json:"build_version"`
+	}
+	if err := json.Unmarshal(rawStatus, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire.Version != protocolVersion || wire.BuildVersion != processBuild.Version {
+		t.Fatalf("status wire versions: %s", rawStatus)
+	}
 	list, err := h.Call(context.Background(), "ls", json.RawMessage(`{}`))
 	if err != nil {
 		t.Fatal(err)

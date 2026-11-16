@@ -139,18 +139,26 @@ type build struct {
 	Arch    string `json:"arch"`
 }
 
+// processBuild identifies this process even after its executable is replaced.
+var processBuild = readBuild()
+
+// readBuild reads the module, toolchain and platform stamped into this binary.
+func readBuild() build {
+	b := build{Version: "(devel)", Go: runtime.Version(), OS: runtime.GOOS, Arch: runtime.GOARCH}
+	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" {
+		b.Version = bi.Main.Version
+	}
+	return b
+}
+
 // versionCmd prints this binary's build on one line, or as JSON under --json.
 type versionCmd struct{}
 
 func (cmd *versionCmd) Run(c *cli) error {
 	c.autostart = false
-	b := build{Version: "(devel)", Go: runtime.Version(), OS: runtime.GOOS, Arch: runtime.GOARCH}
-	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" {
-		b.Version = bi.Main.Version
-	}
 	if c.json {
-		return json.NewEncoder(stdout).Encode(b)
+		return json.NewEncoder(stdout).Encode(&processBuild)
 	}
-	fmt.Fprintf(stdout, "ovnfs %s %s %s/%s\n", b.Version, b.Go, b.OS, b.Arch)
+	fmt.Fprintf(stdout, "ovnfs %s %s %s/%s\n", processBuild.Version, processBuild.Go, processBuild.OS, processBuild.Arch)
 	return nil
 }
