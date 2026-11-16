@@ -49,6 +49,13 @@ const lockFile = "lock.json"
 // gcGrace protects objects written by work still in flight from a concurrent store sweep.
 const gcGrace = time.Hour
 
+// openSlots bounds the persisted checkouts Open opens at once. Opening one
+// mostly walks its upper on disk, so the bound does not follow GOMAXPROCS.
+const openSlots = 8
+
+// openOverlay opens a checkout's overlay; tests replace it to observe Open.
+var openOverlay = overlay.New
+
 // Open restores the registry and reconciles durable filesystem mutation intents.
 func Open(c Config) (*Registry, error) {
 	if !filepath.IsAbs(c.State) || !filepath.IsAbs(c.Mount) {
@@ -159,36 +166,9 @@ func Open(c Config) (*Registry, error) {
 		r.layers[disk.ID] = &layerRecord{id: disk.ID, base: disk.Base, layer: layer, portable: disk.Portable, embedded: embedded}
 	}
 	phase(fmt.Sprintf("%d layers", len(d.Layers)))
-	for _, disk := range d.Checkouts {
-		b := r.bases[disk.Base]
-		if b == nil {
-			cleanup()
-			return nil, failure("io", "checkout %s references missing base %s", disk.Name, disk.Base)
-		}
-		stack, stackErr := r.layerStackLocked(disk.Stack, disk.Base)
-		if stackErr != nil {
-			cleanup()
-			return nil, coded(stackErr)
-		}
-		upper := r.upperPath(disk.dir())
-		if disk.Git {
-			if err := git.MarkCheckout(r.gitdirPath(disk.dir()), disk.Name); err != nil {
-				cleanup()
-				return nil, coded(err)
-			}
-		}
-		fs, openErr := overlay.New(upper, stack, b.view.Bottom(disk.Created), r.config.Memory)
-		if openErr != nil {
-			cleanup()
-			return nil, coded(openErr)
-		}
-		h := &checkoutRecord{meta: disk.checkoutMeta, base: b, stack: append([]string{}, disk.Stack...), upper: upper, fs: fs}
-		h.generation.Store(1)
-		if !disk.Wrote.IsZero() {
-			h.wrote.Store(disk.Wrote.UnixNano())
-		}
-		r.checkouts[disk.Name] = h
-		r.retainLocked(b, h.stack)
+	if err = r.openCheckouts(d.Checkouts); err != nil {
+		cleanup()
+		return nil, coded(err)
 	}
 	phase(fmt.Sprintf("%d checkouts", len(d.Checkouts)))
 	for _, disk := range d.Snapshots {
@@ -293,6 +273,62 @@ func (r *Registry) openBases(metas []base.Meta) error {
 	}
 	for i, meta := range metas {
 		r.bases[meta.ID] = records[i]
+	}
+	return nil
+}
+
+// openCheckouts restores the persisted checkouts into r.checkouts. Opening one
+// indexes its whole upper, which dominates the restore of many checkouts, so
+// up to openSlots open at once; the records then land in disks' order. It
+// returns the first error in disks' order, after every open has ended.
+func (r *Registry) openCheckouts(disks []diskCheckout) error {
+	type pending struct {
+		base  *baseRecord
+		stack []*overlay.Layer
+		upper string
+	}
+	plan := make([]pending, len(disks))
+	for i, disk := range disks {
+		b := r.bases[disk.Base]
+		if b == nil {
+			return failure("io", "checkout %s references missing base %s", disk.Name, disk.Base)
+		}
+		stack, err := r.layerStackLocked(disk.Stack, disk.Base)
+		if err != nil {
+			return err
+		}
+		plan[i] = pending{base: b, stack: stack, upper: r.upperPath(disk.dir())}
+	}
+	fss := make([]*overlay.FS, len(disks))
+	errs := make([]error, len(disks))
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for range min(len(disks), openSlots) {
+		wg.Go(func() {
+			for i := next.Add(1) - 1; i < int64(len(disks)); i = next.Add(1) - 1 {
+				disk, p := disks[i], plan[i]
+				if disk.Git {
+					if errs[i] = git.MarkCheckout(r.gitdirPath(disk.dir()), disk.Name); errs[i] != nil {
+						continue
+					}
+				}
+				fss[i], errs[i] = openOverlay(p.upper, p.stack, p.base.view.Bottom(disk.Created), r.config.Memory)
+			}
+		})
+	}
+	wg.Wait()
+	if err := cmp.Or(errs...); err != nil {
+		return err
+	}
+	for i, disk := range disks {
+		p := plan[i]
+		h := &checkoutRecord{meta: disk.checkoutMeta, base: p.base, stack: append([]string{}, disk.Stack...), upper: p.upper, fs: fss[i]}
+		h.generation.Store(1)
+		if !disk.Wrote.IsZero() {
+			h.wrote.Store(disk.Wrote.UnixNano())
+		}
+		r.checkouts[disk.Name] = h
+		r.retainLocked(p.base, h.stack)
 	}
 	return nil
 }

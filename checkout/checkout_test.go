@@ -78,15 +78,20 @@ func newFixture(t *testing.T) *fixture {
 	return f
 }
 
-// open (re)opens the registry on the fixture's state.
-func (f *fixture) open() {
-	f.t.Helper()
-	reg, err := Open(Config{State: f.state, Mount: f.mount, Node: "n_" + filepath.Base(filepath.Dir(f.state)), Memory: overlay.NewMemory(64<<20, 1<<20, 0), BlobCache: 64 << 20, GitRemotes: f.gitRemotes,
+// config is the registry configuration of the fixture's state.
+func (f *fixture) config() Config {
+	return Config{State: f.state, Mount: f.mount, Node: "n_" + filepath.Base(filepath.Dir(f.state)), Memory: overlay.NewMemory(64<<20, 1<<20, 0), BlobCache: 64 << 20, GitRemotes: f.gitRemotes,
 		Invalidate: func(checkout string, paths, trees []string) {
 			f.mu.Lock()
 			f.invalidated = append(f.invalidated, invalidation{checkout: checkout, paths: slices.Clone(paths), trees: slices.Clone(trees)})
 			f.mu.Unlock()
-		}})
+		}}
+}
+
+// open (re)opens the registry on the fixture's state.
+func (f *fixture) open() {
+	f.t.Helper()
+	reg, err := Open(f.config())
 	if err != nil {
 		f.t.Fatal(err)
 	}
