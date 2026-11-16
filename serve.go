@@ -215,6 +215,7 @@ func (cmd *serveCmd) Run(c *cli) (err error) {
 	}
 	defer adminListener.Close()
 	adminServer := admin.NewServer()
+	adminServer.Logf = log.Printf
 	served := make(chan error, 2)
 	go func() {
 		served <- fmt.Errorf("admin serve: %w", adminServer.Serve(adminListener))
