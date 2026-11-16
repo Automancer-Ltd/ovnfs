@@ -293,7 +293,9 @@ Written files start in memory, not in the upper: new and truncated files, and
 files of at most 256 KiB copied up for writing, share one budget across all
 checkouts (`--memory`, default 64 MiB). A file moves into its upper once it has been left
 untouched for 2 s, when it outgrows 256 KiB, when newer files need the budget
-(least recently used first), before a hard link, `chown` or lock, and before
+(least recently used first), before a hard link, `chown` or lock, before a
+rename over a file already in the upper (so the host rename replaces the old
+copy atomically), and before
 `snap`, `fork`, `diff` and a planned stop, which therefore cost one host create
 per file written in the last 2 s; files deleted sooner never reach the disk.
 Directories, symlinks and whiteouts always live in the upper. A deleted name
