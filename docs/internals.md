@@ -388,7 +388,13 @@ closed files. Removing a directory logs the removal without paging in its cold
 subtree: a record is only paged in under a
 parent that still names it, so its descendants stop resolving at once, and
 their owner indexes are discounted from the live index size a batch per
-operation. A record that cannot be read or contradicts its parent latches the
+operation. A node moved out of a directory keeps the id derived from it, and
+stays reachable after that directory is removed: the table maps each such
+stray id to its holder's key, drops the entry once the holder is removed or no
+longer holds the id, so that it never names another path, and a clean close
+saves the map as `strays` in the index directory. An index without that file
+predates the map, so the next start rebuilds it from the log, which recovers
+the strays. A record that cannot be read or contradicts its parent latches the
 identity fault below; a failed record write backs off like a failed spill.
 
 The index lives in an instance directory below `STATE/nodes.log.cache`, on
@@ -401,7 +407,8 @@ retired hashes still only in memory are appended to the pack in one write, the
 record of every resident logged node that changed since it paged in, the
 root's included, is appended to `records`, and every slot whose record or
 owner index moved is rewritten in place; spills and evictions rewrote theirs
-already. Closing thus writes two files whatever the number of directories.
+already. The strays replace their file through a synced temporary file.
+Closing thus writes three files whatever the number of directories.
 Close then flushes the index files, the pack, trimmed to what was appended, and
 their directories, in parallel, and only then writes the manifest
 `nodes.log.cache/owners` durably: the identity log's size, its size when last
