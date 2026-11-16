@@ -503,15 +503,15 @@ func (l *Layer) RemoveMetadata() error {
 	if err != nil {
 		return err
 	}
-	at := l.dir
+	at, raw := l.dir, false
 	if info.IsDir() {
-		l.prune()
+		raw = l.prune()
 		at = filepath.Join(l.dir, manifestName)
 	}
 	if err := os.Remove(at); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
-	if info.IsDir() {
+	if info.IsDir() && !raw {
 		// Stored-only layers can have an empty directory after interrupted cleanup.
 		_ = os.Remove(l.dir)
 	}
@@ -577,14 +577,16 @@ func (l *Layer) load(i int, me manifestEntry, links map[int]uint64) error {
 // prune removes from the layer directory every raw file the manifest makes
 // redundant (stored content, whiteout and opaque markers) and the directories
 // left empty, keeping raw entries. It is best effort: what cannot be removed now
-// (a file open on Windows) is retried when the layer is next opened.
-func (l *Layer) prune() {
+// (a file open on Windows) is retried when the layer is next opened. It reports
+// whether the layer still holds raw entries.
+func (l *Layer) prune() bool {
 	l.mu.RLock()
 	ids := l.ids
 	l.mu.RUnlock()
 	_ = os.Remove(filepath.Join(l.dir, originsName))
 	_ = os.Remove(filepath.Join(l.dir, originsName+".tmp"))
 	var dirs []string
+	held := make(map[string]bool) // directories holding a raw entry, the root included
 	_ = l.Walk(func(p string, e Entry) error {
 		host := filepath.Join(l.dir, filepath.FromSlash(p))
 		switch e.Kind {
@@ -597,19 +599,31 @@ func (l *Layer) prune() {
 				_ = os.Remove(filepath.Join(host, opaqueName))
 			}
 			if p != "" {
-				dirs = append(dirs, host)
+				dirs = append(dirs, p)
 			}
 		case KindWhiteout:
 			_ = os.Remove(filepath.Join(l.dir, filepath.FromSlash(parent(p)), whPrefix+path.Base(p)))
 		default:
 			if _, ok := ids[p]; ok {
 				_ = os.Remove(host)
+				return nil
+			}
+			for d := parent(p); !held[d]; d = parent(d) {
+				held[d] = true
+				if d == "" {
+					break
+				}
 			}
 		}
 		return nil
 	})
-	// Children follow their parents in walk order; a directory still holding a raw entry stays.
+	// Children follow their parents in walk order. A directory holding a raw
+	// entry is not even tried: macOS rmdir(2) also removes a directory that
+	// holds only AppleDouble "._" files, deleting them with it.
 	for i := len(dirs) - 1; i >= 0; i-- {
-		_ = os.Remove(dirs[i])
+		if !held[dirs[i]] {
+			_ = os.Remove(filepath.Join(l.dir, filepath.FromSlash(dirs[i])))
+		}
 	}
+	return held[""]
 }

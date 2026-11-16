@@ -705,6 +705,38 @@ func TestStoredLayerKeepsOnlyRawLeftovers(t *testing.T) {
 	check()
 }
 
+// TestStoredLayerKeepsAppleDoubleSidecars checks that the AppleDouble sidecars
+// a macOS NFS client writes for xattrs, which stay raw, remain readable once
+// their snapshot's layer is stored, before and after a restart, though every
+// other file in their directories moved to the store: macOS rmdir(2) removes a
+// directory holding only "._" files, deleting them with it (issue #60).
+func TestStoredLayerKeepsAppleDoubleSidecars(t *testing.T) {
+	f := newFixture(t)
+	f.newCheckout(folder(t, map[string]string{"file.txt": "base", "d/x": "base"}), "c")
+	f.put("c", "file.txt", "rewritten")
+	f.put("c", "d/x", "rewritten")
+	sidecar := strings.Repeat("A", 4096)
+	sidecars := []string{"._file.txt", "d/._x"}
+	for _, p := range sidecars {
+		f.put("c", p, sidecar)
+	}
+	f.snapLayer("c")
+	check := func() {
+		t.Helper()
+		for _, p := range sidecars {
+			if got := f.read("c", p); got != sidecar {
+				t.Fatalf("%s reads %q, want %d bytes", p, got, len(sidecar))
+			}
+		}
+	}
+	check()
+	if err := f.reg.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.open()
+	check()
+}
+
 // TestRestartStoresHashedRawLayers checks that a layer left raw after its
 // snapshot was hashed (a stop or crash before storing it) is stored once the
 // registry opens again.
