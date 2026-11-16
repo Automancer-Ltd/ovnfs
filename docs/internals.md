@@ -296,10 +296,18 @@ untouched for 2 s, when it outgrows 256 KiB, when newer files need the budget
 (least recently used first), before a hard link, `chown` or lock, and before
 `snap`, `fork`, `diff` and a planned stop, which therefore cost one host create
 per file written in the last 2 s; files deleted sooner never reach the disk.
-Directories, symlinks and whiteouts always live in the upper. With
+Directories, symlinks and whiteouts always live in the upper. A deleted name
+keeps its whiteout on disk until the new memory file at that name spills. With
 `--fsync` enabled, syncing a named memory file also spills and syncs it;
 the default leaves it in memory. NFS does not forward application fsync calls.
 This sync does not include the parent directory or snapshot data.
+
+When a file's write to disk fails (a full disk, say), the file stays in memory
+and the daemon retries it every second. While any file waits, new files go to
+disk, so a full disk fails the next write at the client instead of growing
+what only memory holds. The daemon logs the first failure of each checkout,
+and `ovnfs status` shows a `memory error` row with the waiting count and the
+latest error.
 
 The 256 KiB limit keeps a build's small short-lived files (cargo fingerprints,
 dep-info files, temporary files, most rlibs) in memory, while large outputs

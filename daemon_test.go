@@ -10,6 +10,7 @@ import (
 
 	"github.com/charmbracelet/colorprofile"
 	"github.com/stencil-hq/ovnfs/admin"
+	"github.com/stencil-hq/ovnfs/api"
 )
 
 // TestMain answers a spawned `serve` by exiting, so a startDaemon that spawns
@@ -121,5 +122,29 @@ func TestStopWaitsForTheStartLock(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "not running") {
 		t.Fatalf("stop printed %q, want not running", out.String())
+	}
+}
+
+// TestStatusRowsShowMemoryError shows parked memory files right after the
+// memory row, and no row while none waits.
+func TestStatusRowsShowMemoryError(t *testing.T) {
+	row := func(rows [][2]string, label string) (int, string) {
+		for i, r := range rows {
+			if r[0] == label {
+				return i, r[1]
+			}
+		}
+		return -1, ""
+	}
+	rows := statusRows(api.Status{MemoryParked: 2, MemoryError: "no space left on device"})
+	i, got := row(rows, "memory error")
+	if got != "2 parked: no space left on device" {
+		t.Fatalf("memory error row = %q", got)
+	}
+	if m, _ := row(rows, "memory"); i != m+1 {
+		t.Fatalf("memory error row at %d, memory row at %d", i, m)
+	}
+	if i, _ := row(statusRows(api.Status{}), "memory error"); i != -1 {
+		t.Fatal("memory error row shown with no parked file")
 	}
 }

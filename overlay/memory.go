@@ -56,12 +56,19 @@ type Memory struct {
 	// synced. Set before sharing the budget with any overlay.
 	SyncOnFsync bool
 
+	// Logf reports the first failed spill of each overlay; nil is silent.
+	// Set before sharing the budget with any overlay.
+	Logf func(format string, args ...any)
+
 	limit, fileMax int64
 	idle           time.Duration
+	retryEvery     time.Duration // period of the writeback retry of parked files
 
 	mu      sync.Mutex
 	used    int64
 	lru     list.List // *memFile, most recently used first
+	parked  list.List // *memFile whose spill failed, oldest first
+	lastErr error     // the latest spill failure of a parked file
 	writing bool      // the writeback worker runs
 }
 
@@ -69,42 +76,91 @@ type Memory struct {
 // bytes, writing back files untouched for idle (0 keeps them until memory
 // pressure or [FS.Flush]).
 func NewMemory(limit, fileMax int64, idle time.Duration) *Memory {
-	return &Memory{limit: limit, fileMax: min(fileMax, limit), idle: idle}
+	return &Memory{limit: limit, fileMax: min(fileMax, limit), idle: idle, retryEvery: time.Second}
 }
 
 // writeback spills files left untouched for the idle age, oldest first, so
-// snapshots and crashes find only recent files in memory. It exits once no
-// file is waiting; admit restarts it.
+// snapshots and crashes find only recent files in memory, and retries parked
+// files every retryEvery. With idle 0 it retries parked files only. It exits
+// once no file is waiting; admit and park restart it.
 func (mem *Memory) writeback() {
+	var retryAt time.Time
 	for {
 		mem.mu.Lock()
-		e := mem.lru.Back()
-		if e == nil {
+		if mem.parked.Len() > 0 && !time.Now().Before(retryAt) {
+			files := make([]*memFile, 0, mem.parked.Len())
+			for e := mem.parked.Front(); e != nil; e = e.Next() {
+				files = append(files, e.Value.(*memFile))
+			}
+			mem.mu.Unlock()
+			for _, m := range files {
+				m.owner.writeBack(m)
+			}
+			retryAt = time.Now().Add(mem.retryEvery)
+			continue
+		}
+		var wait time.Duration
+		if e := mem.lru.Back(); mem.idle > 0 && e != nil {
+			m := e.Value.(*memFile)
+			if wait = mem.idle - time.Since(m.touched); wait <= 0 {
+				mem.mu.Unlock()
+				m.owner.writeBack(m)
+				continue
+			}
+		} else if mem.parked.Len() == 0 {
 			mem.writing = false
 			mem.mu.Unlock()
 			return
 		}
-		m := e.Value.(*memFile)
-		if wait := mem.idle - time.Since(m.touched); wait > 0 {
-			mem.mu.Unlock()
-			time.Sleep(wait)
-			continue
+		if mem.parked.Len() > 0 {
+			if r := time.Until(retryAt); wait == 0 || r < wait {
+				wait = r
+			}
 		}
-		owner := m.owner
 		mem.mu.Unlock()
-		owner.writeBack(m)
+		time.Sleep(wait)
 	}
 }
 
-// park takes m out of the LRU after a failed spill, keeping its charge, so
-// eviction and writeback stop retrying it; its next write or [FS.Flush] tries again.
-func (mem *Memory) park(m *memFile) {
+// park moves m from the LRU to the parked list after its spill failed with
+// err, keeping its charge: eviction skips it, the writeback worker retries it
+// every retryEvery, and admit refuses new files until it leaves. The first
+// failure of each overlay is logged. A file that already left its overlay's
+// namespace is ignored. The caller holds m.owner.mu.
+func (mem *Memory) park(m *memFile, err error) {
+	f := m.owner
+	if f.files[m.path] != m {
+		return
+	}
 	mem.mu.Lock()
 	if m.elem != nil {
 		mem.lru.Remove(m.elem)
 		m.elem = nil
 	}
+	if m.pelem == nil {
+		m.pelem = mem.parked.PushBack(m)
+	}
+	mem.lastErr = err
+	if !mem.writing {
+		mem.writing = true
+		go mem.writeback()
+	}
+	logf := mem.Logf
 	mem.mu.Unlock()
+	if logf != nil && f.spillLogged.CompareAndSwap(false, true) {
+		logf("overlay %s: keeping a file in memory after its write to disk failed, retrying: %v", f.upper, err)
+	}
+}
+
+// Parked reports how many files wait in memory after a failed spill and the
+// latest failure, or 0 and "" when none waits.
+func (mem *Memory) Parked() (n int, err string) {
+	mem.mu.Lock()
+	defer mem.mu.Unlock()
+	if mem.parked.Len() == 0 {
+		return 0, ""
+	}
+	return mem.parked.Len(), mem.lastErr.Error()
 }
 
 // Usage reports the bytes charged to memory files and the budget's limit.
@@ -132,12 +188,19 @@ func (mem *Memory) uncharge(m *memFile, n int64) {
 	mem.mu.Unlock()
 }
 
-// release returns m's whole charge and forgets its LRU position.
+// release returns m's whole charge and forgets its LRU or parked position.
 func (mem *Memory) release(m *memFile) {
 	mem.mu.Lock()
 	if m.elem != nil {
 		mem.lru.Remove(m.elem)
 		m.elem = nil
+	}
+	if m.pelem != nil {
+		mem.parked.Remove(m.pelem)
+		m.pelem = nil
+		if mem.parked.Len() == 0 {
+			mem.lastErr = nil
+		}
 	}
 	mem.used -= m.charged
 	m.charged = 0
@@ -181,6 +244,7 @@ type memFile struct {
 	handles             map[*memHandle]struct{}
 	version             uint64        // counts changes of data and metadata, see [FS.writeBack]
 	elem                *list.Element // LRU position while named; guarded by Memory.mu
+	pelem               *list.Element // parked position after a failed spill; guarded by Memory.mu
 	touched             time.Time     // last open or write; guarded by Memory.mu
 	charged             int64
 }
@@ -239,12 +303,17 @@ func (i memInfo) Sys() any { return memStat(i) }
 
 // admit charges n more bytes to m, linking it into the budget's LRU, after
 // spilling least recently used files while the budget is exhausted. It reports
-// false when nothing more can spill; the caller then keeps the data on disk.
-// The caller holds f.mu.
+// false when nothing more can spill, or while any file is parked so no new
+// data joins memory that may not reach the disk; the caller then keeps the
+// data on disk. The caller holds f.mu.
 func (f *FS) admit(m *memFile, n int64) bool {
 	mem := f.mem
 	for {
 		mem.mu.Lock()
+		if mem.parked.Len() > 0 {
+			mem.mu.Unlock()
+			return false
+		}
 		if mem.used+n <= mem.limit {
 			mem.used += n
 			m.charged += n
@@ -269,7 +338,7 @@ func (f *FS) admit(m *memFile, n int64) bool {
 		owner := v.owner
 		err := owner.spill(v)
 		if err != nil {
-			mem.park(v)
+			mem.park(v, err)
 		}
 		if owner != f {
 			owner.mu.Unlock()
@@ -282,22 +351,19 @@ func (f *FS) admit(m *memFile, n int64) bool {
 
 // addMem publishes p as a memory file holding data, leaving the parent's
 // mtime to the caller: a new name stamps it ([FS.touchDir]), a copy-up keeps
-// it. It returns nil without error when the budget refuses the file. The
-// caller ensured p's parent exists in upper and p has no upper entry.
-func (f *FS) addMem(p string, mode os.FileMode, mtime time.Time, data []byte) (*memFile, error) {
+// it. A deletion marker at p stays on disk until the file spills. It returns
+// nil when the budget refuses the file. The caller ensured p's parent exists
+// in upper and p has no upper entry.
+func (f *FS) addMem(p string, mode os.FileMode, mtime time.Time, data []byte) *memFile {
 	now := time.Now()
 	m := &memFile{owner: f, path: p, data: data, mode: mode & memModeBits, atime: mtime, mtime: mtime, ctime: now, created: now, ino: memInodes.Add(1), handles: make(map[*memHandle]struct{})}
 	m.uid, m.gid = newOwner(f.index.entries[parent(p)].Info)
 	if !f.admit(m, fileOverhead+int64(cap(data))) {
-		return nil, nil
-	}
-	if err := f.clearWhiteout(p); err != nil {
-		f.mem.release(m)
-		return nil, err
+		return nil
 	}
 	f.files[p] = m
 	f.index.set(p, Entry{Kind: KindFile, Info: m.info(path.Base(p))})
-	return m, nil
+	return m
 }
 
 // copyUpMem copies a small immutable regular file into memory, reporting false
@@ -320,8 +386,7 @@ func (f *FS) copyUpMem(s source, p string, info os.FileInfo) (bool, error) {
 	if err != nil || int64(len(data)) > f.mem.fileMax {
 		return false, err
 	}
-	m, err := f.addMem(p, info.Mode(), info.ModTime(), data)
-	return m != nil, err
+	return f.addMem(p, info.Mode(), info.ModTime(), data) != nil, nil
 }
 
 // readBounded reads r, sized for about size bytes, stopping once it holds more
@@ -395,8 +460,8 @@ func (f *FS) truncateMem(m *memFile, size int64) (bool, error) {
 	return true, nil
 }
 
-// writeBack spills m for the writeback worker if it is still waiting in
-// memory and still idle. A file without open handles is staged from a copy
+// writeBack spills m for the writeback worker if it is parked, or still
+// waiting in memory and still idle. A file without open handles is staged from a copy
 // without f.mu, so the checkout's lookups and opens go on during the host
 // create, write and close (milliseconds where Windows Defender scans new
 // files); it replaces m only if m did not change meanwhile, else a later
@@ -406,15 +471,15 @@ func (f *FS) writeBack(m *memFile) {
 	defer f.staging.RUnlock()
 	f.mu.Lock()
 	f.mem.mu.Lock()
-	due := m.elem != nil && time.Since(m.touched) >= f.mem.idle
+	due := m.pelem != nil || m.elem != nil && time.Since(m.touched) >= f.mem.idle
 	f.mem.mu.Unlock()
 	if !due {
 		f.mu.Unlock()
 		return
 	}
 	if len(m.handles) != 0 {
-		if f.spill(m) != nil {
-			f.mem.park(m)
+		if err := f.spill(m); err != nil {
+			f.mem.park(m, err)
 		}
 		f.mu.Unlock()
 		return
@@ -430,15 +495,15 @@ func (f *FS) writeBack(m *memFile) {
 		p := m.path
 		err = f.preserveDirTime(parent(p), func() error { return hostfile.Rename(tmp, f.up(p)) })
 		if err == nil {
-			if f.installed(m, nil) != nil {
-				f.mem.park(m)
+			if err := f.installed(m, nil); err != nil {
+				f.mem.park(m, err)
 			}
 			return
 		}
 	}
 	os.Remove(tmp)
 	if err != nil {
-		f.mem.park(m)
+		f.mem.park(m, err)
 	}
 }
 
@@ -475,12 +540,13 @@ func (f *FS) spill(m *memFile) error {
 }
 
 // installed retires memory file m once its staged copy holds its name in the
-// upper, handing each open handle its staged descriptor. The caller holds f.mu.
+// upper, then drops the deletion marker the name kept while in memory, and
+// hands each open handle its staged descriptor. The caller holds f.mu.
 func (f *FS) installed(m *memFile, fds map[*memHandle]*os.File) error {
 	p := m.path
 	delete(f.files, p)
 	f.mem.release(m)
-	err := f.refresh(p)
+	err := errors.Join(f.clearWhiteout(p), f.refresh(p))
 	for h, fd := range fds {
 		h.disk = f.adopt(&file{File: fd, name: h.name, writable: writable(h.flag)})
 		f.bind(h.disk, p)

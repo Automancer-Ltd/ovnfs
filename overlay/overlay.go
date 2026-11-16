@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -47,6 +48,7 @@ type FS struct {
 	hosts       map[*file]struct{}  // open descriptors of upper files, see [FS.CloseFiles]
 	writers     map[inodeKey]int    // open writable descriptors per upper inode, see [FS.upperInfo]
 	staging     sync.RWMutex        // shared by an unlocked writeback, see [FS.writeBack]
+	spillLogged atomic.Bool         // the first failed spill is logged, see [Memory.park]
 }
 
 // Filesystem interface assertions keep the overlay compatible with protocols.
@@ -588,10 +590,10 @@ retry:
 	if p == "" || reserved(p) {
 		return nil, &fs.PathError{Op: "open", Path: name, Err: syscall.EPERM}
 	}
-	// startMem makes p an empty memory file; nil without error means disk.
-	startMem := func(mode os.FileMode) (*memFile, error) {
+	// startMem makes p an empty memory file; nil means disk.
+	startMem := func(mode os.FileMode) *memFile {
 		if f.mem == nil {
-			return nil, nil
+			return nil
 		}
 		return f.addMem(p, mode, time.Now(), nil)
 	}
@@ -605,10 +607,7 @@ retry:
 				if err := f.ensureDir(parent(p)); err != nil {
 					return nil, err
 				}
-				if m, err := startMem(info.Mode().Perm()); m != nil || err != nil {
-					if err != nil {
-						return nil, err
-					}
+				if m := startMem(info.Mode().Perm()); m != nil {
 					return f.openMem(m, original, flag)
 				}
 				err := f.preserveDirTime(parent(p), func() error {
@@ -655,10 +654,7 @@ retry:
 		if err := f.ensureDir(parent(p)); err != nil {
 			return nil, err
 		}
-		if m, err := startMem(perm & memModeBits &^ umask); m != nil || err != nil {
-			if err != nil {
-				return nil, err
-			}
+		if m := startMem(perm & memModeBits &^ umask); m != nil {
 			// A new name changes the parent like a host create; the creating open skips the permission check.
 			if err := f.touchDir(parent(p)); err != nil {
 				return nil, err
@@ -1020,14 +1016,17 @@ func (f *FS) Rename(from, to string) error {
 		}
 		f.dropIndex(dst)
 	}
-	// A memory file moves only in the index; it replaces a host file by unlinking it.
+	// A memory file over an upper file on disk spills first, so the host
+	// rename replaces the old copy atomically and a crash finds one of the two.
+	if m := f.files[src]; m != nil && derr == nil && ds.upper && !dinfo.IsDir() && f.files[dst] == nil {
+		if err := f.spill(m); err != nil {
+			return err
+		}
+	}
+	// Any other memory file moves only in the index.
 	srcMem := f.files[src] != nil
 	if !srcMem {
 		if err := hostfile.Rename(f.up(src), f.up(dst)); err != nil {
-			return err
-		}
-	} else if derr == nil && ds.upper && f.files[dst] == nil {
-		if err := hostfile.Remove(f.up(dst)); err != nil {
 			return err
 		}
 	}
@@ -1059,7 +1058,10 @@ func (f *FS) Rename(from, to string) error {
 	if sinfo.IsDir() {
 		err = f.placeDir(dst, true)
 	} else {
-		err = f.clearWhiteout(dst)
+		// A memory file keeps the marker until it spills ([FS.installed]).
+		if f.files[dst] == nil {
+			err = f.clearWhiteout(dst)
+		}
 		if err == nil {
 			err = f.refresh(dst)
 		}
@@ -1359,9 +1361,8 @@ func (f *FS) copyUpBottomForOpen(p string, info os.FileInfo) (bool, error) {
 		}
 		if inMemory {
 			if int64(len(data)) <= f.mem.fileMax {
-				m, err := f.addMem(p, info.Mode(), info.ModTime(), data)
-				if m != nil || err != nil {
-					return false, err
+				if f.addMem(p, info.Mode(), info.ModTime(), data) != nil {
+					return false, nil
 				}
 			}
 			inMemory = false
