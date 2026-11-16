@@ -415,11 +415,23 @@ func (cmd *statusCmd) Run(c *cli) error {
 	if err != nil || c.json {
 		return err
 	}
+	printStatus(stdout, stderr, &st, processBuild.Version)
+	return nil
+}
+
+// printStatus reports both processes' builds without treating a difference as a failure.
+func printStatus(out, warnings io.Writer, st *api.Status, clientVersion string) {
 	transport := st.Proto + ":" + fmt.Sprint(st.Port) // protocol and file-server port, not a dialable address
 	if st.Proto == "nfs" && st.Port == 0 {
 		transport = st.Proto + ":" + nfsSocket(st.State)
 	}
+	daemonVersion := st.BuildVersion
+	if daemonVersion == "" {
+		daemonVersion = "unknown"
+	}
 	rows := [][2]string{
+		{"daemon", daemonVersion},
+		{"client", clientVersion},
 		{"pid", fmt.Sprint(st.PID)},
 		{"uptime", (time.Duration(st.Uptime * float64(time.Second))).Round(time.Second).String()},
 		{"proto", transport},
@@ -443,7 +455,12 @@ func (cmd *statusCmd) Run(c *cli) error {
 		rows = append(rows, [2]string{"node cache error", st.NodeCacheError})
 	}
 	for _, row := range rows {
-		fmt.Fprintf(stdout, "%s%s%s\n", paint(stdout, styleDim, row[0]), strings.Repeat(" ", max(2, 12-len(row[0]))), row[1])
+		fmt.Fprintf(out, "%s%s%s\n", paint(out, styleDim, row[0]), strings.Repeat(" ", max(2, 12-len(row[0]))), row[1])
 	}
-	return nil
+	if st.BuildVersion != "" && st.BuildVersion != "(devel)" &&
+		clientVersion != "" && clientVersion != "(devel)" && st.BuildVersion != clientVersion {
+		fmt.Fprintf(warnings, "%s daemon %s differs from CLI %s; "+
+			"'ovnfs restart' with the same --state/--mount options uses this CLI's version\n",
+			paint(warnings, styleYellow, "warning:"), st.BuildVersion, clientVersion)
+	}
 }

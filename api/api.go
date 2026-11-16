@@ -48,9 +48,11 @@ type Rule struct {
 	Origin string `json:"origin"` // "builtin:3", ".o2/ovnfs.yml:6", "flag"
 }
 
-// Status describes the running daemon.
+// Status describes the running daemon. Version is the admin protocol generation;
+// BuildVersion is the daemon's module version, not the CLI's.
 type Status struct {
 	Version        int     `json:"version"`
+	BuildVersion   string  `json:"build_version,omitempty"`
 	PID            int     `json:"pid"`
 	Uptime         float64 `json:"uptime_s"`
 	Proto          string  `json:"proto"`

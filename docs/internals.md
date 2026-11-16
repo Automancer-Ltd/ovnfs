@@ -36,6 +36,16 @@ raw reply, `restart` the new daemon's status and `version` its build
 the socket owner's uid (on Windows, the same user SID) may
 connect, on this socket and on the link socket.
 
+In `status`, `version` remains the integer admin protocol generation;
+`build_version` is the running daemon's module version, read from its own build
+information. Replacing the binary on disk does not change the daemon's build.
+Human-readable status shows both daemon and client versions. Different known
+versions produce a warning on stderr, without failing or restarting the daemon;
+`ovnfs restart` with the same `--state` and `--mount` options uses the invoking
+binary. Older daemons without this field show `unknown`; missing versions and
+`(devel)` builds are not compared. `--json status` stays the daemon's raw reply,
+without a client version or warning mixed into it.
+
 `grep` and `glob` use the shapes in [`api/search.go`](../api/search.go).
 For example, `ovnfs ctl grep '{"checkout":"app","pattern":"TODO","glob":"*.go"}'`
 searches the live merged checkout without reading through the mount. A `dir`
