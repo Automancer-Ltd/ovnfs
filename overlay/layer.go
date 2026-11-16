@@ -102,7 +102,10 @@ func walkLayer(dir string, live, recursive bool, listing string) (*Layer, error)
 			}
 			return nil
 		}
-		info, err := item.Info()
+		// Not item.Info(): on Windows that is the copy NTFS keeps in the parent's
+		// listing, which lags the file's own record (a grown directory lists size
+		// 0), while every other index update stats the file itself.
+		info, err := os.Lstat(real)
 		if err != nil {
 			return err
 		}
