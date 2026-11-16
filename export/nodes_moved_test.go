@@ -201,31 +201,44 @@ func TestStrayOfRemovedHolderGoesStale(t *testing.T) {
 }
 
 // TestStrayInsideRemovedOriginGoesStale moves an entry holding a derived id
-// deeper into its own directory, then removes that directory: the id must go
-// stale with it.
+// deeper into its own directory, then removes that directory, resident or
+// paged out: the id must go stale with it, and leave no stray behind.
 func TestStrayInsideRemovedOriginGoesStale(t *testing.T) {
-	name := filepath.Join(t.TempDir(), "nodes.log")
-	ns := newNamespace("pkg/target/sub/.bin/tool", "pkg/target/deep/package.json", "pkg/other/package.json")
-	nt := openLogged(t, name, ns)
-	sub := nt.id("pkg/target/sub")
-	nt.id("pkg/target/sub/.bin")
-	nt.id("pkg/target/deep/package.json")
-	nt.id("pkg/other/package.json")
-	ns.move("pkg/target/sub", "pkg/target/deep/sub")
-	nt.rename("pkg/target/sub", "pkg/target/deep/sub")
-	ns.del("pkg/target")
-	nt.remove("pkg/target")
-	if len(nt.strays) != 0 {
-		t.Fatalf("strays of a removed subtree kept: %v", nt.strays)
-	}
-	evictAll(t, nt, ns)
-	if got := pathOf(t, nt, sub); got != "<stale>" {
-		t.Fatalf("id %x of a removed subtree → %q", sub, got)
-	}
-	closeLogged(t, nt)
-	nt = openLogged(t, name, ns)
-	if got := pathOf(t, nt, sub); got != "<stale>" {
-		t.Fatalf("after restart: %x → %q", sub, got)
+	for _, cold := range []bool{false, true} {
+		t.Run(map[bool]string{false: "resident", true: "cold"}[cold], func(t *testing.T) {
+			name := filepath.Join(t.TempDir(), "nodes.log")
+			ns := newNamespace("pkg/target/sub/.bin/tool", "pkg/target/deep/package.json", "pkg/other/package.json")
+			nt := openLogged(t, name, ns)
+			sub := nt.id("pkg/target/sub")
+			nt.id("pkg/target/sub/.bin")
+			nt.id("pkg/target/deep/package.json")
+			nt.id("pkg/other/package.json")
+			ns.move("pkg/target/sub", "pkg/target/deep/sub")
+			nt.rename("pkg/target/sub", "pkg/target/deep/sub")
+			if cold {
+				evictAll(t, nt, ns)
+			}
+			ns.del("pkg/target")
+			nt.remove("pkg/target")
+			evictAll(t, nt, ns) // reclaims the removed cold records
+			if len(nt.deadKeys) != 0 {
+				t.Fatalf("dead keys left: %v", nt.deadKeys)
+			}
+			if len(nt.strays) != 0 {
+				t.Fatalf("strays of a removed subtree kept: %v", nt.strays)
+			}
+			if got := pathOf(t, nt, sub); got != "<stale>" {
+				t.Fatalf("id %x of a removed subtree → %q", sub, got)
+			}
+			closeLogged(t, nt)
+			nt = openLogged(t, name, ns)
+			if len(nt.strays) != 0 {
+				t.Fatalf("after restart: strays %v", nt.strays)
+			}
+			if got := pathOf(t, nt, sub); got != "<stale>" {
+				t.Fatalf("after restart: %x → %q", sub, got)
+			}
+		})
 	}
 }
 

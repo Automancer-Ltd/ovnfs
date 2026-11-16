@@ -1370,6 +1370,9 @@ func (t *nodeTable) cleanDead() {
 		}
 		for _, k := range rec.kids {
 			t.deadKeys = append(t.deadKeys, k.key)
+			if t.strays[k.id] == k.key {
+				delete(t.strays, k.id) // its holder died inside the removed subtree
+			}
 		}
 		for _, a := range rec.away {
 			t.addStray(derivedID(key, a.hash), a.key)
