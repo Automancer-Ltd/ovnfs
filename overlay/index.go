@@ -23,7 +23,7 @@ func (f *FS) lookupRead(p string) (source, os.FileInfo, error) {
 		}
 		q := p[:end]
 		real := f.up(q)
-		info, err := hostLstat(real)
+		info, err := os.Lstat(real) // only the final component needs its stored mode
 		if err == nil {
 			if q == p {
 				info, err = withMode(real, info)
@@ -92,7 +92,7 @@ func (f *FS) loadIndex() error {
 // openUpperCold opens an upper regular file for reading without loading the
 // index, which only mutations and writable descriptors need. ok is false when
 // the full path must decide. The caller holds mu.
-func (f *FS) openUpperCold(p, name string, flag int) (billy.File, bool, error) {
+func (f *FS) openUpperCold(p string, flag int) (billy.File, bool, error) {
 	s, info, err := f.lookupRead(p)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, true, err
@@ -100,7 +100,7 @@ func (f *FS) openUpperCold(p, name string, flag int) (billy.File, bool, error) {
 	if err != nil || !s.upper || !info.Mode().IsRegular() {
 		return nil, false, nil
 	}
-	h, err := open(f.up(p), name, flag, 0, f)
+	h, err := open(f.up(p), p, flag, 0, f)
 	if err != nil {
 		return nil, true, err
 	}

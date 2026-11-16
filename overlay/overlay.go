@@ -565,7 +565,7 @@ func (f *FS) OpenFile(name string, flag int, perm os.FileMode) (billy.File, erro
 retry:
 	p := Clean(name)
 	if !writing && f.index == nil {
-		if h, ok, err := f.openUpperCold(p, name, flag); ok {
+		if h, ok, err := f.openUpperCold(p, flag); ok {
 			return h, err
 		}
 	}
