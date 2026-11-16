@@ -91,8 +91,8 @@ func startDaemon(ctx context.Context, state, mount string) (*admin.Client, int, 
 }
 
 // lockDaemon creates the state directory and waits for its start lock, held
-// by startDaemon and restart while they change the daemon; closing the
-// returned file releases it.
+// by startDaemon, stop, restart and tune while they change the daemon; closing
+// the returned file releases it.
 func lockDaemon(state string) (*os.File, error) {
 	if err := os.MkdirAll(state, 0o700); err != nil {
 		return nil, fmt.Errorf("creating state %s: %w", state, err)
@@ -333,6 +333,11 @@ type stopCmd struct{}
 
 func (cmd *stopCmd) Run(c *cli) error {
 	c.autostart = false
+	lock, err := lockDaemon(c.state)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 	if !accepting(c.state) {
 		fmt.Fprintln(stderr, paint(stderr, styleDim, "not running"))
 		return nil
@@ -353,9 +358,9 @@ func (cmd *stopCmd) Run(c *cli) error {
 // compatible NFS or SMB mount stays; retained NFS mounts refresh non-root
 // handles once the new daemon serves. Mismatched macOS NFS options force a
 // fresh mount. It starts the daemon when none runs, and leaves the old one
-// untouched if it refuses to stop. The start lock is held throughout, so
-// clients that auto-start while the old daemon exits wait for the new one
-// instead of racing it for the state directory.
+// untouched if it refuses to stop. The start lock is held throughout, so a
+// stop, or a client that auto-starts, while the old daemon exits waits for the
+// new one instead of racing it for the state directory.
 type restartCmd struct{}
 
 func (cmd *restartCmd) Run(c *cli) error {
