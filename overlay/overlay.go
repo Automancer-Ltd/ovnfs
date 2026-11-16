@@ -154,8 +154,13 @@ func (f *FS) UpperFile(name string) (os.FileInfo, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	p := Clean(name)
-	if f.index == nil || reserved(p) {
+	if f.upper == "" || reserved(p) {
 		return nil, false
+	}
+	if f.index == nil {
+		// A cold index has no memory files (see [FS.Cool]), so the host decides.
+		s, info, err := f.lookupRead(p)
+		return info, err == nil && s.upper && info.Mode().IsRegular()
 	}
 	entry, ok := f.index.entries[p]
 	if !ok || entry.Kind != KindFile {
