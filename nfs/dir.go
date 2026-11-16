@@ -103,7 +103,7 @@ func verifier(dir, first uint64, infos []os.FileInfo) uint64 {
 // dirCacheBytes bounds the estimated bytes of the listings dirCache keeps:
 // room for tens of thousands of entries, enough for every directory clients
 // are paging through at once.
-const dirCacheBytes = 8 << 20
+const dirCacheBytes = 64 << 20
 
 // Estimated memory of a listing beyond its names: the struct and its slice,
 // and per entry the interface word pair plus the FileInfo behind it (a host

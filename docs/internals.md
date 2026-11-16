@@ -324,7 +324,7 @@ file to the upper as it happens.
 Two smaller caches have fixed budgets: reconstructed git delta bases, 16 MiB
 shared by every repository the daemon reads (git's default is 96 MiB per
 process, and the daemon keeps one object database per work tree open), and
-the NFS READDIR snapshots that keep a paged listing stable, 8 MiB by estimated
+the NFS READDIR snapshots that keep a paged listing stable, 64 MiB by estimated
 size; the newest snapshot stays even when it alone exceeds that.
 
 The Go collector runs with its defaults (`GOGC=100`: the heap may grow to twice
