@@ -1,6 +1,7 @@
 package export
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -130,5 +131,89 @@ func TestColdStoreLifecycle(t *testing.T) {
 	defer closeLogged(t, nt)
 	if _, err := os.Stat(cold); !os.IsNotExist(err) {
 		t.Fatal("reopen with another log retained the store", err)
+	}
+}
+
+// busyRestart issues an id for co/<leaf>, crashes, and reopens the log over
+// a directory co where a create lands during every read of co. The extra
+// paths appear after the crash.
+func busyRestart(t *testing.T, leaf string, extra ...string) (*nodeTable, uint64) {
+	t.Helper()
+	name := filepath.Join(t.TempDir(), "nodes.log")
+	ns := newNamespace("co/"+leaf, "co/other")
+	nt := openLogged(t, name, ns)
+	id := nt.id("co/" + leaf)
+	if !derived(id) {
+		t.Fatalf("co/%s got a counter id %x", leaf, id)
+	}
+	ns.add(extra...)
+	nt2 := openLogged(t, crashCopy(t, name), ns)
+	creates, busy := 0, false
+	nt2.list = func(dir string) ([]os.FileInfo, error) {
+		if dir == "co" && !busy {
+			busy = true
+			creates++
+			p := fmt.Sprintf("co/new%d", creates)
+			ns.add(p)
+			nt2.created(p)
+			busy = false
+		}
+		return ns.list(dir)
+	}
+	return nt2, id
+}
+
+// coState returns the listing and leaf count of co.
+func coState(nt *nodeTable) (*dirList, int) {
+	nt.mu.Lock()
+	defer nt.mu.Unlock()
+	d := nt.find("co")
+	if d == nil || d.dir == nil {
+		return nil, 0
+	}
+	return d.dir.list, len(d.dir.leaves)
+}
+
+// TestResolveDecidesFromReadListing resolves a pre-crash handle from the
+// listing it read, though a create during each read makes install refuse it.
+func TestResolveDecidesFromReadListing(t *testing.T) {
+	nt, id := busyRestart(t, "leaf")
+	before, _ := coState(nt)
+	if got := pathOf(t, nt, id); got != "co/leaf" {
+		t.Fatalf("handle resolved to %s", got)
+	}
+	if after, _ := coState(nt); after != before {
+		t.Fatal("a refused listing was stored")
+	}
+	if got := pathOf(t, nt, id); got != "co/leaf" {
+		t.Fatalf("second resolution: %s", got)
+	}
+}
+
+// TestResolveKeepsDegradedBehavior grows no leaf from a read listing while
+// a failed spill stops admissions.
+func TestResolveKeepsDegradedBehavior(t *testing.T) {
+	nt, id := busyRestart(t, "leaf")
+	nt.spillErr = errors.New("spill")
+	nt.spillRetry = time.Now().Add(time.Hour)
+	nt.cacheLimit = 0
+	_, leaves := coState(nt)
+	if p, ok := nt.path(id); ok {
+		t.Fatalf("degraded resolution returned %s", p)
+	}
+	if nt.spillErr == nil {
+		t.Fatal("spill failure cleared during the test")
+	}
+	if _, after := coState(nt); after != leaves {
+		t.Fatalf("leaves grew from %d to %d", leaves, after)
+	}
+}
+
+// TestResolveAmbiguousReadListing resolves nothing when the read listing
+// holds two unowned entries of the handle's hash.
+func TestResolveAmbiguousReadListing(t *testing.T) {
+	nt, id := busyRestart(t, collideA, "co/"+collideB)
+	if p, ok := nt.path(id); ok {
+		t.Fatalf("ambiguous handle resolved to %s", p)
 	}
 }

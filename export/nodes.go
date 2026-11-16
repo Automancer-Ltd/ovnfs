@@ -229,7 +229,7 @@ func (t *nodeTable) id(p string) (id uint64) {
 		if unlisted == nil {
 			return id
 		}
-		if ok, err := t.relist(unlisted); ok || err != nil {
+		if ok, _, err := t.relist(unlisted); ok || err != nil {
 			listed = unlisted
 		}
 	}
@@ -794,7 +794,8 @@ func (t *nodeTable) takenResident(d *node, h uint32) bool {
 // resolve finds the entry a derived id that no node holds names, as its
 // directory and name: a leaf, or for an id issued before a restart the one
 // entry of its hash in the keyed directory that no other node owns, which
-// becomes a leaf.
+// becomes a leaf. A listing that relist read decides even when install
+// refused to keep it, so creates during each read cannot exhaust the tries.
 func (t *nodeTable) resolve(id uint64) (*node, string) {
 	if id&derivedBit == 0 || id >= idLimit || t.list == nil {
 		return nil, ""
@@ -844,7 +845,7 @@ func (t *nodeTable) resolve(id uint64) (*node, string) {
 				// This process may not have recovered every pre-restart handle.
 				// An absent index record still needs ordinary listing resolution.
 			}
-			if name, ok := s.candidate(d, h); ok {
+			if name, ok := s.list.candidate(d, h); ok {
 				s.coldDirty = true
 				t.addLeaf(d, name)
 				return d, name
@@ -854,22 +855,30 @@ func (t *nodeTable) resolve(id uint64) (*node, string) {
 			return nil, ""
 		}
 		tries++
-		installed, err := t.relist(d)
+		installed, infos, err := t.relist(d)
 		if err != nil {
 			return nil, ""
 		}
 		if n := t.byID[id]; n != nil {
 			return n.parent, n.name
 		}
+		if !installed && infos != nil && t.spillErr == nil {
+			// The refused listing is not kept: it decides this id only.
+			if name, ok := newDirList(infos).candidate(d, h); ok {
+				d.dir.coldDirty = true
+				t.addLeaf(d, name)
+				return d, name
+			}
+			return nil, ""
+		}
 		fresh = installed
 	}
 	return nil, ""
 }
 
-// candidate returns the entry of hash h in d's listing that no node owns,
-// if the listing knows exactly one.
-func (s *dirState) candidate(d *node, h uint32) (string, bool) {
-	l := s.list
+// candidate returns the entry of hash h in the listing l of d that no node
+// owns, if the listing knows exactly one.
+func (l *dirList) candidate(d *node, h uint32) (string, bool) {
 	if l == nil {
 		return "", false
 	}
@@ -887,8 +896,9 @@ func (s *dirState) candidate(d *node, h uint32) (string, bool) {
 }
 
 // relist reads d again with the mutex released and installs the entries
-// unless d changed meanwhile.
-func (t *nodeTable) relist(d *node) (bool, error) {
+// unless d changed meanwhile. It also returns the entries it read, installed
+// or not, while d is still live at its path.
+func (t *nodeTable) relist(d *node) (bool, []os.FileInfo, error) {
 	s := d.state()
 	gen := s.gen
 	s.reading++
@@ -899,15 +909,15 @@ func (t *nodeTable) relist(d *node) (bool, error) {
 	t.mu.Lock()
 	s.reading--
 	if !location.holds(d) {
-		return false, nil
+		return false, nil, nil
 	}
 	if d.fullPath() != dir {
-		return false, nil
+		return false, nil, nil
 	}
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
-	return t.install(d, gen, infos), nil
+	return t.install(d, gen, infos), infos, nil
 }
 
 // install replaces d's listing if d is live and unchanged since gen.
