@@ -445,5 +445,6 @@ func (cmd *statusCmd) Run(c *cli) error {
 	for _, row := range rows {
 		fmt.Fprintf(stdout, "%s%s%s\n", paint(stdout, styleDim, row[0]), strings.Repeat(" ", max(2, 12-len(row[0]))), row[1])
 	}
+	printWarnings(st.Warnings)
 	return nil
 }

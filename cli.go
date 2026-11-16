@@ -349,10 +349,15 @@ func (cmd *newCmd) Run(c *cli) error {
 	} else if r.Checkout.JJ != "" {
 		fmt.Fprintf(stderr, "  %s\n", paint(stderr, styleDim, "jj: "+r.Checkout.JJ))
 	}
-	for _, w := range r.Warnings {
+	printWarnings(r.Warnings)
+	return nil
+}
+
+// printWarnings shows a reply's warnings on stderr, after its result.
+func printWarnings(ws []string) {
+	for _, w := range ws {
 		fmt.Fprintln(stderr, paint(stderr, styleYellow, "warning:"), w)
 	}
-	return nil
 }
 
 // forkCmd snapshots a checkout, opens a child on it and prints the child's path.
@@ -374,9 +379,7 @@ func (cmd *forkCmd) Run(c *cli) error {
 	if r.Checkout.JJ != "" {
 		fmt.Fprintf(stderr, "  %s\n", paint(stderr, styleDim, "jj: "+r.Checkout.JJ))
 	}
-	for _, w := range r.Warnings {
-		fmt.Fprintln(stderr, paint(stderr, styleYellow, "warning:"), w)
-	}
+	printWarnings(r.Warnings)
 	return nil
 }
 

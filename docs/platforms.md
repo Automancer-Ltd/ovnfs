@@ -28,6 +28,15 @@ immediately. The export root is read-only; cross-checkout rename returns EXDEV
 so `mv` copies. It also holds an empty, unlisted `.metadata_never_index`, the
 file macOS checks for on every new volume to keep Spotlight from indexing it.
 
+The client's attribute and name caches live in its vnodes, which macOS caps
+system-wide at `kern.maxvnodes` (263,168 on a 128 GB Mac). A full walk such as
+`git status` takes two per file, the client's and the daemon's for the source
+file; past the cap the kernel recycles the walk's own vnodes before the next
+walk reaches them, so every walk sends one LOOKUP per file. On a 479,000-file
+checkout that made a warm `git status` 27 s; with `kern.maxvnodes=2097152` it
+took 2 s. `ovnfs status` warns when the cap is below twice the largest
+checkout's file count and prints the `sysctl` that fixes it.
+
 The 128 KiB I/O buffers balance bulk transfers with small random writes:
 macOS maps a whole buffer for a write and flushes it before a discontiguous
 write. Larger buffers make 4 KiB writes disproportionately expensive.

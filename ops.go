@@ -68,6 +68,9 @@ func (h *opsHandler) Call(ctx context.Context, op string, raw json.RawMessage) (
 			s := api.Status{Version: protocolVersion, PID: os.Getpid(), Uptime: time.Since(h.started).Seconds(), Proto: h.welcome.Proto, Port: h.welcome.Port, Mount: h.welcome.Mount, State: h.welcome.State, Socket: socketPath(h.welcome.State)}
 			h.reg.Counts(&s)
 			reportHeap(&s)
+			if w := vnodeWarning(h.reg.Largest()); w != "" {
+				s.Warnings = append(s.Warnings, w)
+			}
 			if h.nodeCache != nil {
 				s.NodeCache = h.nodeCache()
 				if h.nodeIndexBytes != nil {

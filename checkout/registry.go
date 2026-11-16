@@ -589,6 +589,19 @@ func (r *Registry) Counts(s *api.Status) {
 	s.Snapshots, s.Bases, s.Layers = len(r.snapshots), len(r.bases), len(r.layers)
 }
 
+// Largest names the live checkout whose capture holds the most files: the one
+// whose full walk, such as git status, makes the kernel cache the most vnodes.
+func (r *Registry) Largest() (name string, files int) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, h := range r.checkouts {
+		if n := h.base.view.Stats().Files; n > files && !h.retired.Load() {
+			name, files = h.meta.Name, n
+		}
+	}
+	return name, files
+}
+
 // checkoutLocked describes a checkout for replies.
 func (r *Registry) checkoutLocked(h *checkoutRecord) api.Checkout {
 	empty, err := r.upperEmpty(h)

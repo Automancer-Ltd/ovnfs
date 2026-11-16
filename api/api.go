@@ -71,6 +71,8 @@ type Status struct {
 	HeapInUse      int64   `json:"heap_in_use"` // Go heap spans holding objects: live, not yet collected garbage and fragmentation
 	GoHeld         int64   `json:"go_held"`     // memory the Go runtime holds from the OS (heap, stacks, metadata), minus what it returned
 	Footprint      int64   `json:"footprint"`   // process memory as the OS charges it (macOS phys_footprint, Linux RssAnon+VmSwap, Windows private bytes); 0 where unknown
+	// Warnings name host settings that slow the mount down, each with its fix.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // Usage is resident bytes against a limit. A zero Limit disables file/blob
