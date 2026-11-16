@@ -435,11 +435,33 @@ func TestForcedUnmountEndsBusyMount(t *testing.T) {
 	if f.srv.abort == nil {
 		t.Fatal("fusectl is mounted, but Mount found no abort file for its connection")
 	}
-	held, err := os.Open(f.path("alpha/held"))
+	// A child process holds the file. Held in this process, the descriptor
+	// would reach the vfork of fusermount inside Unmount, and its exec would
+	// close it with a FUSE FLUSH that this process must answer. A GC starting
+	// meanwhile waits for the vforking thread, which waits for that answer.
+	holder := exec.Command("sh", "-c", `exec 3<"$0"; read -r _; exec cat <&3`, f.path("alpha/held"))
+	release, err := holder.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer held.Close()
+	var out bytes.Buffer
+	holder.Stdout = &out
+	if err := holder.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		holder.Process.Kill()
+		holder.Wait()
+	})
+	heldFD := fmt.Sprintf("/proc/%d/fd/3", holder.Process.Pid)
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+		if p, _ := os.Readlink(heldFD); p == f.path("alpha/held") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the holder did not open alpha/held")
+		}
+	}
 	if err := f.srv.Unmount(false); err == nil {
 		t.Fatal("plain unmount succeeded while a file on the mount is open")
 	}
@@ -452,8 +474,9 @@ func TestForcedUnmountEndsBusyMount(t *testing.T) {
 	if names, err := os.ReadDir(f.mnt); err != nil || len(names) != 0 {
 		t.Fatalf("mountpoint after forced unmount lists %v, %v; want an empty directory", names, err)
 	}
-	if n, err := held.ReadAt(make([]byte, 4), 0); err == nil {
-		t.Fatalf("read through the ended mount returned %d bytes", n)
+	release.Close()
+	if err := holder.Wait(); err == nil || out.Len() != 0 {
+		t.Fatalf("read through the ended mount returned %q, %v", out.Bytes(), err)
 	}
 }
 
