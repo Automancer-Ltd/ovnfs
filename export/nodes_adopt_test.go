@@ -17,8 +17,7 @@ import (
 // resolution is what a table resolves: the path of every issued id, and the
 // id of every path of the namespace, 0 for none. Orphans are derived ids
 // held away from the directory they derive from, which was removed since:
-// they resolve only while their holder is resident, whichever way the table
-// was opened.
+// they resolve through the table's strays, whichever way it was opened.
 type resolution struct {
 	paths   map[uint64]string
 	ids     map[string]uint64
@@ -58,16 +57,12 @@ func resolveAll(t *testing.T, nt *nodeTable, ns *namespace, issued map[uint64]bo
 	return r
 }
 
-// sameResolution fails unless got resolves every issued id and path as want,
-// orphans aside unless both were opened alike.
-func sameResolution(t *testing.T, what string, got, want resolution, alike bool) {
+// sameResolution fails unless got resolves every issued id and path as want.
+func sameResolution(t *testing.T, what string, got, want resolution) {
 	t.Helper()
 	for id, p := range want.paths {
 		if got.orphans[id] != want.orphans[id] {
 			t.Fatalf("%s: %x orphaned %v, want %v", what, id, got.orphans[id], want.orphans[id])
-		}
-		if got.orphans[id] && !alike {
-			continue
 		}
 		if got.paths[id] != p {
 			t.Fatalf("%s: %x → %q, want %q", what, id, got.paths[id], p)
@@ -275,7 +270,7 @@ func TestAdoptedIndexMatchesReplay(t *testing.T) {
 				if crash.opened.adopted {
 					t.Fatalf("cycle %d: adopted after a crash", cycle)
 				}
-				sameResolution(t, fmt.Sprintf("cycle %d: crash", cycle), resolveAll(t, crash, ns, issued), live, false)
+				sameResolution(t, fmt.Sprintf("cycle %d: crash", cycle), resolveAll(t, crash, ns, issued), live)
 				closeLogged(t, crash)
 				replayed := openLogged(t, filepath.Join(clean, "nodes.log"), ns)
 				if replayed.opened.adopted {
@@ -286,8 +281,8 @@ func TestAdoptedIndexMatchesReplay(t *testing.T) {
 					t.Fatalf("cycle %d: replayed: %s", cycle, nt.opened.why)
 				}
 				adopted := resolveAll(t, nt, ns, issued)
-				sameResolution(t, fmt.Sprintf("cycle %d: adopted", cycle), adopted, live, false)
-				sameResolution(t, fmt.Sprintf("cycle %d: replayed", cycle), resolveAll(t, replayed, ns, issued), adopted, true)
+				sameResolution(t, fmt.Sprintf("cycle %d: adopted", cycle), adopted, live)
+				sameResolution(t, fmt.Sprintf("cycle %d: replayed", cycle), resolveAll(t, replayed, ns, issued), adopted)
 				nt.cacheLimit = 8 << 10
 
 				// New names get the same ids from either open, never
