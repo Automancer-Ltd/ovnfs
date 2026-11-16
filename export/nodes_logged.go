@@ -554,7 +554,10 @@ func (t *nodeTable) buildIndex(r *replayTable, prior *priorIndex) error {
 		if n.id&derivedBit == 0 {
 			continue
 		}
-		if o, ok := r.keys[n.id>>hashBits&(maxDerivingKey-1)]; ok && o != n.parent {
+		switch o, ok := r.keys[n.id>>hashBits&(maxDerivingKey-1)]; {
+		case !ok:
+			t.addStray(n.id, n.key) // its directory was removed after it moved out
+		case o != n.parent:
 			away[o] = append(away[o], recordAway{uint32(n.id & (1<<hashBits - 1)), n.key})
 		}
 	}
@@ -763,10 +766,14 @@ func (t *nodeTable) adoptIndex(h *ownersHeader, prior *priorIndex) error {
 	if err != nil {
 		return fail(err)
 	}
+	strays, err := readStrays(x.dir, h.next)
+	if err != nil {
+		return fail(err)
+	}
 	t.index, t.next, t.pack, t.coldRoot = x, h.next, pack, prior.instance
 	t.compacted, t.built, t.recordsEnd = int64(h.compacted), int64(h.built), int64(h.records)
 	t.coldBytes, t.runtimeBytes = int64(h.coldBytes), int64(h.runtimeBytes)
-	t.deadKeys = h.dead
+	t.deadKeys, t.strays = h.dead, strays
 	s := t.root.state()
 	slot.owner.apply(s)
 	s.loaded, s.slot = slot.owner, slot.at
@@ -1131,7 +1138,56 @@ func (t *nodeTable) saveIndex() error {
 		}
 	}
 	t.recordsEnd = end
-	return nil
+	return writeStrays(x.dir, t.strays)
+}
+
+// strayFile, in an index's directory, lists the strays at its clean close as
+// pairs of uvarints: the derived id and the key of the node holding it. An
+// index without one predates strays: the open rebuilds it from the log,
+// which recovers them.
+const strayFile = "strays"
+
+// writeStrays replaces dir's stray file with strays, durably.
+func writeStrays(dir string, strays map[uint64]uint64) error {
+	var b []byte
+	for id, key := range strays {
+		b = binary.AppendUvarint(binary.AppendUvarint(b, id), key)
+	}
+	name := filepath.Join(dir, strayFile)
+	f, err := os.OpenFile(name+".tmp", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(b)
+	if err == nil {
+		err = durable.Sync(f)
+	}
+	if err = errors.Join(err, f.Close()); err != nil {
+		return err
+	}
+	return os.Rename(name+".tmp", name)
+}
+
+// readStrays reads dir's stray file, checking each id and key against the
+// counter next.
+func readStrays(dir string, next uint64) (map[uint64]uint64, error) {
+	b, err := os.ReadFile(filepath.Join(dir, strayFile))
+	if err != nil {
+		return nil, err
+	}
+	var strays map[uint64]uint64
+	r := logReader{b: b}
+	for len(r.b) > 0 && r.err == nil {
+		id, key := r.uvarint(), r.uvarint()
+		if r.err != nil || id&derivedBit == 0 || id >= idLimit || key < 2 || key >= next {
+			return nil, errNodeIndex
+		}
+		if strays == nil {
+			strays = make(map[uint64]uint64)
+		}
+		strays[id] = key
+	}
+	return strays, nil
 }
 
 // syncIndex makes durable everything the manifest makes authoritative, at
@@ -1180,6 +1236,7 @@ func (t *nodeTable) retireID(id uint64) {
 	if id&derivedBit == 0 {
 		return
 	}
+	delete(t.strays, id)
 	d := t.byKey[id>>hashBits&(maxDerivingKey-1)]
 	if d == nil {
 		return // its cold directory's held entry keeps it reserved
@@ -1313,6 +1370,9 @@ func (t *nodeTable) cleanDead() {
 		}
 		for _, k := range rec.kids {
 			t.deadKeys = append(t.deadKeys, k.key)
+		}
+		for _, a := range rec.away {
+			t.addStray(derivedID(key, a.hash), a.key)
 		}
 	}
 }

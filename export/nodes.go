@@ -91,7 +91,8 @@ type nodeTable struct {
 	opened              nodeLoad   // how open loaded the identities
 	paging              map[uint64]chan struct{}
 	enumerations        []*enumeration
-	deadKeys            []uint64 // retired cold keys whose owner index bytes are still counted live
+	strays              map[uint64]uint64 // derived ids of removed directories that logged nodes moved out of them hold, to those nodes' keys
+	deadKeys            []uint64          // retired cold keys whose owner index bytes are still counted live
 	list                func(dir string) ([]os.FileInfo, error)
 	pending             []byte // records of the current operation, written by flush
 	log                 *os.File
@@ -813,7 +814,7 @@ func (t *nodeTable) resolve(id uint64) (*node, string) {
 		d := t.byKey[key]
 		if d == nil {
 			if t.pageKey(key) == nil {
-				return nil, ""
+				return t.stray(id)
 			}
 			continue
 		}
@@ -877,6 +878,31 @@ func (t *nodeTable) resolve(id uint64) (*node, string) {
 		}
 	}
 	return nil, ""
+}
+
+// stray resolves a derived id of a removed directory that a logged node
+// moved out of it holds, dropping an entry whose holder is gone.
+func (t *nodeTable) stray(id uint64) (*node, string) {
+	key, ok := t.strays[id]
+	if !ok {
+		return nil, ""
+	}
+	if n := t.pageKey(key); n != nil && n.id == id {
+		return n.parent, n.name
+	}
+	if t.strays[id] == key {
+		delete(t.strays, id)
+	}
+	return nil, ""
+}
+
+// addStray records that the logged node keyed key holds id, derived from a
+// directory being removed.
+func (t *nodeTable) addStray(id, key uint64) {
+	if t.strays == nil {
+		t.strays = make(map[uint64]uint64)
+	}
+	t.strays[id] = key
 }
 
 // candidate returns the entry of hash h in the listing l of d that no node
@@ -1145,6 +1171,11 @@ func (t *nodeTable) drop(n *node) {
 	forget = func(n *node) {
 		t.uncache(n)
 		if s := n.dir; s != nil {
+			// Holders of n's derived ids outlive it if they moved out of
+			// n; retire drops the entries of those still inside.
+			for h, key := range s.held {
+				t.addStray(derivedID(n.key, h), key)
+			}
 			t.dropOwners(n)
 			for _, st := range s.stubs {
 				t.deadKeys = append(t.deadKeys, st.key)
