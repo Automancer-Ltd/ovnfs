@@ -351,22 +351,19 @@ func (f *FS) admit(m *memFile, n int64) bool {
 
 // addMem publishes p as a memory file holding data, leaving the parent's
 // mtime to the caller: a new name stamps it ([FS.touchDir]), a copy-up keeps
-// it. It returns nil without error when the budget refuses the file. The
-// caller ensured p's parent exists in upper and p has no upper entry.
-func (f *FS) addMem(p string, mode os.FileMode, mtime time.Time, data []byte) (*memFile, error) {
+// it. A deletion marker at p stays on disk until the file spills. It returns
+// nil when the budget refuses the file. The caller ensured p's parent exists
+// in upper and p has no upper entry.
+func (f *FS) addMem(p string, mode os.FileMode, mtime time.Time, data []byte) *memFile {
 	now := time.Now()
 	m := &memFile{owner: f, path: p, data: data, mode: mode & memModeBits, atime: mtime, mtime: mtime, ctime: now, created: now, ino: memInodes.Add(1), handles: make(map[*memHandle]struct{})}
 	m.uid, m.gid = newOwner(f.index.entries[parent(p)].Info)
 	if !f.admit(m, fileOverhead+int64(cap(data))) {
-		return nil, nil
-	}
-	if err := f.clearWhiteout(p); err != nil {
-		f.mem.release(m)
-		return nil, err
+		return nil
 	}
 	f.files[p] = m
 	f.index.set(p, Entry{Kind: KindFile, Info: m.info(path.Base(p))})
-	return m, nil
+	return m
 }
 
 // copyUpMem copies a small immutable regular file into memory, reporting false
@@ -389,8 +386,7 @@ func (f *FS) copyUpMem(s source, p string, info os.FileInfo) (bool, error) {
 	if err != nil || int64(len(data)) > f.mem.fileMax {
 		return false, err
 	}
-	m, err := f.addMem(p, info.Mode(), info.ModTime(), data)
-	return m != nil, err
+	return f.addMem(p, info.Mode(), info.ModTime(), data) != nil, nil
 }
 
 // readBounded reads r, sized for about size bytes, stopping once it holds more
@@ -544,12 +540,13 @@ func (f *FS) spill(m *memFile) error {
 }
 
 // installed retires memory file m once its staged copy holds its name in the
-// upper, handing each open handle its staged descriptor. The caller holds f.mu.
+// upper, then drops the deletion marker the name kept while in memory, and
+// hands each open handle its staged descriptor. The caller holds f.mu.
 func (f *FS) installed(m *memFile, fds map[*memHandle]*os.File) error {
 	p := m.path
 	delete(f.files, p)
 	f.mem.release(m)
-	err := f.refresh(p)
+	err := errors.Join(f.clearWhiteout(p), f.refresh(p))
 	for h, fd := range fds {
 		h.disk = f.adopt(&file{File: fd, name: h.name, writable: writable(h.flag)})
 		f.bind(h.disk, p)
