@@ -46,10 +46,11 @@ type Server struct {
 	once sync.Once
 	// verf is this instance's write verifier: it changes when the server
 	// restarts, telling clients to resend unstable writes.
-	verf [8]byte
-	dirs dirCache
-	v3   v3State
-	v4   v4State
+	verf    [8]byte
+	dirs    dirCache
+	resumes resumeCache
+	v3      v3State
+	v4      v4State
 }
 
 // Serve accepts connections until the listener fails, and closes it.

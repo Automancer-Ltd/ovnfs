@@ -3,6 +3,8 @@ package nfs
 import (
 	"container/list"
 	"os"
+	"slices"
+	"strings"
 	"sync"
 )
 
@@ -59,16 +61,30 @@ func (s *Server) list(id uint64, p string, cookie, verf uint64) (*listing, statu
 	return l, stOK
 }
 
-// relist lists directory id again for a continuation after cookie whose
-// snapshot is gone and whose directory changed. Its entries are numbered
-// from cookie+1: the macOS client drops entries whose cookie is not past
-// the one it asked for, and ends the listing at BAD_COOKIE.
-func (s *Server) relist(id uint64, p string, cookie uint64) (*listing, status) {
-	l, st := s.read(id, p, cookie+1)
-	if st == stOK {
-		s.dirs.put(l)
+// relist lists directory id again for a continuation after cookie, from the
+// listing verf names, whose snapshot is gone and whose directory changed.
+// When s.resumes knows the last name that page returned, it keeps only the
+// entries after it. Its entries are numbered from cookie+1: the macOS client
+// drops entries whose cookie is not past the one it asked for, and ends the
+// listing at BAD_COOKIE.
+func (s *Server) relist(id uint64, p string, cookie, verf uint64) (*listing, status) {
+	infos, err := s.FS.ReadDir(p)
+	if err != nil {
+		return nil, statusOf(err)
 	}
-	return l, st
+	if last, ok := s.resumes.get(resumeKey{id, verf, cookie}); ok {
+		i, found := slices.BinarySearchFunc(infos, last, func(info os.FileInfo, name string) int {
+			return strings.Compare(info.Name(), name)
+		})
+		if found {
+			i++
+		}
+		infos = infos[i:]
+	}
+	first := cookie + 1
+	l := &listing{dir: id, verf: verifier(id, first, infos), first: first, entries: infos}
+	s.dirs.put(l)
+	return l, stOK
 }
 
 // read lists directory id, at path p, sorted by name and numbered from first.
@@ -175,4 +191,57 @@ func (c *dirCache) remove(e *list.Element) {
 	l := c.lru.Remove(e).(*cachedListing)
 	delete(c.byVerf, l.verf)
 	c.size -= l.size
+}
+
+// resumeMax bounds the continuation points resumeCache keeps.
+const resumeMax = 4096
+
+// resumeKey names a continuation point: the cookie of the last entry a
+// READDIR page returned from the listing of directory dir with verifier verf.
+type resumeKey struct{ dir, verf, cookie uint64 }
+
+// resumeCache keeps the name of the entry each of the resumeMax most
+// recently used continuation points follows, evicting the least recently
+// used, so a continuation whose snapshot dirCache evicted resumes after it.
+// The zero value is empty and ready.
+type resumeCache struct {
+	mu    sync.Mutex
+	byKey map[resumeKey]*list.Element // of *resumePoint
+	lru   list.List                   // most recently used first
+}
+
+// resumePoint is a resumeCache entry.
+type resumePoint struct {
+	key  resumeKey
+	last string
+}
+
+// put records that continuation point k follows the entry named last.
+func (c *resumeCache) put(k resumeKey, last string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.byKey == nil {
+		c.byKey = make(map[resumeKey]*list.Element)
+	}
+	if e := c.byKey[k]; e != nil {
+		e.Value.(*resumePoint).last = last
+		c.lru.MoveToFront(e)
+		return
+	}
+	c.byKey[k] = c.lru.PushFront(&resumePoint{key: k, last: last})
+	if c.lru.Len() > resumeMax {
+		delete(c.byKey, c.lru.Remove(c.lru.Back()).(*resumePoint).key)
+	}
+}
+
+// get returns the name of the entry continuation point k follows.
+func (c *resumeCache) get(k resumeKey) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e := c.byKey[k]
+	if e == nil {
+		return "", false
+	}
+	c.lru.MoveToFront(e)
+	return e.Value.(*resumePoint).last, true
 }
