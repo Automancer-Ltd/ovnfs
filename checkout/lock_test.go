@@ -14,8 +14,8 @@ func TestLockStateWaitsForTheHolder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	time.AfterFunc(300*time.Millisecond, func() { held.Close() })
 	start := time.Now()
+	time.AfterFunc(300*time.Millisecond, func() { held.Close() })
 	f, err := lockState(state)
 	if err != nil {
 		t.Fatal(err)
