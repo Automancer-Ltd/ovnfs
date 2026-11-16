@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/colorprofile"
 	"github.com/stencil-hq/ovnfs/admin"
 )
 
@@ -79,5 +80,46 @@ func TestClientQuotesLogOfAFailedLoad(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "read state.json: unexpected end of JSON input") {
 		t.Fatalf("error without the daemon log: %v", err)
+	}
+}
+
+// TestStopWaitsForTheStartLock holds the start lock as a restart does between
+// its old and new daemon: stop waits for it instead of reporting no daemon
+// while the new one starts.
+func TestStopWaitsForTheStartLock(t *testing.T) {
+	state, err := os.MkdirTemp("", "ovnfs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(state) })
+	var out strings.Builder
+	saved := stderr
+	stderr = &colorprofile.Writer{Forward: &out, Profile: colorprofile.ASCII}
+	t.Cleanup(func() { stderr = saved })
+	lock, err := lockDaemon(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- (&stopCmd{}).Run(&cli{ctx: context.Background(), state: state})
+	}()
+	select {
+	case err := <-done:
+		lock.Close()
+		t.Fatalf("stop returned %v while the start lock was held", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	lock.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("stop did not return after the start lock was released")
+	}
+	if !strings.Contains(out.String(), "not running") {
+		t.Fatalf("stop printed %q, want not running", out.String())
 	}
 }
