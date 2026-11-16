@@ -38,6 +38,9 @@
   the removed one; a hash collision with a name created behind the export while
   the daemon was down makes an earlier handle stale (`ESTALE`), never another
   file's.
+- A failed write or sync of the node id log (`nodes.log`), for example on a
+  full disk, fails the export with `EIO` until the daemon restarts, and
+  `ovnfs status` shows it as `node cache error`.
 - NFSv3 cannot push cache invalidations: folder edits in cache and local
   paths, `pull`, and reattach can remain cached until the client's attribute
   timeout (up to 60 s). NFSv4 read delegations reduce that window for opened

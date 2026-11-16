@@ -21,10 +21,10 @@ func (t *nodeTable) prepareRename(from, to string) (func(), error) {
 	t.dirNode(dir)
 	t.node(to)
 	extra, err := t.keepPaths(recoverOwners, from, to)
+	t.flush() // a failed append refuses the rename
 	if err == nil {
 		err = t.cacheErr
 	}
-	t.flush()
 	t.mu.Unlock()
 	finish := func() { t.mu.Lock(); extra.release(); t.mu.Unlock(); release() }
 	if err != nil {

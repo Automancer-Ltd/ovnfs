@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/stencil-hq/ovnfs/internal/durable"
@@ -602,12 +603,29 @@ func (t *nodeTable) flush() {
 	}
 	if t.log != nil && t.logErr == nil {
 		if _, err := t.log.Write(t.pending); err != nil {
-			t.logErr = err
+			t.logFailure(err)
 		} else {
 			t.dirty = true
 		}
 	}
 	t.pending = t.pending[:0]
+}
+
+// logFailure fails the export closed on the first failed log write or sync,
+// with t.mu held. Later records would be lost, so a restart could not
+// resolve the ids they place. The failure is final until restart.
+func (t *nodeTable) logFailure(err error) {
+	if t.logErr != nil {
+		return
+	}
+	t.logErr = err
+	if t.cacheErr == nil {
+		t.cacheErr = fmt.Errorf("node log: %w: %v", syscall.EIO, err)
+		t.fault.Store(&nodeCacheFault{t.cacheErr})
+	}
+	if t.logf != nil {
+		t.logf("node ids: log write failed, refusing new identities until restart: %v", err)
+	}
 }
 
 // syncLoop groups durable flushes without retaining records in userspace
@@ -622,17 +640,15 @@ func (t *nodeTable) syncLoop() {
 		select {
 		case <-timer.C:
 			t.mu.Lock()
-			dirty := t.dirty
+			dirty, log := t.dirty, t.log
 			t.dirty = false
 			t.mu.Unlock()
 			if !dirty {
 				continue
 			}
-			if err := durable.Sync(t.log); err != nil {
+			if err := durable.Sync(log); err != nil {
 				t.mu.Lock()
-				if t.logErr == nil {
-					t.logErr = err
-				}
+				t.logFailure(err)
 				t.mu.Unlock()
 			}
 		case <-t.stop:

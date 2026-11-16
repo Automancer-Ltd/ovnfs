@@ -96,6 +96,7 @@ type nodeTable struct {
 	pending             []byte // records of the current operation, written by flush
 	log                 *os.File
 	logErr              error
+	logf                func(format string, args ...any) // optional sink for the first log failure
 	dirty               bool
 	stop                chan struct{}
 	done                chan struct{}

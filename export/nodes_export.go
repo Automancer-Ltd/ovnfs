@@ -16,6 +16,9 @@ func New(rt *Router, nodesLog, upperVolume string, logf func(format string, args
 	if err != nil {
 		return nil, err
 	}
+	nodes.mu.Lock()
+	nodes.logf = logf
+	nodes.mu.Unlock()
 	if logf != nil {
 		logf("%v", nodes.opened)
 	}
