@@ -558,6 +558,11 @@ func (f *FS) OpenFile(name string, flag int, perm os.FileMode) (billy.File, erro
 	defer f.mu.Unlock()
 retry:
 	p := Clean(name)
+	if !writing && f.index == nil {
+		if h, ok, err := f.openUpperCold(p, name, flag); ok {
+			return h, err
+		}
+	}
 	if err := f.loadIndex(); err != nil {
 		return nil, err
 	}
@@ -1511,6 +1516,7 @@ type file struct {
 	fs          *FS
 	ownerClosed bool
 	closeErr    error
+	cold        string // upper path of a read opened without the index, see [FS.openUpperCold]
 }
 
 // open wraps a host file without losing its overlay-relative name; an owner
