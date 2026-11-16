@@ -1,9 +1,13 @@
 package export
 
 import (
+	"errors"
 	"os"
+	"path"
+	"syscall"
 	"testing"
 
+	"github.com/go-git/go-billy/v5"
 	"github.com/stencil-hq/ovnfs/ntinfo"
 	"github.com/stencil-hq/ovnfs/overlay"
 )
@@ -16,6 +20,97 @@ func newMetadataTestFS(t *testing.T) *nodeFS {
 		t.Fatal(err)
 	}
 	return &nodeFS{Filesystem: fs, Change: fs, nodes: newNodeTable(fs.ReadDir)}
+}
+
+// sidecarRemoveFails fails every removal of an AppleDouble sidecar, as a full
+// disk does when the overlay must record a whiteout.
+type sidecarRemoveFails struct{ billy.Filesystem }
+
+func (f sidecarRemoveFails) Remove(name string) error {
+	if overlay.AppleDouble(path.Base(name)) {
+		return syscall.ENOSPC
+	}
+	return f.Filesystem.Remove(name)
+}
+
+// createAll makes each named file, with its parent directories.
+func createAll(t *testing.T, n *nodeFS, names ...string) {
+	t.Helper()
+	for _, name := range names {
+		if err := n.MkdirAll(path.Dir(name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		f, err := n.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+	}
+}
+
+// TestRemoveReportsSidecarCleanupError returns the cleanup failure, not
+// ENOTEMPTY, so the client sees why the directory stays.
+func TestRemoveReportsSidecarCleanupError(t *testing.T) {
+	n := newMetadataTestFS(t)
+	createAll(t, n, "co/dir/._x")
+	n.Filesystem = sidecarRemoveFails{n.Filesystem}
+	err := n.Remove("co/dir")
+	if !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("got %v, want ENOSPC", err)
+	}
+	if _, err := n.Lstat("co/dir/._x"); err != nil {
+		t.Fatalf("sidecar gone: %v", err)
+	}
+}
+
+// TestRenameOntoSidecarOnlyDirectory replaces a directory the client sees as
+// empty and keeps the ids of the moved subtree.
+func TestRenameOntoSidecarOnlyDirectory(t *testing.T) {
+	n := newMetadataTestFS(t)
+	createAll(t, n, "co/dst/._x", "co/src/file")
+	idFile := n.nodes.id("co/src/file")
+	if err := n.Rename("co/src", "co/dst"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.Lstat("co/dst/file"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.Lstat("co/dst/._x"); !os.IsNotExist(err) {
+		t.Fatalf("sidecar kept: %v", err)
+	}
+	if p, _ := n.nodes.path(idFile); p != "co/dst/file" {
+		t.Fatalf("moved file id points at %q", p)
+	}
+}
+
+// TestRenameOntoNonEmptyDirectoryKeepsSidecars refuses a visibly nonempty
+// destination and leaves its sidecars alone.
+func TestRenameOntoNonEmptyDirectoryKeepsSidecars(t *testing.T) {
+	n := newMetadataTestFS(t)
+	createAll(t, n, "co/dst/real", "co/dst/._real")
+	if err := n.MkdirAll("co/src", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Rename("co/src", "co/dst"); !errors.Is(err, syscall.ENOTEMPTY) {
+		t.Fatalf("got %v, want ENOTEMPTY", err)
+	}
+	if _, err := n.Lstat("co/dst/._real"); err != nil {
+		t.Fatalf("sidecar gone: %v", err)
+	}
+}
+
+// TestRenameReportsSidecarCleanupError returns the cleanup failure and leaves
+// the source in place.
+func TestRenameReportsSidecarCleanupError(t *testing.T) {
+	n := newMetadataTestFS(t)
+	createAll(t, n, "co/dst/._x", "co/src/file")
+	n.Filesystem = sidecarRemoveFails{n.Filesystem}
+	if err := n.Rename("co/src", "co/dst"); !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("got %v, want ENOSPC", err)
+	}
+	if _, err := n.Lstat("co/src/file"); err != nil {
+		t.Fatalf("source moved: %v", err)
+	}
 }
 
 // TestHiddenSidecarsRemainAddressable verifies hiding does not break xattr writes.
