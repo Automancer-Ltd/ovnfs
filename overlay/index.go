@@ -1,0 +1,128 @@
+package overlay
+
+import (
+	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/go-git/go-billy/v5"
+)
+
+// lookupRead checks only the requested path and ancestor barriers while cold.
+// A native stat follows intermediate symlinks, so inspect the ancestors first.
+func (f *FS) lookupRead(p string) (source, os.FileInfo, error) {
+	if f.index != nil || f.upper == "" || p == "" || reserved(p) {
+		return f.lookup(p)
+	}
+	blocked := false
+	for end := 0; end <= len(p); end++ {
+		if end > 0 && end < len(p) && p[end] != '/' {
+			continue
+		}
+		q := p[:end]
+		real := f.up(q)
+		info, err := hostLstat(real)
+		if err == nil {
+			if q == p {
+				info, err = withMode(real, info)
+				return source{upper: true}, info, err
+			}
+			if !info.IsDir() {
+				return source{}, nil, notExist("lstat", p)
+			}
+			if _, err = os.Lstat(filepath.Join(real, opaqueName)); err == nil {
+				blocked = true
+			} else if !missing(err) {
+				return source{}, nil, err
+			}
+		} else if !missing(err) {
+			return source{}, nil, err
+		} else {
+			if q != "" {
+				if _, err = os.Lstat(f.whiteoutPath(q)); err == nil {
+					return source{}, nil, notExist("lstat", p)
+				} else if !missing(err) {
+					return source{}, nil, err
+				}
+			}
+			break // descendants of a missing upper directory are missing too
+		}
+	}
+	if blocked {
+		return source{}, nil, notExist("lstat", p)
+	}
+	return f.lookup(p)
+}
+
+// loadIndex is called under mu exclusively, never for a cold directory listing.
+func (f *FS) loadIndex() error {
+	if f.upper == "" {
+		return nil
+	}
+	f.lastAccess.Store(time.Now().UnixNano())
+	if f.index != nil {
+		return nil
+	}
+	index, err := indexLayer(f.upper, true)
+	if err != nil {
+		return err
+	}
+	index.addOrigins(f.origins)
+	f.index = index
+	f.pathIDs = make(map[string]inodeKey)
+	f.aliases = make(map[inodeKey]inodeNames)
+	for p, e := range index.entries {
+		if err := f.track(p, e.Info); err != nil {
+			f.index, f.pathIDs, f.aliases = nil, nil, nil
+			return err
+		}
+	}
+	for h := range f.hosts {
+		if h.cold != "" {
+			f.bind(h, h.cold) // nothing renames upper files while the index is cold
+			h.cold = ""
+		}
+	}
+	f.origins = nil
+	return nil
+}
+
+// openUpperCold opens an upper regular file for reading without loading the
+// index, which only mutations and writable descriptors need. ok is false when
+// the full path must decide. The caller holds mu.
+func (f *FS) openUpperCold(p, name string, flag int) (billy.File, bool, error) {
+	s, info, err := f.lookupRead(p)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, true, err
+	}
+	if err != nil || !s.upper || !info.Mode().IsRegular() {
+		return nil, false, nil
+	}
+	h, err := open(f.up(p), name, flag, 0, f)
+	if err != nil {
+		return nil, true, err
+	}
+	h.cold = p
+	return h, true, nil
+}
+
+// Cool drops reconstructible metadata only. Handles and staged or pending writes
+// pin it; no file, checkout generation or exported identity is changed.
+func (f *FS) Cool(before time.Time) {
+	if !f.staging.TryLock() {
+		return
+	}
+	defer f.staging.Unlock()
+	if !f.mu.TryLock() {
+		return
+	}
+	defer f.mu.Unlock()
+	if f.index == nil || f.upper == "" || f.lastAccess.Load() >= before.UnixNano() ||
+		len(f.hosts) != 0 || len(f.files) != 0 || f.memoryHandles != 0 {
+		return
+	}
+	f.rootInfo, f.origins = f.index.entries[""].Info, f.index.origins()
+	f.index, f.pathIDs, f.aliases = nil, nil, nil
+}

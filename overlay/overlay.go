@@ -49,6 +49,11 @@ type FS struct {
 	writers     map[inodeKey]int    // open writable descriptors per upper inode, see [FS.upperInfo]
 	staging     sync.RWMutex        // shared by an unlocked writeback, see [FS.writeBack]
 	spillLogged atomic.Bool         // the first failed spill is logged, see [Memory.park]
+
+	rootInfo      os.FileInfo       // root attributes while the index is cold
+	origins       map[string]string // rename hints kept while the index is cold
+	lastAccess    atomic.Int64      // Unix nanoseconds of the last index use, see [FS.Cool]
+	memoryHandles int               // open memory handles, including unlinked files'
 }
 
 // Filesystem interface assertions keep the overlay compatible with protocols.
@@ -95,14 +100,9 @@ func New(upper string, layers []*Layer, bottom Bottom, mem *Memory) (*FS, error)
 	if err := os.Mkdir(f.work, 0o700); err != nil {
 		return nil, err
 	}
-	f.index, err = indexLayer(f.upper, true)
+	f.index, err = walkLayer(f.upper, true, false, "")
 	if err != nil {
 		return nil, err
-	}
-	for p, e := range f.index.entries {
-		if err := f.track(p, e.Info); err != nil {
-			return nil, err
-		}
 	}
 	// A fresh upper must not change the visible root's timestamp.
 	if len(f.index.entries) == 1 {
@@ -119,6 +119,8 @@ func New(upper string, layers []*Layer, bottom Bottom, mem *Memory) (*FS, error)
 			}
 		}
 	}
+	f.rootInfo = f.index.entries[""].Info
+	f.index = nil
 	return f, nil
 }
 
@@ -128,6 +130,18 @@ func (f *FS) Rebase(bottom Bottom) {
 	defer f.mu.Unlock()
 	f.bottom = bottom
 	f.bottomEpoch++
+}
+
+// Relayer replaces frozen layer old with fresh, the same layer restored from its
+// metadata, without disturbing open files or inode identities.
+func (f *FS) Relayer(old, fresh *Layer) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, l := range f.layers {
+		if l == old {
+			f.layers[i] = fresh
+		}
+	}
 }
 
 // Upper returns the host directory receiving writes, or empty for read-only views.
@@ -155,7 +169,11 @@ func (f *FS) UpperFile(name string) (os.FileInfo, bool) {
 }
 
 // Stack returns an independent slice of immutable layers, top first.
-func (f *FS) Stack() []*Layer { return slices.Clone(f.layers) }
+func (f *FS) Stack() []*Layer {
+	f.mu.RLock() // [FS.Relayer] swaps entries
+	defer f.mu.RUnlock()
+	return slices.Clone(f.layers)
+}
 
 // Freeze transfers this upper's index to a frozen layer after the caller has
 // flushed it ([FS.Flush]), renamed the upper to dir and removed its work
@@ -164,7 +182,7 @@ func (f *FS) Stack() []*Layer { return slices.Clone(f.layers) }
 func (f *FS) Freeze(dir string) (*Layer, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.upper == "" || f.index == nil {
+	if f.upper == "" {
 		return nil, &fs.PathError{Op: "freeze", Path: dir, Err: syscall.EROFS}
 	}
 	if len(f.files) != 0 {
@@ -182,6 +200,13 @@ func (f *FS) Freeze(dir string) (*Layer, error) {
 		return nil, &fs.PathError{Op: "freeze", Path: root, Err: syscall.ENOTDIR}
 	}
 	l := f.index
+	if l == nil {
+		// A cold upper is indexed where the caller renamed it.
+		if l, err = indexLayer(root, false); err != nil {
+			return nil, err
+		}
+		l.addOrigins(f.origins)
+	}
 	if wrote, err := l.saveOrigins(root); err != nil {
 		return nil, err
 	} else if wrote {
@@ -236,6 +261,9 @@ func (f *FS) lookup(p string) (source, os.FileInfo, error) {
 	if reserved(p) {
 		return source{}, nil, notExist("lstat", p)
 	}
+	if p == "" && f.index == nil && f.upper != "" && f.rootInfo != nil {
+		return source{upper: true}, f.rootInfo, nil
+	}
 	if f.index != nil {
 		if e, ok := f.index.entries[p]; ok {
 			if e.Kind == KindWhiteout {
@@ -252,13 +280,14 @@ func (f *FS) lookup(p string) (source, os.FileInfo, error) {
 		}
 	}
 	for _, l := range f.layers {
-		if e, ok := l.entries[p]; ok {
+		v := l.view()
+		if e, ok := v.entries[p]; ok {
 			if e.Kind == KindWhiteout {
 				return source{}, nil, notExist("lstat", p)
 			}
 			return source{layer: l}, e.Info, nil
 		}
-		if l.barrier(p) {
+		if v.barrier(p) {
 			return source{}, nil, notExist("lstat", p)
 		}
 	}
@@ -275,7 +304,7 @@ func (f *FS) lookup(p string) (source, os.FileInfo, error) {
 // lowerHas detects a name in any immutable source, even if currently hidden.
 func (f *FS) lowerHas(p string) (bool, error) {
 	for _, l := range f.layers {
-		if e, ok := l.entries[p]; ok && e.Kind != KindWhiteout {
+		if e, ok := l.view().entries[p]; ok && e.Kind != KindWhiteout {
 			return true, nil
 		}
 	}
@@ -291,6 +320,10 @@ func (f *FS) lowerHas(p string) (bool, error) {
 
 // readlink reads the selected backing source without doing another lookup.
 func (f *FS) readlink(s source, p string) (string, error) {
+	if s.upper && s.layer == nil {
+		target, err := os.Readlink(f.up(p))
+		return filepath.ToSlash(target), err
+	}
 	if s.layer != nil {
 		return s.layer.Readlink(p)
 	}
@@ -303,15 +336,15 @@ func (f *FS) readlink(s source, p string) (string, error) {
 func (f *FS) InBottom(name string) bool {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	s, _, err := f.lookup(Clean(name))
-	return err == nil && s.layer == nil
+	s, _, err := f.lookupRead(Clean(name))
+	return err == nil && !s.upper && s.layer == nil
 }
 
 // Lstat describes name without following its final symlink.
 func (f *FS) Lstat(name string) (os.FileInfo, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	_, info, err := f.lookup(Clean(name))
+	_, info, err := f.lookupRead(Clean(name))
 	return info, err
 }
 
@@ -321,7 +354,7 @@ func (f *FS) Stat(name string) (os.FileInfo, error) {
 	defer f.mu.RUnlock()
 	p := Clean(name)
 	for range 40 {
-		s, info, err := f.lookup(p)
+		s, info, err := f.lookupRead(p)
 		if err != nil || info.Mode()&os.ModeSymlink == 0 {
 			return info, err
 		}
@@ -342,7 +375,7 @@ func (f *FS) Readlink(name string) (string, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	p := Clean(name)
-	s, _, err := f.lookup(p)
+	s, _, err := f.lookupRead(p)
 	if err != nil {
 		return "", err
 	}
@@ -351,9 +384,18 @@ func (f *FS) Readlink(name string) (string, error) {
 
 // ReadDir merges direct entries from all visible levels in name order.
 func (f *FS) ReadDir(name string) ([]os.FileInfo, error) {
+	p := Clean(name)
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return f.readDir(Clean(name))
+	if f.index == nil && f.upper != "" {
+		index, err := walkLayer(f.upper, true, false, p)
+		if err != nil {
+			return nil, err
+		}
+		view := FS{upper: f.upper, index: index, layers: f.layers, bottom: f.bottom}
+		return view.readDir(p)
+	}
+	return f.readDir(p)
 }
 
 // readDir applies ancestor barriers, whiteouts, opaque directories and shadows.
@@ -375,6 +417,7 @@ func (f *FS) readDir(p string) ([]os.FileInfo, error) {
 	seen := make(map[string]bool)
 	out := make([]os.FileInfo, 0)
 	merge := func(l *Layer, upper bool) (bool, error) {
+		l = l.view()
 		e, present := l.entries[p]
 		if present && e.Kind != KindDir {
 			return true, nil
@@ -448,6 +491,7 @@ func (f *FS) bottomOnly(p string) bool {
 
 // untouched reports whether l has no entry, child or barrier for directory p.
 func (l *Layer) untouched(p string) bool {
+	l = l.view()
 	_, present := l.entries[p]
 	return !present && len(l.children[p]) == 0 && !l.barrier(p)
 }
@@ -479,7 +523,7 @@ func (f *FS) Open(name string) (billy.File, error) { return f.OpenFile(name, os.
 func (f *FS) openLower(name string, flag int) (h billy.File, ok bool, err error) {
 	p := Clean(name)
 	f.mu.RLock()
-	s, info, err := f.lookup(p)
+	s, info, err := f.lookupRead(p)
 	bottom := f.bottom
 	f.mu.RUnlock()
 	if err != nil || s.upper || !info.Mode().IsRegular() {
@@ -508,14 +552,21 @@ func (f *FS) OpenFile(name string, flag int, perm os.FileMode) (billy.File, erro
 		if h, ok, err := f.openLower(name, flag); ok {
 			return h, err
 		}
-	} else {
-		f.staging.RLock()
-		defer f.staging.RUnlock()
 	}
+	f.staging.RLock()
+	defer f.staging.RUnlock()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 retry:
 	p := Clean(name)
+	if !writing && f.index == nil {
+		if h, ok, err := f.openUpperCold(p, name, flag); ok {
+			return h, err
+		}
+	}
+	if err := f.loadIndex(); err != nil {
+		return nil, err
+	}
 	if writing {
 		if err := f.mutable("open", p); err != nil {
 			return nil, err
@@ -1175,7 +1226,7 @@ func (f *FS) mutable(op, p string) error {
 	if f.upper == "" {
 		return &fs.PathError{Op: op, Path: p, Err: syscall.EROFS}
 	}
-	return nil
+	return f.loadIndex()
 }
 
 // refresh synchronizes one upper entry's metadata without forgetting opacity.
@@ -1446,7 +1497,8 @@ func (f *FS) upperInfo(p string, e Entry) (os.FileInfo, error) {
 	if e.Kind == KindDir {
 		return e.Info, nil
 	}
-	if key, ok := f.pathIDs[p]; ok && f.writers[key] == 0 {
+	// A cold listing's transient view (no pathIDs) has no open descriptors.
+	if key, ok := f.pathIDs[p]; f.pathIDs == nil || ok && f.writers[key] == 0 {
 		return e.Info, nil
 	}
 	return lstatIndexed(f.up(p), e.Info)
@@ -1464,6 +1516,7 @@ type file struct {
 	fs          *FS
 	ownerClosed bool
 	closeErr    error
+	cold        string // upper path of a read opened without the index, see [FS.openUpperCold]
 }
 
 // open wraps a host file without losing its overlay-relative name; an owner

@@ -216,10 +216,11 @@ func Open(c Config) (*Registry, error) {
 	}
 	phase("leftovers")
 	r.hasher = newHasher(r.storeLayers)
-	r.workers.Add(2)
+	r.workers.Add(3)
 	go r.collectGarbage()
 	go r.processNotices()
 	go r.emptyTrash()
+	go r.coolCheckouts()
 	// Without folder events, live paths are simply never delegated (see Tracked).
 	if r.watcher, err = watch.New(r.folderChanged); err == nil {
 		r.watchWake = make(chan struct{}, 1)
@@ -913,6 +914,7 @@ func (r *Registry) storeLayers(kept layerBlobs) {
 		if rec == nil {
 			continue
 		}
+		stored := l.Stored()
 		err := storeLayer(r.store, l, ids)
 		if err == nil && embeddable(l) {
 			// The manifest file stays the recoverable copy until state.json carries it.
@@ -926,6 +928,9 @@ func (r *Registry) storeLayers(kept layerBlobs) {
 				err = l.RemoveMetadata()
 			}
 		}
+		if err == nil && !stored {
+			r.restoreStored(rec, l)
+		}
 		r.mu.Lock()
 		rec.refs--
 		if rec.refs == 0 {
@@ -935,6 +940,26 @@ func (r *Registry) storeLayers(kept layerBlobs) {
 		if err != nil {
 			r.enqueueNotice(baseNotice{fault: "store layer " + rec.id + ": " + err.Error()})
 		}
+	}
+}
+
+// restoreStored swaps a just-stored layer for one restored from its metadata,
+// whose index is dropped while unused (see overlay.Layer.Cool). On failure the
+// resident layer keeps serving.
+func (r *Registry) restoreStored(rec *layerRecord, old *overlay.Layer) {
+	fresh, err := overlay.RestoreLayer(old.Dir(), old.Metadata(), blobFiles{r.store})
+	if err != nil {
+		return
+	}
+	r.mu.Lock()
+	rec.layer = fresh
+	filesystems := make([]*overlay.FS, 0, len(r.checkouts))
+	for _, h := range r.checkouts {
+		filesystems = append(filesystems, h.fs)
+	}
+	r.mu.Unlock()
+	for _, fs := range filesystems {
+		fs.Relayer(old, fresh)
 	}
 }
 
@@ -990,6 +1015,38 @@ func (r *Registry) wakeNotices() {
 	select {
 	case r.noticeWake <- struct{}{}:
 	default:
+	}
+}
+
+// coolCheckouts drops upper and restored layer indexes unused for a minute. It
+// never retires a checkout or invalidates handles, and never waits on one under r.mu.
+func (r *Registry) coolCheckouts() {
+	defer r.workers.Done()
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	var filesystems []*overlay.FS
+	for {
+		select {
+		case <-r.stop:
+			return
+		case <-ticker.C:
+		}
+		r.mu.RLock()
+		for _, h := range r.checkouts {
+			if !h.retired.Load() {
+				filesystems = append(filesystems, h.fs)
+			}
+		}
+		for _, rec := range r.layers {
+			rec.layer.Cool(6) // six checks: a minute
+		}
+		r.mu.RUnlock()
+		before := time.Now().Add(-time.Minute)
+		for _, fs := range filesystems {
+			fs.Cool(before)
+		}
+		clear(filesystems) // keep no retired checkout's FS alive between ticks
+		filesystems = filesystems[:0]
 	}
 }
 
