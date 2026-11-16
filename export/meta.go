@@ -252,7 +252,15 @@ func (n *nodeFS) Rename(from, to string) (err error) {
 	}()
 
 	n.recall(from, to)
-	if err := n.Filesystem.Rename(from, to); err != nil {
+	err = n.Filesystem.Rename(from, to)
+	if errors.Is(err, syscall.ENOTEMPTY) {
+		if info, statErr := n.Filesystem.Lstat(to); statErr == nil && info.IsDir() {
+			err = n.retryWithoutSidecars(overlay.Clean(to), err, func() error {
+				return n.Filesystem.Rename(from, to)
+			})
+		}
+	}
+	if err != nil {
 		return err
 	}
 	src, dst := overlay.Clean(from), overlay.Clean(to)
@@ -278,8 +286,10 @@ func (n *nodeFS) Remove(name string) (err error) {
 
 	n.recall(name)
 	err = n.Filesystem.Remove(name)
-	if errors.Is(err, syscall.ENOTEMPTY) && n.dropAppleDouble(name) {
-		err = n.Filesystem.Remove(name)
+	if errors.Is(err, syscall.ENOTEMPTY) {
+		err = n.retryWithoutSidecars(name, err, func() error {
+			return n.Filesystem.Remove(name)
+		})
 	}
 	if err != nil {
 		return err
@@ -288,24 +298,41 @@ func (n *nodeFS) Remove(name string) (err error) {
 	return nil
 }
 
+// retryWithoutSidecars handles notEmpty, the ENOTEMPTY of an operation on
+// dir. It runs retry once after it drops the sidecars of dir. It keeps
+// notEmpty when dir holds a visible entry, and it returns the cleanup error
+// when a sidecar removal fails, because a partial cleanup is not success.
+func (n *nodeFS) retryWithoutSidecars(dir string, notEmpty error, retry func() error) error {
+	dropped, err := n.dropAppleDouble(dir)
+	if err != nil {
+		return err
+	}
+	if !dropped {
+		return notEmpty
+	}
+	return retry()
+}
+
 // dropAppleDouble removes the "._*" files from dir if nothing else is in it.
 // Clients cannot see them (ReadDir hides them), so to the client the
-// directory is empty and rmdir must succeed.
-func (n *nodeFS) dropAppleDouble(dir string) bool {
+// directory is empty and rmdir must succeed. It returns false and no error
+// when dir holds a visible entry, and the first listing or removal error.
+func (n *nodeFS) dropAppleDouble(dir string) (bool, error) {
 	infos, err := n.Filesystem.ReadDir(dir)
 	if err != nil {
-		return false
+		return false, err
 	}
 	for _, info := range infos {
 		if !overlay.AppleDouble(info.Name()) {
-			return false
+			return false, nil
 		}
 	}
 	for _, info := range infos {
-		if n.Filesystem.Remove(path.Join(dir, info.Name())) != nil {
-			return false
+		name := path.Join(dir, info.Name())
+		if err := n.Filesystem.Remove(name); err != nil {
+			return false, err
 		}
-		n.nodes.remove(overlay.Clean(path.Join(dir, info.Name())))
+		n.nodes.remove(overlay.Clean(name))
 	}
-	return true
+	return true, nil
 }
