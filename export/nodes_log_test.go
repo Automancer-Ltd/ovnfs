@@ -1,11 +1,15 @@
 package export
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // openLogged opens the identity log name over namespace ns.
@@ -370,5 +374,120 @@ func TestLegacyLogIDsGoStale(t *testing.T) {
 	}
 	if id, _ := nt.lookup("new"); derived(id) {
 		t.Fatal("expected a counter id for a directory created as an ancestor")
+	}
+}
+
+// captureLog collects nt's log lines. Read them with nt.mu held.
+func captureLog(nt *nodeTable) *[]string {
+	var lines []string
+	nt.mu.Lock()
+	nt.logf = func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
+	nt.mu.Unlock()
+	return &lines
+}
+
+// swapLog replaces nt's log handle with f, under the node mutex. The
+// original handle is closed at cleanup.
+func swapLog(t *testing.T, nt *nodeTable, f *os.File) {
+	t.Helper()
+	nt.mu.Lock()
+	orig := nt.log
+	nt.log = f
+	nt.mu.Unlock()
+	t.Cleanup(func() { orig.Close() })
+}
+
+// failedTable opens a logged table over co/a and co/b/f, issues co/a, then
+// makes every log write fail with EBADF.
+func failedTable(t *testing.T) (nt *nodeTable, name string, ns *namespace, lines *[]string, issued uint64) {
+	t.Helper()
+	name = filepath.Join(t.TempDir(), "nodes.log")
+	ns = newNamespace("co/a", "co/b/f")
+	nt = openLogged(t, name, ns)
+	lines = captureLog(nt)
+	if issued = nt.id("co/a"); issued == 0 {
+		t.Fatal("co/a: no id before the failure")
+	}
+	ro, err := os.Open(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	swapLog(t, nt, ro)
+	return nt, name, ns, lines, issued
+}
+
+// TestNodeLogWriteFailureLatchesFault refuses new identities after the first
+// failed log append, so no id that a restart cannot resolve reaches a client.
+func TestNodeLogWriteFailureLatchesFault(t *testing.T) {
+	nt, name, ns, lines, issued := failedTable(t)
+	for i := range 3 {
+		if id := nt.id("co/b/f"); id != 0 {
+			t.Fatalf("call %d: issued %x after the log failed", i, id)
+		}
+	}
+	if nt.fault.Load() == nil {
+		t.Fatal("no fault latched")
+	}
+	if err := (&nodeFS{nodes: nt}).IdentityError(); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("identity error: %v", err)
+	}
+	nt.mu.Lock()
+	got := len(*lines)
+	nt.mu.Unlock()
+	if got != 1 {
+		t.Fatalf("log lines: %d, want 1: %q", got, *lines)
+	}
+
+	// A restart from the log as it stands resolves every issued id.
+	reopened := openLogged(t, crashCopy(t, name), ns)
+	if got := pathOf(t, reopened, issued); got != "co/a" {
+		t.Fatalf("issued id resolves to %s", got)
+	}
+	fresh := reopened.id("co/b/f")
+	for _, id := range []uint64{1, reopened.id("co"), issued} {
+		if fresh == 0 || fresh == id {
+			t.Fatalf("fresh id %x reuses %x", fresh, id)
+		}
+	}
+}
+
+// TestNodeLogFailureShowsInStatus reports a failed log write as the node
+// cache error that status shows.
+func TestNodeLogFailureShowsInStatus(t *testing.T) {
+	nt, _, _, _, _ := failedTable(t)
+	nt.id("co/b/f")
+	got := (&Export{fs: &nodeFS{nodes: nt}}).NodeCacheError()
+	if !strings.HasPrefix(got, "node log:") || !strings.Contains(got, "input/output error") {
+		t.Fatalf("node cache error: %q", got)
+	}
+}
+
+// TestNodeLogSyncFailureLatchesFault latches the same fault when the flush
+// worker cannot make the log durable.
+func TestNodeLogSyncFailureLatchesFault(t *testing.T) {
+	name := filepath.Join(t.TempDir(), "nodes.log")
+	nt := openLogged(t, name, newNamespace("co/a"))
+	lines := captureLog(nt)
+	closed, err := os.Open(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed.Close()
+	swapLog(t, nt, closed)
+	nt.mu.Lock()
+	nt.dirty = true
+	nt.mu.Unlock()
+	deadline := time.Now().Add(2 * time.Second)
+	for nt.fault.Load() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("no fault latched within 2s")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	nt.mu.Lock()
+	got := len(*lines)
+	nt.mu.Unlock()
+	if got != 1 {
+		t.Fatalf("log lines: %d, want 1: %q", got, *lines)
 	}
 }
