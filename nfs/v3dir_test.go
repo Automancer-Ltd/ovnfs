@@ -304,7 +304,83 @@ func TestV3ReaddirChangesMidListing(t *testing.T) {
 	s.dirs = dirCache{}
 	fs.write(t, "d/zz-new", "")
 	pg := readdir3(t, call, true, dir, cookie, first.verf, 4096, 4096)
+	last := first.entries[len(first.entries)-1].name
+	next := files[slices.Index(files, last)+1]
+	if pg.st != stOK || len(pg.entries) == 0 || pg.entries[0].name != next || pg.entries[0].cookie != cookie+1 {
+		t.Fatalf("evicted continuation of a changed directory: %+v, want %q on, numbered after cookie %d", pg, next, cookie)
+	}
+}
+
+// TestV3ReaddirEvictedTwice checks that a continuation of a changed
+// directory whose snapshot was evicted resumes after the last name its page
+// returned, numbered after its cookie, so a reader that loses its snapshot
+// before every page still lists each entry once.
+func TestV3ReaddirEvictedTwice(t *testing.T) {
+	for _, plus := range []bool{false, true} {
+		fs := newTestFS(t)
+		files := dirFixture(t, fs, 30)
+		s := &Server{FS: fs}
+		call := direct(s)
+		dir := fs.FileID("d")
+
+		pg := readdir3(t, call, plus, dir, 0, 0, 4096, 400)
+		if pg.st != stOK || pg.eof {
+			t.Fatalf("first page: %+v", pg)
+		}
+		// Remove a file not listed yet, so the directory changed.
+		if err := os.Remove(fs.host(path.Join("d", files[len(files)-1]))); err != nil {
+			t.Fatal(err)
+		}
+		seen := pg.entries
+		pages := 1
+		for !pg.eof {
+			if pages > 100 {
+				t.Fatal("listing does not end")
+			}
+			s.dirs = dirCache{}
+			last := pg.entries[len(pg.entries)-1]
+			pg = readdir3(t, call, plus, dir, last.cookie, pg.verf, 4096, 400)
+			pages++
+			if pg.st != stOK || len(pg.entries) == 0 {
+				t.Fatalf("plus %v: page %d: %+v", plus, pages, pg)
+			}
+			if e := pg.entries[0]; e.name <= last.name || e.cookie != last.cookie+1 {
+				t.Fatalf("plus %v: page %d starts at %q cookie %d, want after %q cookie %d", plus, pages, e.name, e.cookie, last.name, last.cookie)
+			}
+			seen = append(seen, pg.entries...)
+		}
+		if pages < 3 {
+			t.Fatalf("plus %v: %d pages, want an eviction before at least two", plus, pages)
+		}
+		want := append([]string{".", ".."}, files[:len(files)-1]...)
+		if got := names(t, seen); !slices.Equal(got, want) {
+			t.Fatalf("plus %v: listing evicted before every page: %v", plus, got)
+		}
+	}
+}
+
+// TestV3ReaddirResumeMiss checks that a continuation of a changed directory
+// whose snapshot and continuation point are both gone lists the directory
+// again from its first entry, numbered after its cookie.
+func TestV3ReaddirResumeMiss(t *testing.T) {
+	fs := newTestFS(t)
+	files := dirFixture(t, fs, 30)
+	s := &Server{FS: fs}
+	call := direct(s)
+	dir := fs.FileID("d")
+
+	first := readdir3(t, call, false, dir, 0, 0, 0, 400)
+	if first.st != stOK || first.eof {
+		t.Fatalf("first page: %+v", first)
+	}
+	if err := os.Remove(fs.host(path.Join("d", files[len(files)-1]))); err != nil {
+		t.Fatal(err)
+	}
+	s.dirs = dirCache{}
+	s.resumes = resumeCache{}
+	cookie := first.entries[len(first.entries)-1].cookie
+	pg := readdir3(t, call, false, dir, cookie, first.verf, 0, 400)
 	if pg.st != stOK || len(pg.entries) == 0 || pg.entries[0].name != files[0] || pg.entries[0].cookie != cookie+1 {
-		t.Fatalf("evicted continuation of a changed directory: %+v, want the directory again, numbered after cookie %d", pg, cookie)
+		t.Fatalf("continuation without its point: %+v, want %q on, numbered after cookie %d", pg, files[0], cookie)
 	}
 }

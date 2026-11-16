@@ -41,6 +41,36 @@ func TestDirCacheBudget(t *testing.T) {
 	}
 }
 
+// TestResumeCacheBounded checks that continuation points are kept up to
+// resumeMax, least recently used out first.
+func TestResumeCacheBounded(t *testing.T) {
+	var c resumeCache
+	key := func(i int) resumeKey { return resumeKey{dir: 1, verf: 2, cookie: uint64(i)} }
+	for i := range 5000 {
+		c.put(key(i), strconv.Itoa(i))
+	}
+	oldest := 5000 - resumeMax
+	if last, ok := c.get(key(oldest)); !ok || last != strconv.Itoa(oldest) {
+		t.Fatalf("point %d: %q %v", oldest, last, ok)
+	}
+	c.put(key(5000), "5000")
+	if c.lru.Len() != resumeMax || len(c.byKey) != resumeMax {
+		t.Fatalf("holds %d points, want %d", c.lru.Len(), resumeMax)
+	}
+	if _, ok := c.get(key(oldest - 1)); ok {
+		t.Fatal("point kept past the limit")
+	}
+	if _, ok := c.get(key(oldest)); !ok {
+		t.Fatal("recently used point dropped")
+	}
+	if _, ok := c.get(key(oldest + 1)); ok {
+		t.Fatal("least recently used point kept")
+	}
+	if last, ok := c.get(key(5000)); !ok || last != "5000" {
+		t.Fatalf("newest point: %q %v", last, ok)
+	}
+}
+
 // fakeInfo is a regular file's FileInfo with only a name.
 type fakeInfo string
 

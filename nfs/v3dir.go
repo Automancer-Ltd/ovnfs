@@ -41,7 +41,7 @@ func (s *Server) list3(d *decoder, res *encoder, plus bool) status {
 	}
 	l, st := s.list(id, p, cookie, verf)
 	if st == stBadCookie {
-		l, st = s.relist(id, p, cookie)
+		l, st = s.relist(id, p, cookie, verf)
 	}
 	if st != stOK {
 		return st
@@ -79,6 +79,8 @@ func (s *Server) list3(d *decoder, res *encoder, plus bool) status {
 		}
 		fits = r.add("..", 2, upID, a)
 	}
+	var lastCookie uint64
+	var lastName string
 	for i := start; fits && i < len(l.entries); i++ {
 		info := l.entries[i]
 		var child string
@@ -108,6 +110,14 @@ func (s *Server) list3(d *decoder, res *encoder, plus bool) status {
 		} else {
 			fits = r.add(info.Name(), c, childID, nil)
 		}
+		if fits {
+			lastCookie, lastName = c, info.Name()
+		}
+	}
+	if !fits && lastName != "" {
+		// The page ended with entries left: record where it stopped, for a
+		// continuation whose snapshot is evicted (see Server.relist).
+		s.resumes.put(resumeKey{id, l.verf, lastCookie}, lastName)
 	}
 	if !fits && r.n == 0 {
 		return stTooSmall
