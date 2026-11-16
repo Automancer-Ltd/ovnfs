@@ -190,7 +190,7 @@ env:
 | `proto` | string | user file only: default file server protocol (`nfs`, `smb`, `fuse`, or `winfsp`) |
 | `memory` | size | user file only: memory budget for written files (default 64M) |
 | `fsync` | boolean | user file only: spill and sync memory-backed files on fsync |
-| `node_cache` | size | user file only: estimated cache budget for derived ids and directory listings (default 16M) |
+| `node_cache` | size | user file only: estimated cache budget for derived ids and directory listings (default 256M) |
 | `blob_cache` | size | user file only: memory budget for content-addressed blobs (default 16M) |
 | `atime` | boolean | user file only: allow access time updates |
 | `nfs_io_size` | size | user file only: NFS transfer size, power of two from 4K to 1M (default 128K; 0 uses default) |

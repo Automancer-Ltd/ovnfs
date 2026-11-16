@@ -126,9 +126,10 @@ func (e *Export) NodeCacheError() string {
 }
 
 // DefaultNodeCache is the estimated byte budget for reconstructible
-// identities. Evicted ones cost one append to the index and come back
-// through a memory map, so a small budget only bounds the working set.
-const DefaultNodeCache = 16 << 20
+// identities: several full walks of a 475,000-file tree, about 70 MB each.
+// Trimming and paging past the budget run under the node-table mutex every
+// NFS request takes, so a working set above it serializes the mount.
+const DefaultNodeCache = 256 << 20
 
 // Estimated resident bytes of a leaf, of an unlogged node, and of a retired
 // hash, beside their names.

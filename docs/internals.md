@@ -336,7 +336,7 @@ process footprint the OS charges (`heap_live`, `heap_in_use`, `go_held`,
 `footprint` in JSON).
 
 Node ids and their directories' cached listings share a third budget,
-`--node-cache` (default 16 MiB; `OVNFS_NODE_CACHE`, user-file `node_cache`).
+`--node-cache` (default 256 MiB; `OVNFS_NODE_CACHE`, user-file `node_cache`).
 The least recently used directory loses its listing, unlogged leaves, retired
 hashes and unlogged nodes. Its issued names move to a sorted disk index first,
 beside the hashes of names removed through the export. A cold handle keeps its
@@ -452,15 +452,18 @@ dirty if its ownership changed meanwhile. NFSv4 prepares identity holds before
 its state transaction and releases them after unlocking; slow index I/O does
 not hold the global protocol state lock.
 
-The 16 MiB default holds a build's working set: about 170,000 issued names
-(a leaf costs about 64 bytes plus its name), or listings of about 400,000
-entries (8 bytes plus the name each). Past it, a directory costs a mapped index
-search on its next use rather than memory: walking a 475,000-file tree under
-the default, a name or handle the cache had evicted resolves in about 0.5 µs,
-against 0.1 µs resident (and 26 µs when the earlier per-directory index files
-were read whole), while the table's heap stays near the budget instead of about
-70 MB for the whole tree. A larger budget only saves those searches. It does
-not bound total daemon RSS.
+A leaf costs about 64 bytes plus its name and a listed entry 8 bytes plus its
+name, so a full walk of a 475,000-file tree keeps about 70 MB resident; the
+256 MiB default holds several such walks. Past the budget, a directory costs a
+mapped index search on its next use rather than memory: an evicted name or
+handle resolves in about 0.5 µs alone, against 0.1 µs resident. Under load the
+eviction is the cost: trimming scans the LRU and paging reads the index under
+the node-table mutex every NFS request takes. With the earlier 16 MiB default,
+`git status` on a 479,000-file checkout beside three other live checkouts ran
+the cache at twice its budget, NFS requests waited 848 s in total on that
+mutex per 20 s of wall time, and the status did not finish in 60 s; at 1 GiB
+the cache held 68 MB and lock waits fell to 3 s. The budget does not bound
+total daemon RSS.
 
 Resident name lookups walk their parent path once without paging or retaining
 unneeded operation state. Listed child identities accept a directory and
