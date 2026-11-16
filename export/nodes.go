@@ -796,13 +796,16 @@ func (t *nodeTable) takenResident(d *node, h uint32) bool {
 // directory and name: a leaf, or for an id issued before a restart the one
 // entry of its hash in the keyed directory that no other node owns, which
 // becomes a leaf. A listing that relist read decides even when install
-// refused to keep it, so creates during each read cannot exhaust the tries.
+// refused to keep it, so creates during each read cannot exhaust the tries;
+// it is checked against the directory as it is after the read.
 func (t *nodeTable) resolve(id uint64) (*node, string) {
 	if id&derivedBit == 0 || id >= idLimit || t.list == nil {
 		return nil, ""
 	}
 	key, h := id>>hashBits&(maxDerivingKey-1), uint32(id&(1<<hashBits-1))
 	fresh := false
+	var read *dirList // a listing of readDir install refused
+	var readDir *node
 	for tries := 0; tries < 4; {
 		if n := t.byID[id]; n != nil {
 			return n.parent, n.name
@@ -846,7 +849,11 @@ func (t *nodeTable) resolve(id uint64) (*node, string) {
 				// This process may not have recovered every pre-restart handle.
 				// An absent index record still needs ordinary listing resolution.
 			}
-			if name, ok := s.list.candidate(d, h); ok {
+			l := s.list
+			if readDir == d {
+				l = read
+			}
+			if name, ok := l.candidate(d, h); ok {
 				s.coldDirty = true
 				t.addLeaf(d, name)
 				return d, name
@@ -863,16 +870,11 @@ func (t *nodeTable) resolve(id uint64) (*node, string) {
 		if n := t.byID[id]; n != nil {
 			return n.parent, n.name
 		}
+		fresh = installed
 		if !installed && infos != nil && t.spillErr == nil {
 			// The refused listing is not kept: it decides this id only.
-			if name, ok := newDirList(infos).candidate(d, h); ok {
-				d.dir.coldDirty = true
-				t.addLeaf(d, name)
-				return d, name
-			}
-			return nil, ""
+			read, readDir, fresh = newDirList(infos), d, true
 		}
-		fresh = installed
 	}
 	return nil, ""
 }

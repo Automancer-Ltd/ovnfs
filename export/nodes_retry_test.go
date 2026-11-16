@@ -217,3 +217,25 @@ func TestResolveAmbiguousReadListing(t *testing.T) {
 		t.Fatalf("ambiguous handle resolved to %s", p)
 	}
 }
+
+// TestResolveRechecksReadListing resolves nothing from a listing read while
+// its directory was removed and replaced: the handle died with the old key.
+func TestResolveRechecksReadListing(t *testing.T) {
+	nt, id := busyRestart(t, "leaf")
+	ns, read := newNamespace("co/leaf", "co/other"), false
+	nt.list = func(dir string) ([]os.FileInfo, error) {
+		infos, err := ns.list(dir)
+		if dir == "co" && !read {
+			read = true
+			nt.remove("co")
+			ns.del("co")
+			ns.add("co/leaf")
+			nt.created("co")
+			nt.created("co/leaf")
+		}
+		return infos, err
+	}
+	if p, ok := nt.path(id); ok {
+		t.Fatalf("handle of a removed directory resolved to %s", p)
+	}
+}
