@@ -90,9 +90,16 @@ func putBuf(b *[]byte) {
 	}
 }
 
+// job is one received call and its place in its file's order.
+type job struct {
+	req  *[]byte
+	turn turn
+}
+
 // serve answers calls until the client disconnects or a read fails. Up to
 // Server.Concurrency calls run at once, since Linux multiplexes a mount's
-// I/O over one connection and one slow call must not stall the rest.
+// I/O over one connection and one slow call must not stall the rest; calls
+// on one file keep their arrival order where replies show it (fileOrder).
 func (c *conn) serve() {
 	defer c.nc.Close()
 	var wg sync.WaitGroup
@@ -100,17 +107,21 @@ func (c *conn) serve() {
 	limit := max(c.srv.Concurrency, 1)
 	// jobs is unbuffered: a send succeeds only when a worker is idle, so at
 	// most limit calls are in flight. Workers start lazily up to limit and
-	// exit when jobs closes, after finishing every accepted call.
-	jobs := make(chan *[]byte)
+	// exit when jobs closes, after finishing every accepted call. A call
+	// enters its file's order before it is handed over, so it only ever
+	// waits for calls already held by workers.
+	jobs := make(chan job)
 	defer close(jobs)
 	workers := 0
-	work := func(first *[]byte) {
+	work := func(first job) {
 		defer wg.Done()
 		var cl call
 		var reply encoder
-		for req := first; req != nil; req = <-jobs {
-			c.answer(*req, &cl, &reply)
-			putBuf(req)
+		for j := first; j.req != nil; j = <-jobs {
+			j.turn.wait()
+			c.answer(*j.req, &cl, &reply)
+			j.turn.leave()
+			putBuf(j.req)
 		}
 	}
 	r := bufio.NewReaderSize(c.nc, 64<<10)
@@ -132,18 +143,48 @@ func (c *conn) serve() {
 			putBuf(req)
 			continue
 		}
+		j := job{req: req, turn: c.turnOf(rec)}
 		select {
-		case jobs <- req:
+		case jobs <- j:
 		default:
 			if workers < limit {
 				workers++
 				wg.Add(1)
-				go work(req)
+				go work(j)
 			} else {
-				jobs <- req
+				jobs <- j
 			}
 		}
 	}
+}
+
+// turnOf enters an NFSv3 call in its file's order: SETATTR and WRITE change
+// the file; GETATTR, ACCESS, READ and COMMIT report its attributes. Other
+// calls, and calls that do not decode, get the zero turn; answer rejects
+// the malformed ones.
+func (c *conn) turnOf(rec []byte) turn {
+	d := decoder{buf: rec}
+	d.u32() // xid
+	if d.u32() != msgCall || d.u32() != 2 || d.u32() != progNFS || d.u32() != 3 {
+		return turn{}
+	}
+	var changes bool
+	switch d.u32() {
+	case v3SetAttr, v3Write:
+		changes = true
+	case v3GetAttr, v3Access, v3Read, v3Commit:
+	default:
+		return turn{}
+	}
+	d.u32()
+	d.opaque(maxAuthBytes) // credential
+	d.u32()
+	d.opaque(maxAuthBytes) // verifier
+	id, ok := d.fh(maxFH3)
+	if d.err != nil || !ok {
+		return turn{}
+	}
+	return c.srv.v3.order.enter(id, changes)
 }
 
 // readRecord reads one record into buf, joining its fragments.

@@ -43,12 +43,14 @@ const (
 )
 
 // v3State is what the server remembers between NFSv3 calls, a stateless
-// protocol: cached writers and permission fallbacks (keptFiles), and the
-// verifiers of EXCLUSIVE creates.
+// protocol: cached writers and permission fallbacks (keptFiles), the
+// verifiers of EXCLUSIVE creates, and the calls under way per file
+// (fileOrder).
 type v3State struct {
 	kept     keptFiles
 	verfs    createVerfs
 	maxSizes maxReportedSizes
+	order    fileOrder
 }
 
 // v3proc is an NFSv3 procedure. run appends the result after the NFS3_OK

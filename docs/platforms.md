@@ -65,6 +65,14 @@ Cached writers are keyed by file id and path, so renames reopen at the current
 path; the export's generation-aware handles preserve snapshot isolation.
 This does not change NFS's [fsync limitations](configuration.md#where-the-daemon-lives).
 
+Calls on one file keep their arrival order wherever replies show it. WRITE
+and SETATTR run one at a time per file, each reporting the attributes from
+just before and just after itself; GETATTR, ACCESS, READ and COMMIT wait for
+the changes that arrived before them. The macOS client recognizes its own
+writes only through that unbroken chain: when concurrent writes interleaved
+it, the client dropped every page it had just written and re-read the whole
+file at its next open.
+
 The server also accepts NFSv4.0 clients on the same socket or port. These may receive
 read delegations, recalled on changes through another protocol, `pull`,
 reattach, checkout removal, and folder edits in cache and local paths reported
