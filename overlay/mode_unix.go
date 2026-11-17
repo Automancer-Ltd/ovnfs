@@ -13,14 +13,15 @@ import (
 
 // Unix files hold their mode natively; see mode_windows.go for hosts that cannot.
 
-// sameFile is [os.SameFile] for metadata that may carry an alias name.
-func sameFile(a, b os.FileInfo) bool { return os.SameFile(unalias(a), unalias(b)) }
-
-// hostLstat is [os.Lstat].
-func hostLstat(name string) (os.FileInfo, error) { return os.Lstat(name) }
-
-// lstatIndexed is [os.Lstat]: the host's mode is current.
-func lstatIndexed(name string, _ os.FileInfo) (os.FileInfo, error) { return os.Lstat(name) }
+// lstatIndexed is [os.Lstat] of an upper file with the identity its indexed
+// metadata recorded; the host's mode is current.
+func lstatIndexed(name string, indexed os.FileInfo) (os.FileInfo, error) {
+	info, err := os.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	return keepIdentity(info, indexed), nil
+}
 
 // withMode returns info: the host's mode is the file's.
 func withMode(_ string, info os.FileInfo) (os.FileInfo, error) { return info, nil }

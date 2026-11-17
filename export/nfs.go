@@ -1,6 +1,7 @@
 package export
 
 import (
+	"os"
 	"time"
 
 	"github.com/stencil-hq/ovnfs/nfs"
@@ -8,27 +9,53 @@ import (
 )
 
 // nfsFS is the export as the NFS server sees it.
-type nfsFS struct{ protocolFS }
+type nfsFS struct {
+	protocolFS
+	handles *handleGens
+}
 
 // NFS exposes the routed filesystem to the NFS server. Its requests skip the
 // export's recall hook: the server recalls the delegations an NFS request
 // conflicts with itself, and recalling the requesting client's own delegation
 // races with the reply that granted it.
-func (e *Export) NFS() nfs.Backend { return &nfsFS{e.protocolFS()} }
+func (e *Export) NFS() nfs.Backend { return &nfsFS{protocolFS: e.protocolFS(), handles: e.handles} }
 
-// ChildID identifies a listed child without constructing its full path.
-func (n *nfsFS) ChildID(dir, name string) uint64 {
-	return n.nodes.childID(dir, name)
+// ChildID identifies an entry of a listing of dir without a syscall.
+func (n *nfsFS) ChildID(dir string, info os.FileInfo) uint64 { return n.rt.childID(dir, info) }
+
+// Generation returns what id's current handles carry beside it: the life of
+// its checkout, so a handle of a removed checkout never reaches a later one
+// in the same slot, and how often RetireHandle retired id's handles.
+func (n *nfsFS) Generation(id uint64) uint64 {
+	var life uint32
+	if slot, _ := splitFileID(id); slot != 0 {
+		_, life, _ = n.rt.reg.SlotOwner(slot)
+	}
+	return uint64(life)<<32 | uint64(n.handles.get(id))
 }
 
-// Path resolves a live node id, which NFS file handles carry, to its path.
-func (n *nfsFS) Path(id uint64) (string, bool) {
-	return n.nodes.path(id)
+// Path resolves an NFS handle, file id id with generation gen, to the
+// current path of its entry; false when the entry is gone or the handle is
+// not id's current one.
+func (n *nfsFS) Path(id, gen uint64) (string, bool) {
+	p, life, ok := n.rt.locate(id)
+	if !ok || gen != uint64(life)<<32|uint64(n.handles.get(id)) {
+		return "", false
+	}
+	return p, true
 }
 
-// RetireHandle makes an existing NFS handle stale without removing its path.
+// RetireHandle makes id's existing NFS handles stale while its path keeps
+// the file id; a fresh lookup gets a handle of the next generation.
 func (n *nfsFS) RetireHandle(id uint64) bool {
-	return n.nodes.retireHandle(id)
+	if id == rootID {
+		return false
+	}
+	if _, _, ok := n.rt.locate(id); !ok {
+		return false
+	}
+	n.handles.bump(id)
+	return true
 }
 
 // Rename advances a regular file's mtime to stand in for the ctime change

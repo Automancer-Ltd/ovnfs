@@ -13,16 +13,20 @@ import (
 	"time"
 
 	"github.com/stencil-hq/ovnfs/internal/clone"
+	"github.com/stencil-hq/ovnfs/internal/ident"
 )
 
 // past is the stable timestamp used to detect accidental copy-up changes.
 var past = time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
 
-// dirBottom is a test-only live bottom backed by a plain directory.
+// dirBottom is a test-only live bottom backed by a plain directory. Its
+// entries have their host files' identities, as on the state volume.
 type dirBottom struct{ dir string }
 
 // Lstat reads unmodified host metadata for the test bottom.
-func (b dirBottom) Lstat(p string) (os.FileInfo, error) { return os.Lstat(filepath.Join(b.dir, p)) }
+func (b dirBottom) Lstat(p string) (os.FileInfo, error) {
+	return statHost(filepath.Join(b.dir, p), nil)
+}
 
 // ReadDir lists host entries without interpreting overlay markers.
 func (b dirBottom) ReadDir(p string) ([]os.FileInfo, error) {
@@ -39,13 +43,34 @@ func (b dirBottom) ReadDir(p string) ([]os.FileInfo, error) {
 	}
 	out := make([]os.FileInfo, 0, len(items))
 	for _, item := range items {
-		info, err := item.Info()
+		info, err := b.Lstat(filepath.Join(p, item.Name()))
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, info)
 	}
 	return out, nil
+}
+
+// Locate walks the test bottom for the entry with identity id.
+func (b dirBottom) Locate(id ident.ID) (string, bool) {
+	found, ok := "", false
+	filepath.WalkDir(b.dir, func(real string, _ fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := statHost(real, nil)
+		if err != nil {
+			return err
+		}
+		if got, has := ident.Of(info); has && got == id {
+			rel, _ := filepath.Rel(b.dir, real)
+			found, ok = Clean(rel), true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found, ok
 }
 
 // Open exposes the test bottom read-only.

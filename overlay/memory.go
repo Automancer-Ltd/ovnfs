@@ -12,12 +12,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/stencil-hq/ovnfs/internal/hostfile"
+	"github.com/stencil-hq/ovnfs/internal/ident"
 )
 
 // fileOverhead is a memory file's charge beyond its data, so that many empty
@@ -34,13 +34,8 @@ const memModeBits = os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
 // errAppendWriteAt matches the os package's refusal of positioned appends.
 var errAppendWriteAt = errors.New("os: invalid use of WriteAt on file opened with O_APPEND")
 
-// memInodes numbers memory files for stat data; host inodes never reach this range.
-var memInodes atomic.Uint64
-
 // root skips the owner permission check, as the kernel does for root.
 var root = os.Geteuid() == 0
-
-func init() { memInodes.Store(1 << 62) }
 
 // Memory is the byte budget overlays share for keeping written upper files in
 // memory instead of on disk. New, truncated and small copied-up regular files
@@ -239,8 +234,8 @@ type memFile struct {
 	mode                os.FileMode // memModeBits only
 	atime, mtime, ctime time.Time
 	created             time.Time
-	ino                 uint64
-	uid, gid            uint32 // what a host create in its directory gets
+	id                  ident.ID // a new Synthetic one, or that of the lower file it copies
+	uid, gid            uint32   // what a host create in its directory gets
 	handles             map[*memHandle]struct{}
 	version             uint64        // counts changes of data and metadata, see [FS.writeBack]
 	elem                *list.Element // LRU position while named; guarded by Memory.mu
@@ -251,7 +246,7 @@ type memFile struct {
 
 // info snapshots m's metadata under the given base name.
 func (m *memFile) info(name string) os.FileInfo {
-	return memInfo{name: name, size: int64(len(m.data)), mode: m.mode, atime: m.atime, mtime: m.mtime, ctime: m.ctime, created: m.created, ino: m.ino, uid: m.uid, gid: m.gid}
+	return memInfo{name: name, size: int64(len(m.data)), mode: m.mode, atime: m.atime, mtime: m.mtime, ctime: m.ctime, created: m.created, id: m.id, uid: m.uid, gid: m.gid}
 }
 
 // access makes the owner permission check the kernel makes when the daemon
@@ -279,7 +274,7 @@ type memInfo struct {
 	mode                os.FileMode
 	atime, mtime, ctime time.Time
 	created             time.Time
-	ino                 uint64
+	id                  ident.ID
 	uid, gid            uint32
 }
 
@@ -300,6 +295,10 @@ func (memInfo) IsDir() bool { return false }
 
 // Sys returns synthetic stat data with the owner the file has on disk.
 func (i memInfo) Sys() any { return memStat(i) }
+
+// Identity returns the memory file's identity, which its file on disk keeps
+// once it spills.
+func (i memInfo) Identity() ident.ID { return i.id }
 
 // admit charges n more bytes to m, linking it into the budget's LRU, after
 // spilling least recently used files while the budget is exhausted. It reports
@@ -349,20 +348,29 @@ func (f *FS) admit(m *memFile, n int64) bool {
 	}
 }
 
-// addMem publishes p as a memory file holding data, leaving the parent's
-// mtime to the caller: a new name stamps it ([FS.touchDir]), a copy-up keeps
-// it. A deletion marker at p stays on disk until the file spills. It returns
-// nil when the budget refuses the file. The caller ensured p's parent exists
-// in upper and p has no upper entry.
-func (f *FS) addMem(p string, mode os.FileMode, mtime time.Time, data []byte) *memFile {
+// addMem publishes p as a memory file holding data with identity id (0: a new
+// Synthetic one), leaving the parent's mtime to the caller: a new name stamps
+// it ([FS.touchDir]), a copy-up keeps it. A deletion marker at p stays on disk
+// until the file spills. It returns nil when the budget refuses the file or no
+// identity can be allocated, and the caller keeps the data on disk. The caller
+// ensured p's parent exists in upper and p has no upper entry.
+func (f *FS) addMem(p string, mode os.FileMode, mtime time.Time, data []byte, id ident.ID) *memFile {
+	if id == 0 {
+		var err error
+		if id, err = f.ids.syn.allocate(); err != nil {
+			return nil
+		}
+	}
 	now := time.Now()
-	m := &memFile{owner: f, path: p, data: data, mode: mode & memModeBits, atime: mtime, mtime: mtime, ctime: now, created: now, ino: memInodes.Add(1), handles: make(map[*memHandle]struct{})}
+	m := &memFile{owner: f, path: p, data: data, mode: mode & memModeBits, atime: mtime, mtime: mtime, ctime: now, created: now, id: id, handles: make(map[*memHandle]struct{})}
 	m.uid, m.gid = newOwner(f.index.entries[parent(p)].Info)
 	if !f.admit(m, fileOverhead+int64(cap(data))) {
 		return nil
 	}
 	f.files[p] = m
-	f.index.set(p, Entry{Kind: KindFile, Info: m.info(path.Base(p))})
+	info := m.info(path.Base(p))
+	f.index.set(p, Entry{Kind: KindFile, Info: info})
+	f.register(p, info)
 	return m
 }
 
@@ -386,7 +394,7 @@ func (f *FS) copyUpMem(s source, p string, info os.FileInfo) (bool, error) {
 	if err != nil || int64(len(data)) > f.mem.fileMax {
 		return false, err
 	}
-	return f.addMem(p, info.Mode(), info.ModTime(), data) != nil, nil
+	return f.addMem(p, info.Mode(), info.ModTime(), data, inherited(s, info)) != nil, nil
 }
 
 // readBounded reads r, sized for about size bytes, stopping once it holds more
@@ -484,11 +492,11 @@ func (f *FS) writeBack(m *memFile) {
 		f.mu.Unlock()
 		return
 	}
-	copied := &memFile{data: slices.Clone(m.data), mode: m.mode, atime: m.atime, mtime: m.mtime, created: m.created, uid: m.uid, gid: m.gid}
+	copied := &memFile{data: slices.Clone(m.data), mode: m.mode, atime: m.atime, mtime: m.mtime, created: m.created, id: m.id, uid: m.uid, gid: m.gid}
 	version := m.version
-	tmp := f.stagingName()
+	tmp, ids := f.stagingName(), f.ids
 	f.mu.Unlock()
-	_, err := stage(tmp, copied)
+	_, err := stage(tmp, copied, ids)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err == nil && m.version == version && m.path != "" && f.files[m.path] == m && len(m.handles) == 0 {
@@ -501,7 +509,7 @@ func (f *FS) writeBack(m *memFile) {
 			return
 		}
 	}
-	os.Remove(tmp)
+	ids.discard(tmp)
 	if err != nil {
 		f.mem.park(m, err)
 	}
@@ -525,7 +533,7 @@ func (f *FS) detach(m *memFile) {
 func (f *FS) spill(m *memFile) error {
 	p := m.path
 	tmp := f.stagingName()
-	fds, err := stage(tmp, m)
+	fds, err := stage(tmp, m, f.ids)
 	if err == nil {
 		err = f.preserveDirTime(parent(p), func() error { return hostfile.Rename(tmp, f.up(p)) })
 	}
@@ -533,7 +541,7 @@ func (f *FS) spill(m *memFile) error {
 		for _, fd := range fds {
 			fd.Close()
 		}
-		os.Remove(tmp)
+		f.ids.discard(tmp)
 		return err
 	}
 	return f.installed(m, fds)
@@ -558,10 +566,10 @@ func (f *FS) installed(m *memFile, fds map[*memHandle]*os.File) error {
 	return err
 }
 
-// stage writes m's data and metadata to the new file tmp and opens a host
-// descriptor for each handle. Descriptors open before the final chmod, which
-// may forbid their access mode.
-func stage(tmp string, m *memFile) (map[*memHandle]*os.File, error) {
+// stage writes m's data, identity (persisted in ids) and metadata to the new
+// file tmp and opens a host descriptor for each handle. Descriptors open before the final chmod,
+// which may forbid their access mode.
+func stage(tmp string, m *memFile, ids *idStore) (map[*memHandle]*os.File, error) {
 	out, err := hostfile.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
@@ -586,10 +594,13 @@ func stage(tmp string, m *memFile) (map[*memHandle]*os.File, error) {
 			_, err = fd.Seek(h.off, io.SeekStart)
 		}
 	}
-	if err == nil {
-		err = out.Chmod(m.mode)
-	}
 	err = errors.Join(err, out.Close())
+	if err == nil {
+		err = ids.persist(tmp, m.id)
+	}
+	if err == nil {
+		err = os.Chmod(tmp, m.mode)
+	}
 	if err == nil {
 		err = keepMode(tmp, m.mode)
 	}
@@ -604,7 +615,7 @@ func stage(tmp string, m *memFile) (map[*memHandle]*os.File, error) {
 
 // newHandle registers a handle on m so a spill can hand it a host descriptor.
 func (f *FS) newHandle(m *memFile, name string, flag int) *memHandle {
-	h := &memHandle{fs: f, name: name, flag: flag, m: m}
+	h := &memHandle{fs: f, name: name, flag: flag, m: m, id: m.id}
 	f.memoryHandles++
 	m.handles[h] = struct{}{}
 	f.mem.touch(m)
@@ -651,6 +662,7 @@ func (f *FS) Flush() error {
 // Discard drops every memory file without writing it and returns its budget,
 // for an overlay whose upper is being deleted.
 func (f *FS) Discard() {
+	defer f.names.Add(1)
 	f.staging.Lock()
 	defer f.staging.Unlock()
 	f.mu.Lock()
@@ -686,6 +698,7 @@ type memHandle struct {
 	fs     *FS
 	name   string
 	flag   int
+	id     ident.ID // the file's identity, kept once spilled
 	m      *memFile // nil once spilled
 	off    int64
 	disk   *file // set once, by spill
@@ -726,6 +739,10 @@ func (h *memHandle) check(op string, allowed func(int) bool) error {
 
 // Name returns the overlay-relative name the handle was opened with.
 func (h *memHandle) Name() string { return h.name }
+
+// Identity returns the file's identity, which the export keeps to find the
+// file again after the handle closes; it needs no lock.
+func (h *memHandle) Identity() ident.ID { return h.id }
 
 // Read reads at the handle's offset and advances it.
 func (h *memHandle) Read(p []byte) (int, error) {

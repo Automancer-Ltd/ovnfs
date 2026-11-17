@@ -58,15 +58,19 @@ func TestSearchMergedCheckoutWithoutMount(t *testing.T) {
 	}
 }
 
-func TestSearchIgnoreRulesAndLivePaths(t *testing.T) {
+// TestSearchIgnoreRulesAndSnapshotPaths searches cache and local paths as the
+// checkout's cache snapshot holds them, not the folder as it is now.
+func TestSearchIgnoreRulesAndSnapshotPaths(t *testing.T) {
 	f := newFixture(t)
+	if !sharesBlocks(t) {
+		t.Skip("the volume cannot clone: cache roots start empty")
+	}
 	dir := folder(t, map[string]string{
-		".gitignore": "ignored/\n", "keep.txt": "needle\n", "ignored/live.txt": "old\n",
+		".gitignore": "ignored/\n", "keep.txt": "needle\n", "ignored/local.txt": "needle\n",
 		".hidden.txt": "needle\n", "secret.txt": "needle\n", "node_modules/pkg/index.js": "needle\n",
 	})
-	// Local, not cache: a checkout hides cache files the folder changes after it opens.
 	f.newCheckout(dir, "search", "hidden secret.txt", "local ignored & dir")
-	write(t, filepath.Join(dir, "ignored", "live.txt"), "needle live\n")
+	write(t, filepath.Join(dir, "ignored", "local.txt"), "needle after the snapshot\n")
 	defaults, err := f.reg.Glob(t.Context(), api.GlobArgs{Checkout: "search", Pattern: "*.txt"})
 	if err != nil || !slices.Equal(globPaths(defaults), []string{"keep.txt"}) {
 		t.Fatalf("default ignores: %+v, %v", defaults, err)
@@ -80,11 +84,11 @@ func TestSearchIgnoreRulesAndLivePaths(t *testing.T) {
 	var paths []string
 	for _, match := range all.Matches {
 		paths = append(paths, match.Path)
-		if match.Path == "ignored/live.txt" && match.Text != "needle live" {
-			t.Fatalf("live path was searched through captured content: %+v", match)
+		if match.Path == "ignored/local.txt" && match.Text != "needle" {
+			t.Fatalf("a local path was searched in the folder, not the snapshot: %+v", match)
 		}
 	}
-	if !slices.Equal(paths, []string{".hidden.txt", "ignored/live.txt", "keep.txt", "node_modules/pkg/index.js"}) {
+	if !slices.Equal(paths, []string{".hidden.txt", "ignored/local.txt", "keep.txt", "node_modules/pkg/index.js"}) {
 		t.Fatalf("visibility overrides must not reveal hidden-class paths: %v", paths)
 	}
 	node, err := f.reg.Glob(t.Context(), api.GlobArgs{Checkout: "search", Pattern: "node_modules/**/*.js"})

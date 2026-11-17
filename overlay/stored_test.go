@@ -260,7 +260,7 @@ func TestOpenLayerFinishesInterruptedStore(t *testing.T) {
 func TestOpenLayerRejectsBadManifests(t *testing.T) {
 	for name, body := range map[string]string{
 		"syntax":         "{",
-		"version":        `{"v":2,"e":[{"p":"","k":2,"m":2147484141}]}`,
+		"version":        `{"v":3,"e":[{"p":"","k":2,"m":2147484141}]}`,
 		"no root":        `{"v":1,"e":[]}`,
 		"orphan":         `{"v":1,"e":[{"p":"","k":2,"m":2147484141},{"p":"a/b","k":1,"m":420}]}`,
 		"kind mismatch":  `{"v":1,"e":[{"p":"","k":2,"m":2147484141},{"p":"a","k":2,"m":420}]}`,

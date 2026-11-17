@@ -60,6 +60,27 @@ type v4Grant struct {
 // or being granted, and does nothing before start.
 func (st *v4State) recall(id uint64) { st.changed(0, id) }
 
+// recallRange is recall of every file whose id is in [first, last]: it
+// refuses the grants under way on them and starts the recall of every
+// delegation of them.
+func (st *v4State) recallRange(first, last uint64) {
+	if !st.active() {
+		return
+	}
+	st.mu.Lock()
+	defer st.unlock()
+	for file, g := range st.granting {
+		if file >= first && file <= last {
+			g.changed = true
+		}
+	}
+	for file := range st.files {
+		if file >= first && file <= last {
+			st.recallOthersLocked(0, file)
+		}
+	}
+}
+
 // probeLocked starts a CB_NULL probe of a client's callback path. Until one
 // succeeds the client is granted no delegations.
 func (st *v4State) probeLocked(c *v4Client) {
@@ -153,27 +174,25 @@ func (st *v4State) endGrantLocked(file uint64, g *v4Grant) {
 // other.
 func (st *v4State) active() bool { return st.grants.Load() != 0 || st.delegs.Load() != 0 }
 
-// grantLocked hands client a read delegation of file if it may still have one and
+// grantLocked hands client a read delegation of file, whose handle the
+// client is given with generation gen, if it may still have one and
 // nothing changed the file since beginGrant returned g.
 //
 // The delegation is counted before the grant stops being: active, which
 // reads the counts the other way round, then never sees neither.
-func (st *v4State) grantLocked(client, file uint64, g *v4Grant, identity *v4Identity) (v4StateID, bool, status) {
+func (st *v4State) grantLocked(client, file uint64, g *v4Grant, gen uint64) (v4StateID, bool) {
 	if g.changed {
-		return v4StateID{}, false, stOK
+		return v4StateID{}, false
 	}
 	st.sweepLocked()
 	if !st.mayDelegateLocked(client, file) {
-		return v4StateID{}, false, stOK
+		return v4StateID{}, false
 	}
 	if int(st.delegs.Load()) >= st.maxDelegs {
 		st.recallOldestLocked()
 	}
-	h := st.newHoldLocked(kind4Deleg, v4Owner{client: client}, file, identity)
-	if h == nil {
-		return v4StateID{}, false, stIO
-	}
-	h.granted = st.now()
+	h := st.newHoldLocked(kind4Deleg, v4Owner{client: client}, file)
+	h.granted, h.gen = st.now(), gen
 	st.fileLocked(file).delegs[client] = h
 	st.delegs.Add(1)
 	st.order = append(st.order, h)
@@ -188,7 +207,7 @@ func (st *v4State) grantLocked(client, file uint64, g *v4Grant, identity *v4Iden
 		clear(st.order[len(live):])
 		st.order = live
 	}
-	return h.advance(), true, stOK
+	return h.advance(), true
 }
 
 // recallOldestLocked recalls the least recently granted delegation that is
@@ -324,7 +343,7 @@ func (st *v4State) recallLoop(d *v4Hold, c *v4Client, cb *v4Callback) {
 		st.dropLocked(d)
 	}
 	for attempt := 0; ; attempt++ {
-		s, err := cb.recall(id, d.file, want, failed)
+		s, err := cb.recall(id, d.file, d.gen, want, failed)
 		if err != nil {
 			return // skipped, or revoked by failed
 		}
@@ -392,7 +411,7 @@ func (x *v4compound) conflictName(dir, name string) (uint64, status) {
 	if err != nil || !info.Mode().IsRegular() {
 		return 0, stOK
 	}
-	id := x.s.FS.FileID(p)
+	id := x.s.FS.IDOf(p, info)
 	return id, x.conflict(id)
 }
 

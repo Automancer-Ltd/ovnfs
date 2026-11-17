@@ -1,12 +1,12 @@
 // Package base provides persistent, fork-time views of a captured source folder.
 //
 // A base is the bottom of every checkout opened from one capture. Source-class
-// paths come from the capture's tree: from the live folder while unchanged
-// since the fork time (cloned on first exposure), else from the store or the
-// folder's git objects. Cache- and local-class roots are the live folder,
-// read-only and as it is now: nothing is copied or frozen, and a checkout's writes
-// copy up into its own upper. Hidden roots and source paths that appeared
-// after the fork do not exist in the view.
+// paths come from the capture's tree: from the folder while unchanged since
+// the fork time (cloned on first exposure), else from the store or the
+// folder's git objects. Cache- and local-class roots come from a copy-on-write
+// snapshot of them that the checkout uses (see [Caches]), never from the
+// folder as it is now; a checkout's writes copy up into its own upper. Hidden
+// roots and source paths that appeared after the fork do not exist in the view.
 package base
 
 import (
@@ -83,11 +83,13 @@ type Base struct {
 	domains   *source.Domains
 	objectsMu sync.Mutex
 	objects   map[string]*git.Objects // object readers by work tree top
-	proofs    dirProofs
-	mu        sync.Mutex
-	closeOnce sync.Once
-	closeErr  error
-	remote    *remoteState
+	// cacheRoots lists the capture's cache and local roots, sorted.
+	cacheRoots []string
+	mu         sync.Mutex
+	caches     map[string]*Caches // mu: the cache snapshots served, by id
+	closeOnce  sync.Once
+	closeErr   error
+	remote     *remoteState
 }
 
 // Create marks the fork time and captures o.Root (with c.Store and the base's
@@ -148,7 +150,7 @@ func Capture(ctx context.Context, c Config, o source.Options) (source.Result, []
 	}
 	var warnings []string
 	if lowerDev != stateDev {
-		warnings = append(warnings, "source is on another volume than the state; pins and stored blobs are byte copies instead of clones")
+		warnings = append(warnings, "source is on another volume than the state; pins, stored blobs and local paths are byte copies instead of clones, and cache directories start empty in checkouts")
 	}
 	o.Store, o.State = c.Store, c.StateDir
 	res, err := source.Capture(ctx, o)
@@ -246,7 +248,7 @@ func available(c Config, m Meta, repos []source.Repo) []source.Repo {
 // newBase serves an open capture index.
 func newBase(c Config, m Meta, x *captureIndex, stats api.Capture, domains *source.Domains) *Base {
 	m.ForkTime = m.ForkTime.UTC()
-	b := &Base{config: c, meta: m, index: x, stats: stats, domains: domains, objects: make(map[string]*git.Objects)}
+	b := &Base{config: c, meta: m, index: x, stats: stats, domains: domains, objects: make(map[string]*git.Objects), cacheRoots: cacheRootsOf(x), caches: make(map[string]*Caches)}
 	if m.Remote != nil {
 		b.remote = &remoteState{b: b, prefetched: map[string]bool{}}
 	}
@@ -354,22 +356,20 @@ func (b *Base) Blob(p string, id store.OID) ([]byte, error) {
 }
 
 // Bottom exposes the immutable base through the overlay read-only interface,
-// for a checkout opened at opened: its cache paths leave out what the folder
-// changed since (see [changedAfter]). A zero opened fences nothing, for views
-// that never read cache paths (snapshot hashing).
-func (b *Base) Bottom(opened time.Time) overlay.Bottom {
+// serving a local base's cache and local roots from snapshot c. A nil c leaves
+// the roots out, for views that never read them (snapshot hashing, checkouts
+// prepared before they are named). A remote base ignores c: its cache roots
+// are empty directories and its local roots absent.
+func (b *Base) Bottom(c *Caches) overlay.Bottom {
 	if b.remote != nil {
 		return remoteBottom{b}
 	}
-	v := bottom{b: b}
-	if !opened.IsZero() {
-		v.fence = opened.UnixNano()
-	}
-	return v
+	return bottom{b: b, c: c}
 }
 
-// Close commits pending pin metadata and stops object readers and the
-// group-commit timer. The capture index stays mapped until the base is
+// Close commits pending pin metadata, stops object readers and the
+// group-commit timer, and closes the cache snapshots' open trees, after which
+// their paths read as absent. The capture index stays mapped until the base is
 // unreachable, so a lookup racing Close (or Remove) reads the capture as it
 // was, never unmapped memory.
 func (b *Base) Close() error {
@@ -380,15 +380,23 @@ func (b *Base) Close() error {
 			errs = append(errs, objects.Close())
 		}
 		b.objectsMu.Unlock()
+		for _, c := range b.served() {
+			c.files.close()
+		}
 		b.closeErr = errors.Join(errs...)
 	})
 	return b.closeErr
 }
 
-// Remove closes the base and removes its private storage. Where a mapped
+// Remove closes the base and removes its private storage, with its cache
+// snapshots once those being taken are complete. Where a mapped
 // file cannot be deleted (Windows), the directory goes once the capture index
 // is unmapped.
 func (b *Base) Remove() error {
+	// Snapshots being taken still write below the base's storage.
+	for _, c := range b.served() {
+		c.Wait()
+	}
 	err := b.Close()
 	dir := b.config.StateDir
 	b.index.m.orphan.Store(&dir)

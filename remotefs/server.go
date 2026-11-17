@@ -23,7 +23,7 @@ import (
 // Share is one checkout as a remote-fs socket serves it.
 type Share struct {
 	// FS is the export tree with every checkout as a top-level directory, e.g.
-	// (*export.Export).Nodes(), so mutations keep the export's node ids in step.
+	// (*export.Export).Nodes(), so mutations keep the export's file ids in step.
 	FS billy.Filesystem
 	// Checkout names the served checkout; every wire path resolves below "<Checkout>/".
 	Checkout string

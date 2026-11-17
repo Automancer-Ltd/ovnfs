@@ -1,6 +1,7 @@
 package nfs
 
 import (
+	"encoding/binary"
 	"math"
 	"os"
 	"runtime"
@@ -43,7 +44,7 @@ func TestV4CompoundFraming(t *testing.T) {
 		t.Fatalf("status %d tag %q results %d", r.status, r.tag, r.n)
 	}
 	r.skip(op4PutRootFH)
-	if id, ok := r.next(op4GetFH, stOK).fh(128); !ok || id != 1 {
+	if id, _, ok := r.next(op4GetFH, stOK).fh(128); !ok || id != 1 {
 		t.Fatalf("root handle id %d (%v), want 1", id, ok)
 	}
 	r.end()
@@ -95,7 +96,8 @@ func TestV4CompoundFraming(t *testing.T) {
 }
 
 // TestV4FileHandles checks PUTFH, GETFH, SAVEFH and RESTOREFH: handles are
-// 8-byte file ids, other lengths are BADHANDLE and gone ids STALE.
+// a file id and its generation; legacy 8-byte handles, gone ids and old
+// generations are STALE, other lengths BADHANDLE.
 func TestV4FileHandles(t *testing.T) {
 	fs := newTestFS(t)
 	if err := os.Mkdir(fs.host("d"), 0o755); err != nil {
@@ -107,11 +109,11 @@ func TestV4FileHandles(t *testing.T) {
 
 	r := c.run(v4PutFH(id), v4GetFH(), v4Save(), v4Root(), v4Restore(), v4GetFH())
 	r.skip(op4PutFH)
-	if got, _ := r.next(op4GetFH, stOK).fh(128); got != id {
+	if got, _, _ := r.next(op4GetFH, stOK).fh(128); got != id {
 		t.Fatalf("GETFH %d, want %d", got, id)
 	}
 	r.skip(op4SaveFH, op4PutRootFH, op4RestoreFH)
-	if got, _ := r.next(op4GetFH, stOK).fh(128); got != id {
+	if got, _, _ := r.next(op4GetFH, stOK).fh(128); got != id {
 		t.Fatalf("GETFH after RESTOREFH %d, want %d", got, id)
 	}
 	r.end()
@@ -122,6 +124,14 @@ func TestV4FileHandles(t *testing.T) {
 	if s := c.run(v4PutFH(999)).status; s != stStale {
 		t.Fatalf("unknown id: status %d, want STALE", s)
 	}
+	// A client upgraded across the handle change still holds id-only
+	// handles: STALE makes it look the name up again.
+	if s := c.run(func(e *encoder) { e.u32(op4PutFH); e.opaque(binary.BigEndian.AppendUint64(nil, id)) }).status; s != stStale {
+		t.Fatalf("legacy 8-byte handle: status %d, want STALE", s)
+	}
+	if s := c.run(func(e *encoder) { e.u32(op4PutFH); e.fh(id, 1) }).status; s != stStale {
+		t.Fatalf("wrong generation: status %d, want STALE", s)
+	}
 	if s := c.run(v4Root(), v4Restore()).status; s != stNoFileHandle {
 		t.Fatalf("RESTOREFH without SAVEFH: status %d, want NOFILEHANDLE", s)
 	}
@@ -131,6 +141,35 @@ func TestV4FileHandles(t *testing.T) {
 	if s := c.run(v4PutFH(id)).status; s != stStale {
 		t.Fatalf("removed directory: status %d, want STALE", s)
 	}
+}
+
+// TestV4RetiredHandle checks that a handle RetireHandle retired is STALE
+// while a fresh LOOKUP returns a working handle with the same fileid.
+func TestV4RetiredHandle(t *testing.T) {
+	fs := newTestFS(t)
+	fs.write(t, "f", "data")
+	_, addr := v4serve(t, fs, nil)
+	c := v4dial(t, addr)
+	id := fs.FileID("f")
+	if !fs.RetireHandle(id) {
+		t.Fatal("RetireHandle refused a live file")
+	}
+	if s := c.run(v4PutFH(id)).status; s != stStale {
+		t.Fatalf("retired handle: status %d, want STALE", s)
+	}
+	r := c.run(v4Root(), v4Look("f"), v4GetFH())
+	r.skip(op4PutRootFH, op4Lookup)
+	got, gen, ok := r.next(op4GetFH, stOK).fh(128)
+	r.end()
+	if !ok || got != id || gen != fs.Generation(id) {
+		t.Fatalf("fresh handle (%d, %d), want (%d, %d)", got, gen, id, fs.Generation(id))
+	}
+	r = c.run(func(e *encoder) { e.u32(op4PutFH); e.fh(got, gen) }, v4GetFH())
+	r.skip(op4PutFH)
+	if again, _, _ := r.next(op4GetFH, stOK).fh(128); again != id {
+		t.Fatalf("fresh handle resolves to %d, want %d", again, id)
+	}
+	r.end()
 }
 
 // TestV4LookupAndLookupP walks down and up the tree.
@@ -145,15 +184,15 @@ func TestV4LookupAndLookupP(t *testing.T) {
 
 	r := c.run(v4Root(), v4Look("a"), v4Look("b"), v4GetFH(), v4LookP(), v4GetFH(), v4LookP(), v4GetFH())
 	r.skip(op4PutRootFH, op4Lookup, op4Lookup)
-	if id, _ := r.next(op4GetFH, stOK).fh(8); id != fs.FileID("a/b") {
+	if id, _, _ := r.next(op4GetFH, stOK).fh(fhSize); id != fs.FileID("a/b") {
 		t.Fatalf("a/b id %d", id)
 	}
 	r.skip(op4LookupP)
-	if id, _ := r.next(op4GetFH, stOK).fh(8); id != fs.FileID("a") {
+	if id, _, _ := r.next(op4GetFH, stOK).fh(fhSize); id != fs.FileID("a") {
 		t.Fatalf("parent id %d", id)
 	}
 	r.skip(op4LookupP)
-	if id, _ := r.next(op4GetFH, stOK).fh(8); id != 1 {
+	if id, _, _ := r.next(op4GetFH, stOK).fh(fhSize); id != 1 {
 		t.Fatalf("root id %d", id)
 	}
 	r.end()
@@ -331,7 +370,7 @@ func TestV4GetAttrValues(t *testing.T) {
 		attr4CaseInsensitive: no,
 		attr4CasePreserving:  yes,
 		attr4ChownRestricted: yes,
-		attr4FileHandle:      func(d *decoder) bool { id, ok := d.fh(128); return ok && id == a.fileid },
+		attr4FileHandle:      func(d *decoder) bool { id, _, ok := d.fh(128); return ok && id == a.fileid },
 		attr4FileID:          u64(a.fileid),
 		attr4FilesAvail:      u64(st.FilesFree),
 		attr4FilesFree:       u64(st.FilesFree),

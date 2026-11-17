@@ -278,6 +278,69 @@ func TestV4ClaimDelegateCur(t *testing.T) {
 	}
 }
 
+// TestV4RecallRange recalls the delegations of every file whose id is in the
+// range, as when a whole checkout changes, and of no file outside it.
+func TestV4RecallRange(t *testing.T) {
+	fs, srv, addr := v4delegServer(t, nil)
+	c, cb := v4holder(t, srv, addr, "c")
+	for _, name := range []string{"a", "b", "outside"} {
+		v4write(t, fs, name, "data")
+	}
+	a, b, outside := fs.FileID("a"), fs.FileID("b"), fs.FileID("outside")
+	if b != a+1 || outside != b+1 {
+		t.Fatalf("ids %d %d %d are not consecutive", a, b, outside)
+	}
+	ids := map[uint64]v4StateID{a: c.mustDelegate("o", "a"), b: c.mustDelegate("o", "b")}
+	c.mustDelegate("o", "outside")
+
+	srv.RecallRange(a, b)
+	for range len(ids) {
+		select {
+		case r := <-cb.recalls:
+			if id, ok := ids[r.file]; !ok || r.id != id {
+				t.Fatalf("CB_RECALL %+v, want one of %+v", r, ids)
+			}
+			delete(ids, r.file)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("no CB_RECALL of %+v", ids)
+		}
+	}
+	cb.expectNoRecall(t)
+}
+
+// TestV4RecallNamesGrantedHandle: a delegation's CB_RECALL names the handle
+// the client was given with the delegation, even when the file's handles
+// were retired after the grant (a size regression does that), since the
+// client finds the delegation by that handle.
+func TestV4RecallNamesGrantedHandle(t *testing.T) {
+	fs, srv, addr := v4delegServer(t, nil)
+	c, cb := v4holder(t, srv, addr, "c")
+	v4write(t, fs, "f", "data")
+	r := c.run(v4Root(), v4Open(v4openArgs{owner: c.owner("o"), access: share4Read, name: "f"}), v4GetFH())
+	r.skip(op4PutRootFH)
+	o := v4getOpened(t, r.next(op4Open, stOK))
+	file, gen, ok := r.next(op4GetFH, stOK).fh(fhSize)
+	r.end()
+	if o.deleg == nil || !ok {
+		t.Fatalf("read OPEN of f: delegation %v, handle ok %v", o.deleg, ok)
+	}
+	if !fs.RetireHandle(file) {
+		t.Fatal("RetireHandle refused a live file")
+	}
+	if fs.Generation(file) == gen {
+		t.Fatal("RetireHandle kept the handle's generation")
+	}
+	srv.Recall(file)
+	select {
+	case rc := <-cb.recalls:
+		if rc.id != *o.deleg || !rc.fhOK || rc.file != file || rc.gen != gen {
+			t.Fatalf("CB_RECALL %+v, want stateid %+v and the granted handle (%d, %d)", rc, *o.deleg, file, gen)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no CB_RECALL")
+	}
+}
+
 func TestV4RecallSendsCBRecall(t *testing.T) {
 	fs, srv, addr := v4delegServer(t, nil)
 	c, cb := v4holder(t, srv, addr, "c")

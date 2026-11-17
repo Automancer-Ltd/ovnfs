@@ -3,6 +3,8 @@ package overlay
 import (
 	"os"
 	"path"
+
+	"github.com/stencil-hq/ovnfs/internal/ident"
 )
 
 // inodeKey identifies one host inode so hardlinked paths share metadata updates.
@@ -29,29 +31,66 @@ func (f *FS) addIdentity(p string, key inodeKey) {
 	f.pathIDs[p] = key
 }
 
-// track records one upper name's inode without reading or changing its metadata.
-func (f *FS) track(p string, info os.FileInfo) error {
+// track records one upper name's identity and, for a host file, its inode,
+// without reading or changing its metadata.
+func (f *FS) track(p string, info os.FileInfo) {
 	if info == nil {
-		return nil
+		return
 	}
-	if err := primeInfo(info); err != nil {
-		return err
-	}
+	f.register(p, info)
 	if info.IsDir() {
-		return nil
+		return
 	}
-	key, err := identity(f.upper, p, info)
-	if err != nil {
-		return err
+	key, ok := hostKey(info)
+	if !ok {
+		return
 	}
 	if old, ok := f.pathIDs[p]; ok {
 		if old == key {
-			return nil
+			return
 		}
 		f.untrack(p)
 	}
 	f.addIdentity(p, key)
-	return nil
+}
+
+// register makes upper name p, described by info, where [FS.Locate] finds
+// its identity, unless another indexed name still holds it (a hard link).
+func (f *FS) register(p string, info os.FileInfo) {
+	id, ok := ident.Of(info)
+	if !ok || f.paths == nil {
+		return
+	}
+	if cur, ok := f.paths[id]; ok && cur != p {
+		if e, live := f.index.entries[cur]; live && e.Info != nil {
+			if held, _ := ident.Of(e.Info); held == id {
+				return
+			}
+		}
+	}
+	f.paths[id] = p
+}
+
+// unregister forgets upper name p, about to leave the index, as the holder of
+// its identity, handing it to another name of the same file if one remains,
+// and forgets p's inode in the identity cache: the host may hand its number
+// out again once no name is left.
+func (f *FS) unregister(p string) {
+	e, ok := f.index.entries[p]
+	if !ok || e.Info == nil {
+		return
+	}
+	if key, ok := hostKey(e.Info); ok {
+		f.ids.known.forget(key)
+	}
+	id, ok := ident.Of(e.Info)
+	if !ok || f.paths[id] != p {
+		return
+	}
+	delete(f.paths, id)
+	if other := f.otherAlias(p); other != "" {
+		f.paths[id] = other
+	}
 }
 
 // untrack retires one upper name without retaining dead inode groups.
@@ -90,6 +129,7 @@ func (f *FS) dropIndex(p string) {
 	if m := f.files[p]; m != nil {
 		f.detach(m)
 	}
+	f.unregister(p)
 	f.untrack(p)
 	f.index.drop(p)
 }
@@ -110,10 +150,16 @@ func (f *FS) otherAlias(p string) string {
 	return ""
 }
 
-// moveIdentity temporarily registers a renamed path before the old name retires.
+// moveIdentity registers a renamed path, as an inode name and as its
+// identity's holder, before the old name retires.
 func (f *FS) moveIdentity(from, to string) {
 	if key, ok := f.pathIDs[from]; ok {
 		f.addIdentity(to, key)
+	}
+	if e := f.index.entries[from]; e.Info != nil {
+		if id, ok := ident.Of(e.Info); ok && f.paths[id] == from {
+			f.paths[id] = to
+		}
 	}
 }
 
@@ -121,11 +167,8 @@ func (f *FS) moveIdentity(from, to string) {
 // or attributes and shares it with p's other hard-link names; the inode, and
 // so the identity bookkeeping, is unchanged.
 func (f *FS) restat(p string) error {
-	info, err := hostLstat(f.up(p))
+	info, err := f.stat(p)
 	if err != nil {
-		return err
-	}
-	if err := primeInfo(info); err != nil {
 		return err
 	}
 	f.setInfo(p, info)
@@ -141,13 +184,10 @@ func (f *FS) setInfo(p string, info os.FileInfo) {
 }
 
 // cacheInfo stores a fresh snapshot and shares it with other names of the same inode.
-func (f *FS) cacheInfo(p string, info os.FileInfo) error {
+func (f *FS) cacheInfo(p string, info os.FileInfo) {
 	f.setInfo(p, info)
-	if err := f.track(p, info); err != nil {
-		return err
-	}
+	f.track(p, info)
 	f.cacheAliases(p, info)
-	return nil
 }
 
 // cacheAliases gives p's other hard-link names info, p's fresh metadata. The
@@ -178,8 +218,10 @@ type aliasInfo struct {
 // Name returns the alias's own base name.
 func (i aliasInfo) Name() string { return i.name }
 
-// unalias returns the host metadata beneath an [aliasInfo], whose own type
-// [os.SameFile] requires.
+// Identity forwards the identity of the file the alias names.
+func (i aliasInfo) Identity() ident.ID { id, _ := ident.Of(i.FileInfo); return id }
+
+// unalias returns the metadata beneath an [aliasInfo].
 func unalias(info os.FileInfo) os.FileInfo {
 	if a, ok := info.(aliasInfo); ok {
 		return a.FileInfo
@@ -190,6 +232,7 @@ func unalias(info os.FileInfo) os.FileInfo {
 // bind associates an open descriptor with its inode, not its current name; a
 // writable one makes the inode's indexed metadata volatile until it closes.
 func (f *FS) bind(h *file, p string) {
+	h.id = handleID(f.index.entries[p].Info)
 	h.inode, h.tracked = f.pathIDs[p]
 	if h.writable && h.tracked {
 		f.writers[h.inode]++

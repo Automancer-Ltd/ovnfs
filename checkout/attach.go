@@ -395,7 +395,7 @@ func (r *Registry) reattachLocked(ctx context.Context, h *checkoutRecord, o peer
 		r.layers[id].portable = true
 	}
 	h.base, h.meta.Base, h.meta.Head, h.meta.Parent = b, id, nil, nil
-	h.fs.Rebase(view.Bottom(h.meta.Created))
+	h.fs.Rebase(view.Bottom(nil))
 	r.retainLocked(b, h.stack)
 	r.releaseLocked(oldBase, h.stack)
 	delete(r.intents, name)
@@ -403,7 +403,7 @@ func (r *Registry) reattachLocked(ctx context.Context, h *checkoutRecord, o peer
 		r.retainLocked(oldBase, h.stack)
 		r.releaseLocked(b, h.stack)
 		h.base, h.meta = oldBase, oldMeta
-		h.fs.Rebase(oldBase.view.Bottom(h.meta.Created))
+		h.fs.Rebase(oldBase.view.Bottom(nil))
 		for id, was := range portable {
 			r.layers[id].portable = was
 		}

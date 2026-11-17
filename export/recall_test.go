@@ -12,46 +12,61 @@ import (
 
 	"github.com/stencil-hq/ovnfs/api"
 	"github.com/stencil-hq/ovnfs/checkout"
+	exportfs "github.com/stencil-hq/ovnfs/export"
 	"github.com/stencil-hq/ovnfs/internal/nfstest"
 )
 
-// recorder collects the stable nodes the export asks the frontend to recall.
+// recorder collects the recalls the export asks the frontend for.
 type recorder struct {
-	mu  sync.Mutex
-	ids []uint64
+	mu      sync.Mutex
+	recalls []exportfs.Recall
 }
 
-// add records one recalled node.
-func (r *recorder) add(id uint64) {
+// add records one recall.
+func (r *recorder) add(rc exportfs.Recall) {
 	r.mu.Lock()
-	r.ids = append(r.ids, id)
+	r.recalls = append(r.recalls, rc)
 	r.mu.Unlock()
 }
 
-// has reports whether the node in fh was recalled, then clears the recorder.
+// has reports whether a recall covered the file NFS handle fh names, then
+// clears the recorder.
 func (r *recorder) has(fh []byte) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var id uint64
-	if len(fh) == 8 {
+	if len(fh) >= 8 {
 		id = binary.BigEndian.Uint64(fh)
 	}
-	found := slices.Contains(r.ids, id)
-	r.ids = nil
+	found := slices.ContainsFunc(r.recalls, func(rc exportfs.Recall) bool { return rc.First <= id && id <= rc.Last })
+	r.recalls = nil
 	return found
 }
 
-// TestInvalidateTreeRecallsOnlyThatSubtree recalls every handle below a changed
-// tree and none beside it: a rescan deep in a build directory must not recheck
-// every handle the checkout ever issued.
-func TestInvalidateTreeRecallsOnlyThatSubtree(t *testing.T) {
+// paths returns the paths recalled since the last check, then clears the recorder.
+func (r *recorder) paths() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []string
+	for _, rc := range r.recalls {
+		out = append(out, rc.Path)
+	}
+	r.recalls = nil
+	return out
+}
+
+// TestInvalidateTreeRecallsItsCheckout recalls a changed tree over its
+// checkout's ids, naming the tree for path-addressed frontends, and leaves
+// other checkouts alone.
+func TestInvalidateTreeRecallsItsCheckout(t *testing.T) {
 	f := newStack(t, map[string]string{"t/d/x": "1", "s": "2"})
 	f.create(t, "app")
+	f.create(t, "other")
 	var rec recorder
 	f.export.OnRecall(rec.add)
 	c := nfstest.Start(t, f.export.NFS())
 	x := lookup(t, c, "app/t/d/x")
-	s := lookup(t, c, "app/s")
+	o := lookup(t, c, "other/s")
 	rec.has(nil)
 
 	f.export.Invalidate("app", nil, []string{"t"})
@@ -59,19 +74,19 @@ func TestInvalidateTreeRecallsOnlyThatSubtree(t *testing.T) {
 		t.Fatal("a tree invalidation did not recall a handle below it")
 	}
 	f.export.Invalidate("app", nil, []string{"t"})
-	if rec.has(s) {
-		t.Fatal("a tree invalidation recalled a handle outside it")
+	if got := rec.paths(); !slices.Equal(got, []string{"app/t"}) {
+		t.Fatalf("tree invalidation named %q, want app/t", got)
 	}
 	f.export.Invalidate("app", nil, []string{""})
-	if !rec.has(s) {
-		t.Fatal("invalidating the whole checkout missed a handle")
+	if rec.has(o) {
+		t.Fatal("invalidating one checkout recalled another's handle")
 	}
 }
 
 // TestRecallsChangesBehindNFSClients covers every way a file changes without
 // an NFS request: another protocol, the daemon (Invalidate), and checkout
-// removal, while NFS requests leave recalls to the NFS server. Vanished paths retire
-// their handles so clients see stale.
+// removal, while NFS requests leave recalls to the NFS server. The handle of
+// a vanished path is stale.
 func TestRecallsChangesBehindNFSClients(t *testing.T) {
 	f := newStack(t, map[string]string{"src": "base"})
 	f.create(t, "app")
@@ -117,44 +132,5 @@ func TestRecallsChangesBehindNFSClients(t *testing.T) {
 	}
 	if !rec.has(src) {
 		t.Fatal("removing the checkout did not recall its handles")
-	}
-}
-
-// TestInvalidationRetiresColdHashes covers path and whole-checkout changes.
-func TestInvalidationRetiresColdHashes(t *testing.T) {
-	for _, whole := range []bool{false, true} {
-		t.Run(map[bool]string{true: "checkout", false: "paths"}[whole], func(t *testing.T) {
-			f := newStack(t, map[string]string{"f998": "old", "pressure/file": "pressure"})
-			f.create(t, "app")
-			nodes := f.export.Nodes()
-			old := nodes.ID("app/f998")
-			f.export.SetNodeCache(0)
-			nodes.ID("app/pressure/file")
-			var session checkout.Session
-			if err := f.reg.Enter("app", &session); err != nil {
-				t.Fatal(err)
-			}
-			err := session.FS.Remove("f998")
-			session.Done()
-			if err != nil {
-				t.Fatal(err)
-			}
-			paths := []string{"f998"}
-			if whole {
-				f.export.Invalidate("app", nil, []string{""})
-			}
-			f.export.Invalidate("app", paths, nil)
-			file, err := nodes.Create("app/f4776")
-			if err != nil {
-				t.Fatal(err)
-			}
-			file.Close()
-			if nodes.ID("app/f4776") == old {
-				t.Fatal("replacement reused cold identity")
-			}
-			if _, ok := nodes.Path(old); ok {
-				t.Fatal("retired handle resolves to replacement")
-			}
-		})
 	}
 }

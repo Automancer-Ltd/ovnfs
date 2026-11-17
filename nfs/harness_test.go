@@ -18,8 +18,10 @@ import (
 	"github.com/stencil-hq/ovnfs/smb"
 )
 
-// testFS exports a temporary directory. Like the export's node table, it
-// keeps ids across renames and retires them on removal.
+// testFS exports a temporary directory. Like the export, it keeps an
+// entry's id across renames, makes it stale on removal, and bumps its
+// generation on RetireHandle; ids come from an in-memory map instead of
+// the entries' identities.
 type testFS struct {
 	billy.Filesystem
 	root string
@@ -29,7 +31,9 @@ type testFS struct {
 	mu    sync.Mutex
 	ids   map[string]uint64
 	paths map[uint64]string
-	next  uint64
+	// gens holds the generations RetireHandle bumped; others are 0.
+	gens map[uint64]uint64
+	next uint64
 }
 
 // newTestFS exports a fresh temporary directory; its root has id 1.
@@ -43,6 +47,7 @@ func newTestFS(t testing.TB) *testFS {
 		root:       root,
 		ids:        map[string]uint64{"": 1},
 		paths:      map[uint64]string{1: ""},
+		gens:       map[uint64]uint64{},
 		next:       2,
 	}
 }
@@ -53,7 +58,7 @@ func (f *testFS) host(p string) string { return filepath.Join(f.root, filepath.F
 // clean is the overlay-clean form of p.
 func clean(p string) string { return strings.TrimPrefix(path.Clean("/"+p), "/") }
 
-// FileID allocates ids on first use.
+// FileID allocates ids on first use, without the export's Lstat.
 func (f *testFS) FileID(p string) uint64 {
 	p = clean(p)
 	f.mu.Lock()
@@ -67,20 +72,30 @@ func (f *testFS) FileID(p string) uint64 {
 	return id
 }
 
-// ChildID gives listed names the same identities as direct lookup.
-func (f *testFS) ChildID(dir, name string) uint64 {
-	return f.FileID(path.Join(dir, name))
+// IDOf is FileID: the map, not info, holds the ids.
+func (f *testFS) IDOf(p string, _ os.FileInfo) uint64 { return f.FileID(p) }
+
+// ChildID gives listed entries the same ids as direct lookup.
+func (f *testFS) ChildID(dir string, info os.FileInfo) uint64 {
+	return f.FileID(path.Join(dir, info.Name()))
 }
 
-// Path resolves a live id.
-func (f *testFS) Path(id uint64) (string, bool) {
+// Generation is id's current generation.
+func (f *testFS) Generation(id uint64) uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.gens[id]
+}
+
+// Path resolves a live id at its current generation.
+func (f *testFS) Path(id, gen uint64) (string, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p, ok := f.paths[id]
-	return p, ok
+	return p, ok && f.gens[id] == gen
 }
 
-// RetireHandle makes id stale while preserving its path for the next FileID.
+// RetireHandle bumps id's generation, keeping its path and fileid.
 func (f *testFS) RetireHandle(id uint64) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -88,7 +103,7 @@ func (f *testFS) RetireHandle(id uint64) bool {
 	if !ok || p == "" {
 		return false
 	}
-	f.retireLocked(p)
+	f.gens[id]++
 	return true
 }
 

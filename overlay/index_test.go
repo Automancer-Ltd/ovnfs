@@ -253,7 +253,7 @@ func TestRestoredLayerReloadsAfterCool(t *testing.T) {
 	assertNames(t, f, "a", "x")
 	x, _ := r.Get("a/x")
 	hl, _ := r.Get("hl")
-	if !sameStored(before.Info, x.Info) || !sameStored(x.Info, hl.Info) {
+	if !sameEntry(before.Info, x.Info) || !sameEntry(x.Info, hl.Info) {
 		t.Fatal("hard links lost their identity across decodes")
 	}
 	if got := slices.Sorted(maps.Keys(r.Children(""))); !slices.Equal(got, []string{"a", "b", "hl"}) {

@@ -3,9 +3,9 @@
 package fsys
 
 import (
-	"errors"
 	"io/fs"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,18 +22,6 @@ type nativeInfo struct {
 	st   syscall.Stat_t
 }
 
-// ChangeTime returns the status change time, in Unix nanoseconds, of the
-// entry at path that info describes (its [os.Lstat] data or a [ReadDir]
-// entry's Info). Content, metadata and renames move it, and unlike the mtime
-// no tool can set it back. It fails for an info with no host stat data.
-func ChangeTime(_ string, info os.FileInfo) (int64, error) {
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return 0, errors.ErrUnsupported
-	}
-	return statChange(st), nil
-}
-
 func (e *nativeInfo) Name() string               { return e.name }
 func (e *nativeInfo) Size() int64                { return e.st.Size }
 func (e *nativeInfo) Mode() fs.FileMode          { return e.mode }
@@ -42,6 +30,26 @@ func (e *nativeInfo) IsDir() bool                { return e.mode.IsDir() }
 func (e *nativeInfo) Sys() any                   { return &e.st }
 func (e *nativeInfo) Type() fs.FileMode          { return e.mode.Type() }
 func (e *nativeInfo) Info() (fs.FileInfo, error) { return e, nil }
+
+// Lstatat returns the [os.Lstat] metadata of name, a slash path relative to
+// the open directory dir, without following a final symlink: the same Mode,
+// Size, ModTime and Sys (*syscall.Stat_t), named by name's last element. Base
+// cache snapshots resolve their entries against the snapshot's open root, so
+// the kernel does not walk the snapshot's long absolute path for each one.
+func Lstatat(dir int, name string) (os.FileInfo, error) {
+	if name == "" || strings.IndexByte(name, 0) >= 0 {
+		return nil, &os.PathError{Op: "lstat", Path: name, Err: syscall.EINVAL}
+	}
+	cname := make([]byte, len(name)+1)
+	copy(cname, name)
+	info := &nativeInfo{name: name[strings.LastIndexByte(name, '/')+1:]}
+	if err := fstatat(dir, cname, &info.st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return nil, &os.PathError{Op: "lstat", Path: name, Err: err}
+	}
+	info.mode = modeFromStat(uint32(info.st.Mode))
+	info.mod = mtimeOf(&info.st)
+	return info, nil
+}
 
 // newInfo takes the next nativeInfo from a batch-sized slab. Its backing
 // array is never grown or reused: returned interfaces point into it.

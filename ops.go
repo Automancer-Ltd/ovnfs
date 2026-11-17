@@ -19,15 +19,12 @@ const protocolVersion = 5
 
 // opsHandler binds admin operations to one checkout registry.
 type opsHandler struct {
-	nodeIndexBytes func() int64
-	nodeCache      func() api.Usage
-	nodeCacheError func() string
-	reg            *checkout.Registry
-	shares         *shares
-	links          *links
-	welcome        admin.Welcome
-	started        time.Time
-	stop           func(context.Context, api.StopArgs) error // unmounts as asked, then has the server exit
+	reg     *checkout.Registry
+	shares  *shares
+	links   *links
+	welcome admin.Welcome
+	started time.Time
+	stop    func(context.Context, api.StopArgs) error // unmounts as asked, then has the server exit
 }
 
 // decodeArgs rejects malformed or unknown request fields.
@@ -70,15 +67,6 @@ func (h *opsHandler) Call(ctx context.Context, op string, raw json.RawMessage) (
 			reportHeap(&s)
 			if w := vnodeWarning(h.reg.Largest()); w != "" {
 				s.Warnings = append(s.Warnings, w)
-			}
-			if h.nodeCache != nil {
-				s.NodeCache = h.nodeCache()
-				if h.nodeIndexBytes != nil {
-					s.NodeIndexBytes = h.nodeIndexBytes()
-				}
-				if h.nodeCacheError != nil {
-					s.NodeCacheError = h.nodeCacheError()
-				}
 			}
 			return s, nil
 		})

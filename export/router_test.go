@@ -37,9 +37,9 @@ func routerFixture(t *testing.T, names ...string) (*checkout.Registry, *export.R
 		Mount:     filepath.Join(dir, "mount"),
 		Memory:    overlay.NewMemory(64<<20, 1<<20, 0),
 		BlobCache: 64 << 20,
-		Retire: func(name string) {
+		Retire: func(name string, slot uint16) {
 			if exported != nil {
-				exported.Retire(name)
+				exported.Retire(name, slot)
 			}
 		},
 	})
@@ -50,17 +50,9 @@ func routerFixture(t *testing.T, names ...string) (*checkout.Registry, *export.R
 		if err := reg.Close(); err != nil {
 			t.Errorf("close registry: %v", err)
 		}
-		if exported != nil {
-			if err := exported.Close(); err != nil {
-				t.Errorf("close export: %v", err)
-			}
-		}
 	})
 	rt := export.NewRouter(reg)
-	exported, err = export.New(rt, filepath.Join(dir, "state", "nodes.log"), repo, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	exported = export.New(rt, repo)
 	for _, name := range names {
 		if _, err := reg.New(context.Background(), api.NewArgs{Dir: repo, Name: name}); err != nil {
 			t.Fatalf("create %s: %v", name, err)

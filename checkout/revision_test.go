@@ -83,9 +83,9 @@ func TestNewRevisionDirtyFolder(t *testing.T) {
 	}
 	for p, want := range map[string]string{
 		"tracked.txt": "original\n", "new.txt": "<absent>",
-		"build/out.o": "kept build\n", "debug.log": "kept ignored file\n",
+		"build/out.o": cached(t, "kept build\n"), "debug.log": "kept ignored file\n",
 		"node_modules/not-ignored": "<absent>",
-		"node_modules/kept/cache":  "nested ignored\n",
+		"node_modules/kept/cache":  cached(t, "nested ignored\n"),
 	} {
 		if got := f.read(reply.Checkout.Name, p); got != want {
 			t.Errorf("%s = %q, want %q", p, got, want)

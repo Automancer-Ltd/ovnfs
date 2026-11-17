@@ -131,8 +131,8 @@ is always pruned.
 | Class | In the checkout | Seen by `diff`/`apply`/snapshots |
 | --- | --- | --- |
 | `source` | as captured at open | yes |
-| `cache` (ignored dirs, `node_modules`, ...) | the live folder until the checkout writes there, minus files the folder changed after the open (a build redoes those); writes go to the checkout only | no |
-| `local` (ignored files, secrets, files over 100 MB) | the live folder until the checkout writes there; writes go to the checkout only | no |
+| `cache` (ignored dirs, `node_modules`, ...) | a copy-on-write snapshot of the folder's, taken when the checkout opens; later host builds do not change it; writes go to the checkout only | no |
+| `local` (ignored files, secrets, files over 100 MB) | a copy-on-write snapshot of the folder's, as for `cache`; writes go to the checkout only | no |
 | `hidden` (`.DS_Store`, Python environments, ...) | absent | no |
 
 - Build outputs and dependency installs inside a checkout never reach the
@@ -195,9 +195,8 @@ is always pruned.
   folders below a checkout's root and folders holding the mount, and refuses
   `--rev`, `--take` or `--rule` on a checkout.
 - Keep the daemon's state directory on the same volume as your repositories.
-  Otherwise `new` warns, and files are copied instead of cloned.
-- On macOS (NFSv3), changes to `cache`/`local` paths in the folder can take up
-  to 60 s to appear in the checkout.
+  Otherwise `new` warns, files are copied instead of cloned, and `cache`
+  directories start empty in checkouts.
 - Linux needs `fusermount3` (package `fuse3`). Windows uses SMB or WinFsp, and
   the mount must be a free drive letter.
 - More: [checkouts](https://github.com/stencil-hq/ovnfs/blob/main/docs/checkouts.md),

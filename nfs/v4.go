@@ -177,7 +177,7 @@ func (s *Server) compound4(c *call, res *encoder) acceptStat {
 		default:
 			st = x.op(op)
 		}
-		if st != stOpIllegal && st != stBadXDR && (identityError(s.FS) != nil || x.cur.ok && x.cur.id == 0) {
+		if st != stOpIllegal && st != stBadXDR && x.cur.ok && x.cur.id == 0 {
 			st = stIO
 		}
 		res.put32(mark, uint32(st))
@@ -214,11 +214,15 @@ type v4compound struct {
 	client uint64
 }
 
-// v4fh is a filehandle in use: the file id and the path it resolved to.
+// v4fh is a filehandle in use: the file id, the path it resolved to and,
+// once known, the generation of the handle (Backend.Generation) the client
+// holds or is handed for it.
 type v4fh struct {
-	id   uint64
-	path string
-	ok   bool
+	id       uint64
+	gen      uint64
+	genKnown bool
+	path     string
+	ok       bool
 }
 
 // op runs one operation: it decodes its arguments, encodes its result after
@@ -333,9 +337,22 @@ func (x *v4compound) current() (*v4fh, status) {
 	return &x.cur, stOK
 }
 
-// setCurrent makes the file at p the current filehandle.
-func (x *v4compound) setCurrent(p string) {
-	x.cur = v4fh{id: x.s.FS.FileID(p), path: p, ok: true}
+// handleGen returns the generation of filehandle cur, reading it from the
+// backend the first time. Every use within the COMPOUND then sees the same
+// one: the handle GETFH hands out is the one a delegation granted in the
+// same COMPOUND records and its CB_RECALL names, even if the handle is
+// retired meanwhile.
+func (x *v4compound) handleGen(cur *v4fh) uint64 {
+	if !cur.genKnown {
+		cur.gen, cur.genKnown = x.s.FS.Generation(cur.id), true
+	}
+	return cur.gen
+}
+
+// setCurrent makes file id, at p, the current filehandle. An id of 0 (none
+// could be determined) fails the operation IO (see compound).
+func (x *v4compound) setCurrent(id uint64, p string) {
+	x.cur = v4fh{id: id, path: p, ok: true}
 }
 
 // name decodes a component4 and checks it.
@@ -378,29 +395,32 @@ func (s *Server) dir4(p string) status {
 	return stOK
 }
 
-// putfh sets the current filehandle (PUTFH). Handles are file ids, so a
-// handle of the wrong length is not one of this server's and one whose id
-// is gone is stale.
+// putfh sets the current filehandle (PUTFH): BADHANDLE for a handle no
+// server can have issued, STALE for a legacy handle or one whose file is
+// gone or whose generation is no longer current.
 func (x *v4compound) putfh() status {
-	id, ok := x.d.fh(v4ArgLimit)
+	id, gen, ok := x.d.fh(v4ArgLimit)
 	if x.d.err != nil {
 		return stBadXDR
 	}
 	if !ok {
 		return stBadHandle
 	}
-	p, live := x.s.FS.Path(id)
+	if id == 0 {
+		return stStale
+	}
+	p, live := x.s.FS.Path(id, gen)
 	if !live {
 		return stStale
 	}
-	x.cur = v4fh{id: id, path: p, ok: true}
+	x.cur = v4fh{id: id, gen: gen, genKnown: true, path: p, ok: true}
 	return stOK
 }
 
 // putrootfh makes the export's root the current filehandle (PUTROOTFH,
 // PUTPUBFH).
 func (x *v4compound) putrootfh() status {
-	x.setCurrent("")
+	x.setCurrent(x.s.FS.FileID(""), "")
 	return stOK
 }
 
@@ -410,7 +430,7 @@ func (x *v4compound) getfh() status {
 	if st != stOK {
 		return st
 	}
-	x.e.fh(cur.id)
+	x.e.fh(cur.id, x.handleGen(cur))
 	return stOK
 }
 
@@ -446,13 +466,14 @@ func (x *v4compound) lookup() status {
 	// An entry found shows the current file is a directory; only a miss
 	// needs to tell NFS4ERR_NOTDIR from the entry's absence.
 	p := v4Join(cur.path, name)
-	if _, err := x.s.FS.Lstat(p); err != nil {
+	info, err := x.s.FS.Lstat(p)
+	if err != nil {
 		if st := x.s.dir4(cur.path); st != stOK {
 			return st
 		}
 		return statusOf(err)
 	}
-	x.setCurrent(p)
+	x.setCurrent(x.s.FS.IDOf(p, info), p)
 	return stOK
 }
 
@@ -470,7 +491,7 @@ func (x *v4compound) lookupp() status {
 	if parent == "." {
 		parent = ""
 	}
-	x.setCurrent(parent)
+	x.setCurrent(x.s.FS.FileID(parent), parent)
 	return stOK
 }
 
@@ -504,7 +525,7 @@ func (x *v4compound) getattr() status {
 		return statusOf(err)
 	}
 	var fs v4fsstat
-	return x.s.putAttrs4(x.e, &a, req, &fs)
+	return x.s.putAttrs4(x.e, &a, x.handleGen(cur), req, &fs)
 }
 
 // verify compares the current file's attributes with those given, encoded
@@ -533,7 +554,7 @@ func (x *v4compound) verify(same bool) status {
 	// them: VERIFY and NVERIFY results carry only the status.
 	at := x.e.len()
 	var fs v4fsstat
-	if st := x.s.putAttrVals4(x.e, &a, mask, &fs); st != stOK {
+	if st := x.s.putAttrVals4(x.e, &a, x.handleGen(cur), mask, &fs); st != stOK {
 		return st
 	}
 	equal := bytes.Equal(x.e.buf[at:], vals)

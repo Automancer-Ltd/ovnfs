@@ -112,11 +112,12 @@ func (cb *v4Callback) null() error {
 var errCBSkipped = errors.New("callback no longer wanted")
 
 // recall sends CB_RECALL {stateid, truncate false, fh} of a delegation of
-// file in a CB_COMPOUND, if want, asked once the call's turn has come,
-// still wants it (errCBSkipped if not). A transport failure or a malformed
+// file, granted with the handle of generation gen, in a CB_COMPOUND, if
+// want, asked once the call's turn has come, still wants it (errCBSkipped
+// if not). A transport failure or a malformed
 // reply is an error, which failed gets before the next call's turn comes,
 // so that call's want sees its effect; the client's answer is the status.
-func (cb *v4Callback) recall(id v4StateID, file uint64, want func() bool, failed func(error)) (status, error) {
+func (cb *v4Callback) recall(id v4StateID, file, gen uint64, want func() bool, failed func(error)) (status, error) {
 	cb.calls.Lock()
 	defer cb.calls.Unlock()
 	if !want() {
@@ -130,7 +131,7 @@ func (cb *v4Callback) recall(id v4StateID, file uint64, want func() bool, failed
 		e.u32(cb4OpRecall)
 		putStateID4(e, id)
 		e.bool(false)
-		e.fh(file)
+		e.fh(file, gen)
 	})
 	if err == nil {
 		d := decoder{buf: body}

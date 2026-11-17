@@ -101,9 +101,6 @@ func (s *Server) nfs3(c *call, res *encoder) acceptStat {
 	at := res.len()
 	res.u32(uint32(stOK))
 	st := p.run(s, &c.args, res)
-	if identityError(s.FS) != nil {
-		st = stIO
-	}
 	if c.args.err != nil {
 		return rpcGarbageArgs
 	}
@@ -118,13 +115,17 @@ func (s *Server) nfs3(c *call, res *encoder) acceptStat {
 	return rpcSuccess
 }
 
-// path3 resolves a decoded file handle: BADHANDLE for one this server cannot
-// have issued, STALE for a file id the backend no longer knows.
-func (s *Server) path3(id uint64, ok bool) (string, status) {
+// path3 resolves a decoded file handle: BADHANDLE for one no server can have
+// issued, STALE for a legacy handle or one whose file is gone or whose
+// generation is no longer current.
+func (s *Server) path3(id, gen uint64, ok bool) (string, status) {
 	if !ok {
 		return "", stBadHandle
 	}
-	p, live := s.FS.Path(id)
+	if id == 0 {
+		return "", stStale
+	}
+	p, live := s.FS.Path(id, gen)
 	if !live {
 		return "", stStale
 	}

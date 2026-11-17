@@ -66,6 +66,16 @@ func (s *Server) stat(id uint64, p string) (attrs, error) {
 	return attrsOf(id, info), nil
 }
 
+// statAt describes the file at p, without following a final symlink, for
+// callers that hold its path but not its id.
+func (s *Server) statAt(p string) (attrs, error) {
+	info, err := s.FS.Lstat(p)
+	if err != nil {
+		return attrs{}, err
+	}
+	return attrsOf(s.FS.IDOf(p, info), info), nil
+}
+
 // readlink returns the target of the symlink at p; INVAL when p is not a
 // symlink, which hosts report with differing errors (EINVAL on Unix,
 // ERROR_NOT_A_REPARSE_POINT on Windows).
@@ -131,14 +141,23 @@ func goMode(v uint32) os.FileMode {
 }
 
 // fhSize is the length of every file handle this server issues: the file id,
-// big-endian.
-const fhSize = 8
+// then the generation Backend.Generation tagged it with, both big-endian.
+const fhSize = 16
 
-// fileID decodes a file handle; ok is false for one this server cannot have
-// issued (NFS3ERR_BADHANDLE, NFS4ERR_BADHANDLE).
-func fileID(fh []byte) (id uint64, ok bool) {
-	if len(fh) != fhSize {
-		return 0, false
+// legacyFHSize is the length of the id-only handles earlier servers issued.
+// Clients still holding one after an upgrade get STALE, which makes them
+// look the name up again, rather than BADHANDLE, which they treat as fatal.
+const legacyFHSize = 8
+
+// handleOf decodes a file handle; ok is false for one no server can have
+// issued (NFS3ERR_BADHANDLE, NFS4ERR_BADHANDLE). A legacy handle decodes to
+// id 0, which names no file, so resolving it answers STALE.
+func handleOf(fh []byte) (id, gen uint64, ok bool) {
+	switch len(fh) {
+	case fhSize:
+		return binary.BigEndian.Uint64(fh), binary.BigEndian.Uint64(fh[8:]), true
+	case legacyFHSize:
+		return 0, 0, true
 	}
-	return binary.BigEndian.Uint64(fh), true
+	return 0, 0, false
 }

@@ -20,7 +20,7 @@ func serveNFS(l net.Listener, e *export.Export) error {
 	if os.Getenv("LOG_LEVEL") != "" {
 		srv.Logf = log.Printf
 	}
-	e.OnRecall(srv.Recall)
+	e.OnRecall(func(r export.Recall) { srv.RecallRange(r.First, r.Last) })
 	return srv.Serve(l)
 }
 

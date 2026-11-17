@@ -817,7 +817,7 @@ func finishCreate(r *request, a createArgs, info os.FileInfo, epoch uint64) ([]b
 			return nil, statusDirectoryNotEmpty
 		}
 	}
-	nodeID := fs.FileID(a.name)
+	nodeID := fs.IDOf(a.name, info)
 	if nodeID == 0 {
 		closeImplicit(o)
 		return nil, statusInternalError
@@ -1003,29 +1003,8 @@ func getOpenID(src []byte) fileID {
 func publishOpen(r *request, o *open) bool {
 	var once sync.Once
 	c := r.c
-	var release func()
-	if fs, ok := c.srv.FS.(interface{ HoldFileID(uint64) func() }); ok && o.pipe == nil {
-		id := c.srv.FS.FileID(o.path)
-		if id == 0 {
-			c.srv.st.opens.dropCaching(o)
-			closeImplicit(o)
-			return false
-		}
-		release = fs.HoldFileID(id)
-		if fs, ok := c.srv.FS.(interface{ IdentityError() error }); ok && fs.IdentityError() != nil {
-			release()
-			c.srv.st.opens.dropCaching(o)
-			closeImplicit(o)
-			return false
-		}
-	}
 	o.closeFn = func() {
-		once.Do(func() {
-			closeOpen(c, o)
-			if release != nil {
-				release()
-			}
-		})
+		once.Do(func() { closeOpen(c, o) })
 	}
 	t := r.tree
 	t.mu.Lock()

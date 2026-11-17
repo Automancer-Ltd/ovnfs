@@ -20,7 +20,6 @@ import (
 	"github.com/stencil-hq/ovnfs/api"
 	"github.com/stencil-hq/ovnfs/checkout"
 	"github.com/stencil-hq/ovnfs/export"
-	"github.com/stencil-hq/ovnfs/internal/nodestest"
 	"github.com/stencil-hq/ovnfs/overlay"
 	"golang.org/x/sys/unix"
 )
@@ -65,9 +64,9 @@ func newFixture(t *testing.T, files map[string]string) *fixture {
 	}
 	f := &fixture{state: t.TempDir(), mnt: t.TempDir()}
 	var err error
-	f.reg, err = checkout.Open(checkout.Config{State: f.state, Mount: t.TempDir(), Memory: overlay.NewMemory(64<<20, 1<<20, 0), BlobCache: 64 << 20, Retire: func(name string) {
+	f.reg, err = checkout.Open(checkout.Config{State: f.state, Mount: t.TempDir(), Memory: overlay.NewMemory(64<<20, 1<<20, 0), BlobCache: 64 << 20, Retire: func(name string, slot uint16) {
 		if f.export != nil {
-			f.export.Retire(name)
+			f.export.Retire(name, slot)
 		}
 	}})
 	if err != nil {
@@ -88,15 +87,10 @@ func newFixture(t *testing.T, files map[string]string) *fixture {
 	return f
 }
 
-// open (re)opens the export over the fixture's persistent node log.
+// open (re)opens the export over the fixture's registry.
 func (f *fixture) open(t *testing.T) {
 	t.Helper()
-	e, err := export.New(export.NewRouter(f.reg), filepath.Join(f.state, "nodes.log"), f.state, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.export = e
-	t.Cleanup(func() { e.Close() })
+	f.export = export.New(export.NewRouter(f.reg), f.state)
 }
 
 // mount serves the export at the fixture's mountpoint until the test ends.
@@ -340,14 +334,14 @@ func TestCheckoutReadWrite(t *testing.T) {
 	}
 }
 
-// TestInodesAreStableNodeIDs checks that inode numbers are the export's node
-// ids and survive copy-up, renames, and a remount over the same node log.
+// TestInodesAreStableNodeIDs checks that inode numbers are the export's file
+// ids and survive copy-up, renames, and a remount over a fresh export.
 func TestInodesAreStableNodeIDs(t *testing.T) {
 	f := newFixture(t, map[string]string{"file": "lower"})
 	nodes := f.export.Nodes()
 	ino := f.ino(t, "alpha/file")
 	if want := nodes.ID("alpha/file"); ino != want {
-		t.Fatalf("inode %d, node id %d", ino, want)
+		t.Fatalf("inode %d, file id %d", ino, want)
 	}
 	if ino == f.ino(t, "beta/file") {
 		t.Fatal("checkouts share an inode")
@@ -365,9 +359,6 @@ func TestInodesAreStableNodeIDs(t *testing.T) {
 		t.Fatalf("rename changed inode %d -> %d", ino, got)
 	}
 	f.unmount(t)
-	if err := f.export.Close(); err != nil {
-		t.Fatal(err)
-	}
 	f.open(t)
 	f.mount(t)
 	if got := f.ino(t, "alpha/renamed"); got != ino {
@@ -640,70 +631,5 @@ func TestSpecialNodes(t *testing.T) {
 		if err != nil || info.Mode()&os.ModeType != tc.kind {
 			t.Fatalf("%s: %v, %v", tc.p, info, err)
 		}
-	}
-}
-
-// TestIndexFaultBlocksTruncate exercises a writable kernel handle: neither
-// truncate's descriptor path nor fstat's fallback may hide an identity error.
-func TestIndexFaultBlocksTruncate(t *testing.T) {
-	f := newFixture(t, map[string]string{"d/file": "unchanged", "pressure/file": "pressure"})
-	held, err := os.OpenFile(f.path("alpha/d/file"), os.O_RDWR, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer held.Close()
-	nodes := f.export.Nodes()
-	f.export.SetNodeCache(0)
-	nodes.ID("alpha/pressure/file")
-	nodes.ID("beta/d/file")
-	nodes.ID("beta/pressure/file")
-	nodestest.BreakCold(t, f.state)
-	if nodes.ID("beta/d/file") != 0 || nodes.IdentityError() == nil {
-		t.Fatal("missing cold index did not latch a fault")
-	}
-	wantErrno(t, "ftruncate after index fault", held.Truncate(1), syscall.EIO)
-	var session checkout.Session
-	if err := f.reg.Enter("alpha", &session); err != nil {
-		t.Fatal(err)
-	}
-	info, err := session.FS.Lstat("d/file")
-	session.Done()
-	if err != nil || info.Size() != int64(len("unchanged")) {
-		t.Fatalf("failed truncate changed file size: %v %v", info, err)
-	}
-	time.Sleep(TTL + 100*time.Millisecond) // let the kernel's earlier attrs expire
-	if _, err := held.Stat(); !errors.Is(err, syscall.EIO) {
-		t.Fatalf("fstat hid index fault: %v", err)
-	}
-}
-
-func TestSlowReleaseDoesNotHoldHandleMutex(t *testing.T) {
-	entered, resume := make(chan struct{}), make(chan struct{})
-	h := &fileHandle{release: func() { close(entered); <-resume }}
-	other := &fileHandle{}
-	x := &exportFS{handles: map[uint64]any{1: h, 2: other}}
-	done := make(chan struct{})
-	go func() { x.drop(1); close(done) }()
-	select {
-	case <-entered:
-	case <-time.After(time.Second):
-		t.Fatal("release did not start")
-	}
-	found := make(chan *fileHandle, 1)
-	go func() { found <- x.file(2) }()
-	select {
-	case got := <-found:
-		if got != other {
-			t.Error("lost unrelated handle")
-		}
-	case <-time.After(time.Second):
-		close(resume)
-		t.Fatal("release held handle mutex")
-	}
-	close(resume)
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("drop did not finish")
 	}
 }

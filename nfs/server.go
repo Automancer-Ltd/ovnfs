@@ -2,8 +2,10 @@
 // NFSv4.0 (RFC 7530) on one TCP port.
 //
 // rpc.go frames ONC RPC records and dispatches calls to mount.go, v3*.go and
-// v4*.go. File handles are the backend's stable file ids (8 bytes,
-// big-endian), so they survive renames and server restarts. NFSv4 clients may
+// v4*.go. File handles are the backend's stable file id and the generation
+// Backend.Generation tags it with (16 bytes, big-endian), so they survive
+// renames and server restarts; Backend.RetireHandle makes a file's handles
+// stale without changing its fileid. NFSv4 clients may
 // get read delegations on files the backend calls cacheable; Server.Recall
 // takes them back when a file changes outside this server.
 //
@@ -93,6 +95,11 @@ func (s *Server) start() {
 // themselves; the embedder calls Recall for every other change to a file
 // Backend.Cacheable admits. It does not block.
 func (s *Server) Recall(id uint64) { s.v4.recall(id) }
+
+// RecallRange is Recall of every file id in [first, last], for the
+// embedder's changes that reach many files at once, such as every file of a
+// checkout (a checkout's ids share one range). It does not block.
+func (s *Server) RecallRange(first, last uint64) { s.v4.recallRange(first, last) }
 
 // logf logs through Logf, if set.
 func (s *Server) logf(format string, args ...any) {

@@ -1,6 +1,8 @@
 package nfs
 
 import (
+	"os"
+
 	"github.com/go-git/go-billy/v5"
 
 	"github.com/stencil-hq/ovnfs/smb"
@@ -14,30 +16,34 @@ type Backend interface {
 	// Link makes newname another name of the file oldname. Errors keep their
 	// errno (EXDEV, EMLINK, ENOTSUP, ...), which clients see as statuses.
 	Link(oldname, newname string) error
-	// FileID returns p's stable id, allocating one on first use. File handles
-	// and fileids carry it, so it must follow p across renames.
+	// FileID returns the id of the entry at p, Lstating it; 0 when p does not
+	// exist or has no identity. File handles and fileids carry the id, so it
+	// must follow the entry across renames. Callers holding a FileInfo for p
+	// use IDOf instead.
 	FileID(p string) uint64
-	// ChildID identifies one basename under clean directory dir without
-	// requiring callers to construct a complete child path.
-	ChildID(dir, name string) uint64
-	// Path returns the current path of a live id; false makes the id's
-	// handles stale.
-	Path(id uint64) (string, bool)
-	// RetireHandle makes id stale while preserving its path for a new identity.
-	// It returns false when id is already stale or names the export root.
+	// IDOf returns, without a syscall, the id of the entry at p that info
+	// (from this backend's Lstat, Stat or open-file Stat of p) describes; 0
+	// when it cannot be determined.
+	IDOf(p string, info os.FileInfo) uint64
+	// ChildID returns, without a syscall or path join, the id of the entry
+	// info, which this backend's ReadDir(dir) returned; READDIRPLUS and
+	// NFSv4 READDIR use it for every entry they list.
+	ChildID(dir string, info os.FileInfo) uint64
+	// Generation returns the tag every handle issued now for id carries.
+	// RetireHandle changes it, which makes earlier handles stale.
+	Generation(id uint64) uint64
+	// Path returns the current path of the file a handle (id, gen) names;
+	// false, when the file is gone or gen is not id's current generation,
+	// makes the handle stale.
+	Path(id, gen uint64) (string, bool)
+	// RetireHandle bumps id's generation so its handles go stale while its
+	// path and fileid stay; clients then look the name up again. The server
+	// calls it when a client caches attributes the file can no longer have.
+	// It returns false when id is stale or names the export root.
 	RetireHandle(id uint64) bool
 	// Cacheable permits NFSv4 read delegations on p. It must return true only
 	// when every change to p made outside this server reaches Server.Recall.
 	Cacheable(p string) bool
 	// Statfs reports the capacity FSSTAT and the NFSv4 space attributes show.
 	Statfs() (smb.Statfs, error)
-}
-
-// identityError lets a backend fail closed when stable identities cannot be
-// read. Backends without a separate identity store need no hook.
-func identityError(fs Backend) error {
-	if fs, ok := fs.(interface{ IdentityError() error }); ok {
-		return fs.IdentityError()
-	}
-	return nil
 }

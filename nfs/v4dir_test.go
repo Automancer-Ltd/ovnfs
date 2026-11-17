@@ -139,7 +139,7 @@ func TestV4NamespaceChangeInfo(t *testing.T) {
 	if set, _ := getBitmap4(d); set != bitmap4(attr4Mode) {
 		t.Fatalf("CREATE attrset %v", set)
 	}
-	if id, _ := r.next(op4GetFH, stOK).fh(8); id != fs.FileID("d") {
+	if id, _, _ := r.next(op4GetFH, stOK).fh(fhSize); id != fs.FileID("d") {
 		t.Fatal("CREATE did not make the new directory current")
 	}
 	r.end()

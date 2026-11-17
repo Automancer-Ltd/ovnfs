@@ -11,7 +11,7 @@ import (
 
 // memStat builds darwin stat data for a memory file.
 func memStat(i memInfo) any {
-	s := &syscall.Stat_t{Nlink: 1, Uid: i.uid, Gid: i.gid, Ino: i.ino, Size: i.size, Blocks: (i.size + 511) / 512, Blksize: 4096}
+	s := &syscall.Stat_t{Nlink: 1, Uid: i.uid, Gid: i.gid, Ino: uint64(i.id), Size: i.size, Blocks: (i.size + 511) / 512, Blksize: 4096}
 	s.Mode = uint16(unixMode(i.mode))
 	s.Atimespec = syscall.NsecToTimespec(i.atime.UnixNano())
 	s.Mtimespec = syscall.NsecToTimespec(i.mtime.UnixNano())

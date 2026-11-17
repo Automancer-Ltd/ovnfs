@@ -141,7 +141,7 @@ func handleQueryDirectory(r *request) ([]byte, uint32) {
 		oldLength := len(data)
 		start := (oldLength + 7) &^ 7
 		data = append(data, make([]byte, start-oldLength)...)
-		id := r.c.srv.FS.FileID(e.path)
+		id := r.c.srv.FS.IDOf(e.path, info)
 		if id == 0 {
 			return nil, statusInternalError
 		}

@@ -1,103 +1,16 @@
 package nfs
 
 import (
-	"github.com/go-git/go-billy/v5"
 	"os"
 	"path"
 	"sync/atomic"
-	"syscall"
 	"testing"
+
+	"github.com/go-git/go-billy/v5"
 )
 
-// failingIdentityFS models an index fault during FileID, after Lstat worked.
-type failingIdentityFS struct {
-	*testFS
-	failed atomic.Bool
-}
-
-func (f *failingIdentityFS) FileID(p string) uint64 {
-	if p == "f" {
-		f.failed.Store(true)
-		return 0
-	}
-	return f.testFS.FileID(p)
-}
-
-func (f *failingIdentityFS) ChildID(dir, name string) uint64 {
-	return f.FileID(path.Join(dir, name))
-}
-
-func (f *failingIdentityFS) IdentityError() error {
-	if f.failed.Load() {
-		return syscall.EIO
-	}
-	return nil
-}
-
-// TestIdentityFailureIsIO never publishes zero or a replacement identity when
-// a backend's separate identity store fails during a request.
-func TestIdentityFailureIsIO(t *testing.T) {
-	t.Run("v3", func(t *testing.T) {
-		fs := &failingIdentityFS{testFS: newTestFS(t)}
-		fs.write(t, "f", "content")
-		c := v3server(t, fs)
-		st, d := c.v3call(v3Lookup, func(e *encoder) { dirop(e, 1, "f") })
-		if st != stIO {
-			t.Fatalf("LOOKUP status %d, want IO", st)
-		}
-		if d.bool() || d.err != nil || len(d.buf) != 0 {
-			t.Fatal("malformed LOOKUP failure arm")
-		}
-	})
-	t.Run("v4", func(t *testing.T) {
-		fs := &failingIdentityFS{testFS: newTestFS(t)}
-		fs.write(t, "f", "content")
-		_, addr := v4serve(t, fs, nil)
-		c := v4dial(t, addr)
-		r := c.run(v4Root(), v4Look("f"))
-		r.skip(op4PutRootFH)
-		r.next(op4Lookup, stIO)
-		r.end()
-	})
-}
-
-// failingHoldFS fails inside acquisition, after its caller chose a file id.
-type failingHoldFS struct {
-	*testFS
-	failed atomic.Bool
-	held   atomic.Int64
-}
-
-func (f *failingHoldFS) HoldFileID(uint64) func() {
-	f.held.Add(1)
-	f.failed.Store(true)
-	return func() { f.held.Add(-1) }
-}
-func (f *failingHoldFS) IdentityError() error {
-	if f.failed.Load() {
-		return syscall.EIO
-	}
-	return nil
-}
-func TestLateHoldFailureReleasesState(t *testing.T) {
-	fs := &failingHoldFS{testFS: newTestFS(t)}
-	srv, addr := v4serve(t, fs, nil)
-	fs.write(t, "f", "content")
-	c := v4dial(t, addr)
-	c.setup(srv, "late", nil)
-	if st, _ := c.open("reader", "f", share4Read, false); st != stIO {
-		t.Fatalf("OPEN %d", st)
-	}
-	srv.v4.mu.Lock()
-	holds := len(srv.v4.holds)
-	owners := len(srv.v4.owners)
-	srv.v4.mu.Unlock()
-	if fs.held.Load() != 0 || holds != 0 || owners != 0 {
-		t.Fatalf("unpublished state leaked: holds %d owners %d retained %d", holds, owners, fs.held.Load())
-	}
-}
-
-// allocationFS refuses a fresh id without faulting the rest of the backend.
+// allocationFS determines no id for "f", as a backend does for an entry
+// whose identity it cannot read, and ids for everything else.
 type allocationFS struct{ *testFS }
 
 func (f allocationFS) FileID(p string) uint64 {
@@ -106,10 +19,13 @@ func (f allocationFS) FileID(p string) uint64 {
 	}
 	return f.testFS.FileID(p)
 }
-func (f allocationFS) ChildID(dir, name string) uint64 {
-	return f.FileID(path.Join(dir, name))
+func (f allocationFS) IDOf(p string, _ os.FileInfo) uint64 { return f.FileID(p) }
+func (f allocationFS) ChildID(dir string, info os.FileInfo) uint64 {
+	return f.FileID(path.Join(dir, info.Name()))
 }
 
+// TestRefusedAllocationIsIO answers IO rather than a handle of id 0 when the
+// backend cannot identify the entry looked up.
 func TestRefusedAllocationIsIO(t *testing.T) {
 	fs := allocationFS{newTestFS(t)}
 	fs.write(t, "f", "content")
@@ -124,8 +40,7 @@ func TestRefusedAllocationIsIO(t *testing.T) {
 	}
 }
 
-// refusedSpecialFS commits the creation but refuses its result identity,
-// without poisoning existing identities through IdentityError.
+// refusedSpecialFS commits the creation but has no id for its result.
 type refusedSpecialFS struct{ allocationFS }
 
 func (f refusedSpecialFS) Mknod(name string, mode os.FileMode) error {
@@ -136,6 +51,8 @@ func (f refusedSpecialFS) Mknod(name string, mode os.FileMode) error {
 	return file.Close()
 }
 
+// TestSpecialCreationRefusedIdentity answers IO, with a well-formed failure
+// arm, for a MKNOD or CREATE whose new file has no id.
 func TestSpecialCreationRefusedIdentity(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -178,6 +95,7 @@ func TestSpecialCreationRefusedIdentity(t *testing.T) {
 	}
 }
 
+// retainedFaultFile counts the closes of a file the server may keep open.
 type retainedFaultFile struct {
 	billy.File
 	closes atomic.Int64
@@ -185,6 +103,8 @@ type retainedFaultFile struct {
 
 func (f *retainedFaultFile) Close() error { f.closes.Add(1); return f.File.Close() }
 
+// refusedCreateFS has no id for the file "readonly" and records the file it
+// opens for it.
 type refusedCreateFS struct {
 	*testFS
 	file *retainedFaultFile
@@ -196,8 +116,9 @@ func (f *refusedCreateFS) FileID(p string) uint64 {
 	}
 	return f.testFS.FileID(p)
 }
-func (f *refusedCreateFS) ChildID(dir, name string) uint64 {
-	return f.FileID(path.Join(dir, name))
+func (f *refusedCreateFS) IDOf(p string, _ os.FileInfo) uint64 { return f.FileID(p) }
+func (f *refusedCreateFS) ChildID(dir string, info os.FileInfo) uint64 {
+	return f.FileID(path.Join(dir, info.Name()))
 }
 
 func (f *refusedCreateFS) OpenFile(p string, flag int, perm os.FileMode) (billy.File, error) {
@@ -208,6 +129,10 @@ func (f *refusedCreateFS) OpenFile(p string, flag int, perm os.FileMode) (billy.
 	f.file = &retainedFaultFile{File: file}
 	return f.file, nil
 }
+
+// TestRefusedCreateOpenClosesRetainedFile answers IO for an OPEN creating a
+// file with no id, closing the descriptor kept for it and publishing no
+// state.
 func TestRefusedCreateOpenClosesRetainedFile(t *testing.T) {
 	fs := &refusedCreateFS{testFS: newTestFS(t)}
 	srv, addr := v4serve(t, fs, nil)
@@ -224,109 +149,5 @@ func TestRefusedCreateOpenClosesRetainedFile(t *testing.T) {
 	defer srv.v4.mu.Unlock()
 	if len(srv.v4.holds) != 0 || len(srv.v4.files) != 0 {
 		t.Fatal("refused OPEN published state")
-	}
-}
-
-// acquisitionFaultFS faults a selected hold after retaining it, and counts
-// creation descriptors so an unpublished OPEN cannot leak either resource.
-type acquisitionFaultFS struct {
-	*testFS
-	calls, held atomic.Int64
-	failAt      int64
-	failed      atomic.Bool
-	file        *retainedFaultFile
-}
-
-func (f *acquisitionFaultFS) HoldFileID(uint64) func() {
-	f.held.Add(1)
-	if f.calls.Add(1) == f.failAt {
-		f.failed.Store(true)
-	}
-	return func() { f.held.Add(-1) }
-}
-func (f *acquisitionFaultFS) IdentityError() error {
-	if f.failed.Load() {
-		return syscall.EIO
-	}
-	return nil
-}
-func (f *acquisitionFaultFS) OpenFile(p string, flag int, perm os.FileMode) (billy.File, error) {
-	file, err := f.testFS.OpenFile(p, flag, perm)
-	if err != nil {
-		return nil, err
-	}
-	f.file = &retainedFaultFile{File: file}
-	return f.file, nil
-}
-func TestOpenAcquisitionRollback(t *testing.T) {
-	for _, tc := range []struct {
-		name             string
-		fail             int64
-		create, previous bool
-	}{
-		{"first", 1, false, false}, {"delegation", 2, false, false},
-		{"creation", 1, true, false}, {"additional", 2, false, true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			fs := &acquisitionFaultFS{testFS: newTestFS(t), failAt: tc.fail}
-			fs.cacheable = func(string) bool { return true }
-			srv, addr := v4serve(t, fs, nil)
-			c, _ := v4holder(t, srv, addr, tc.name)
-			var prior v4opened
-			if !tc.create && !tc.previous {
-				fs.write(t, "f", "content")
-			}
-			if tc.previous {
-				r := c.run(v4Root(), v4Open(v4openArgs{owner: c.owner("owner"), access: share4Write, create: true, name: "f", attrs: v4Mode(0400)}))
-				r.skip(op4PutRootFH)
-				prior = v4getOpened(t, r.next(op4Open, stOK))
-				r.end()
-			}
-			access := uint32(share4Read)
-			if tc.create {
-				access = share4AccessAll
-			}
-			r := c.run(v4Root(), v4Open(v4openArgs{owner: c.owner("owner"), access: access, create: tc.create, name: "f", attrs: v4Mode(0400)}))
-			if r.status != stIO {
-				t.Fatalf("OPEN: %d", r.status)
-			}
-			srv.v4.mu.Lock()
-			holds, owners, files := len(srv.v4.holds), len(srv.v4.owners), len(srv.v4.files)
-			if tc.previous {
-				h := srv.v4.holds[prior.id.other]
-				if h == nil || h.id != prior.id || h.access != share4Write {
-					t.Error("failed additional OPEN changed previous state")
-				}
-			}
-			grants := len(srv.v4.granting)
-			srv.v4.mu.Unlock()
-			want := 0
-			if tc.previous {
-				want = 1
-			}
-			if holds != want || owners != want || files != want || fs.held.Load() != int64(want) || grants != 0 {
-				t.Fatalf("unpublished state: holds=%d owners=%d files=%d retained=%d grants=%d", holds, owners, files, fs.held.Load(), grants)
-			}
-			if tc.create && (fs.file == nil || fs.file.closes.Load() != 1) {
-				t.Fatal("creation descriptor was not closed once")
-			}
-			if tc.previous {
-				if fs.file == nil || fs.file.closes.Load() != 0 {
-					t.Fatal("failed additional OPEN closed previous retained file")
-				}
-				fs.failed.Store(false)
-				r := c.run(v4Root(), v4Look("f"), v4Close(prior.id))
-				r.skip(op4PutRootFH)
-				r.skip(op4Lookup)
-				getStateID4(r.next(op4Close, stOK))
-				r.end()
-				if fs.held.Load() != 0 {
-					t.Fatal("previous state could not be closed")
-				}
-				if fs.file.closes.Load() != 1 {
-					t.Fatal("previous retained file did not close once")
-				}
-			}
-		})
 	}
 }

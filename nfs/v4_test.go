@@ -106,7 +106,7 @@ func v4Save() v4op           { return func(e *encoder) { e.u32(op4SaveFH) } }
 func v4Restore() v4op        { return func(e *encoder) { e.u32(op4RestoreFH) } }
 func v4LookP() v4op          { return func(e *encoder) { e.u32(op4LookupP) } }
 func v4ReadLink() v4op       { return func(e *encoder) { e.u32(op4ReadLink) } }
-func v4PutFH(id uint64) v4op { return func(e *encoder) { e.u32(op4PutFH); e.fh(id) } }
+func v4PutFH(id uint64) v4op { return func(e *encoder) { e.u32(op4PutFH); e.fh(id, 0) } }
 
 func v4Look(name string) v4op   { return v4NameOp(op4Lookup, name) }
 func v4Remove(name string) v4op { return v4NameOp(op4Remove, name) }
@@ -521,6 +521,7 @@ type v4FakeRecall struct {
 	id       v4StateID
 	truncate bool
 	file     uint64
+	gen      uint64 // the handle's generation
 	fhOK     bool
 }
 
@@ -601,7 +602,7 @@ func (f *v4FakeCB) serve(nc net.Conn) {
 			tag := d.str(v4OpaqueLimit)
 			minor, ident, n, op := d.u32(), d.u32(), d.u32(), d.u32()
 			rc := v4FakeRecall{ident: ident, id: getStateID4(&d), truncate: d.bool()}
-			rc.file, rc.fhOK = d.fh(128)
+			rc.file, rc.gen, rc.fhOK = d.fh(128)
 			if d.err != nil || minor != 0 || n != 1 || op != cb4OpRecall || len(d.buf) != 0 {
 				return
 			}

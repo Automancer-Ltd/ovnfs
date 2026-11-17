@@ -12,11 +12,11 @@ import (
 
 // getattr3 answers GETATTR (RFC 1813 section 3.3.1).
 func (s *Server) getattr3(d *decoder, res *encoder) status {
-	id, ok := d.fh(maxFH3)
+	id, gen, ok := d.fh(maxFH3)
 	if d.err != nil {
 		return stInval
 	}
-	p, st := s.path3(id, ok)
+	p, st := s.path3(id, gen, ok)
 	if st != stOK {
 		return st
 	}
@@ -26,7 +26,9 @@ func (s *Server) getattr3(d *decoder, res *encoder) status {
 	}
 	if res.sizeRegressed(&a) {
 		s.Recall(id)
-		s.FS.RetireHandle(id)
+		if s.FS.RetireHandle(id) {
+			s.v3.maxSizes.retire(id)
+		}
 		return stStale
 	}
 	fattr3(res, &a)
@@ -40,7 +42,7 @@ func (s *Server) getattr3(d *decoder, res *encoder) status {
 // and again after the change, which catches a delegation granted while the
 // change was under way.
 func (s *Server) setattr3(d *decoder, res *encoder) status {
-	id, ok := d.fh(maxFH3)
+	id, gen, ok := d.fh(maxFH3)
 	sa := decodeSattr3(d)
 	guard := d.bool()
 	var sec, nsec uint32
@@ -50,7 +52,7 @@ func (s *Server) setattr3(d *decoder, res *encoder) status {
 	if d.err != nil {
 		return stInval
 	}
-	p, st := s.path3(id, ok)
+	p, st := s.path3(id, gen, ok)
 	if st != stOK {
 		return st
 	}
@@ -80,12 +82,12 @@ func (s *Server) setattr3(d *decoder, res *encoder) status {
 // lookup3 answers LOOKUP (section 3.3.3), including "." and "..". The root
 // has no parent to look up (ACCES).
 func (s *Server) lookup3(d *decoder, res *encoder) status {
-	id, ok := d.fh(maxFH3)
+	id, gen, ok := d.fh(maxFH3)
 	name := d.str(maxPath3)
 	if d.err != nil {
 		return stInval
 	}
-	p, st := s.path3(id, ok)
+	p, st := s.path3(id, gen, ok)
 	if st != stOK {
 		return st
 	}
@@ -115,12 +117,12 @@ func (s *Server) lookup3(d *decoder, res *encoder) status {
 	if err != nil {
 		return statusOf(err)
 	}
-	fid := s.FS.FileID(child)
+	fid := s.FS.IDOf(child, info)
 	if fid == 0 {
 		return stIO
 	}
 	a := attrsOf(fid, info)
-	res.fh(a.fileid)
+	res.fh(fid, s.FS.Generation(fid))
 	postAttrs3(res, &a)
 	da := attrsOf(id, dir)
 	postAttrs3(res, &da)
@@ -130,12 +132,12 @@ func (s *Server) lookup3(d *decoder, res *encoder) status {
 // access3 answers ACCESS (section 3.3.4), granting every right asked for:
 // the backend's own permissions apply when the client acts.
 func (s *Server) access3(d *decoder, res *encoder) status {
-	id, ok := d.fh(maxFH3)
+	id, gen, ok := d.fh(maxFH3)
 	mask := d.u32()
 	if d.err != nil {
 		return stInval
 	}
-	p, st := s.path3(id, ok)
+	p, st := s.path3(id, gen, ok)
 	if st != stOK {
 		return st
 	}
@@ -147,11 +149,11 @@ func (s *Server) access3(d *decoder, res *encoder) status {
 // readlink3 answers READLINK (section 3.3.5); INVAL for a file that is not
 // a symlink.
 func (s *Server) readlink3(d *decoder, res *encoder) status {
-	id, ok := d.fh(maxFH3)
+	id, gen, ok := d.fh(maxFH3)
 	if d.err != nil {
 		return stInval
 	}
-	p, st := s.path3(id, ok)
+	p, st := s.path3(id, gen, ok)
 	if st != stOK {
 		return st
 	}
@@ -167,13 +169,13 @@ func (s *Server) readlink3(d *decoder, res *encoder) status {
 // read3 answers READ (section 3.3.6), reading straight into the reply. eof
 // is set when the data ends at or past the end of the file.
 func (s *Server) read3(d *decoder, res *encoder) status {
-	id, ok := d.fh(maxFH3)
+	id, gen, ok := d.fh(maxFH3)
 	off := d.u64()
 	count := d.u32()
 	if d.err != nil {
 		return stInval
 	}
-	p, st := s.path3(id, ok)
+	p, st := s.path3(id, gen, ok)
 	if st != stOK {
 		return st
 	}
@@ -222,7 +224,7 @@ const fileSync3 = 2
 // reply, so every write is committed FILE_SYNC with this instance's
 // verifier.
 func (s *Server) write3(d *decoder, res *encoder) status {
-	id, ok := d.fh(maxFH3)
+	id, gen, ok := d.fh(maxFH3)
 	off := d.u64()
 	count := d.u32()
 	how := d.u32()
@@ -230,7 +232,7 @@ func (s *Server) write3(d *decoder, res *encoder) status {
 	if d.err != nil {
 		return stInval
 	}
-	p, st := s.path3(id, ok)
+	p, st := s.path3(id, gen, ok)
 	if st != stOK {
 		return st
 	}
@@ -292,13 +294,13 @@ func (s *Server) writeAt3(id uint64, p string, data []byte, off int64) (int, err
 // commit3 answers COMMIT (section 3.3.21): writes are already stable, so
 // it only confirms the verifier.
 func (s *Server) commit3(d *decoder, res *encoder) status {
-	id, ok := d.fh(maxFH3)
+	id, gen, ok := d.fh(maxFH3)
 	d.u64() // offset
 	d.u32() // count
 	if d.err != nil {
 		return stInval
 	}
-	p, st := s.path3(id, ok)
+	p, st := s.path3(id, gen, ok)
 	if st != stOK {
 		return st
 	}
@@ -309,11 +311,11 @@ func (s *Server) commit3(d *decoder, res *encoder) status {
 
 // fsstat3 answers FSSTAT (section 3.3.18) from Backend.Statfs.
 func (s *Server) fsstat3(d *decoder, res *encoder) status {
-	id, ok := d.fh(maxFH3)
+	id, gen, ok := d.fh(maxFH3)
 	if d.err != nil {
 		return stInval
 	}
-	p, st := s.path3(id, ok)
+	p, st := s.path3(id, gen, ok)
 	if st != stOK {
 		return st
 	}
@@ -343,11 +345,11 @@ const (
 
 // fsinfo3 answers FSINFO (section 3.3.19).
 func (s *Server) fsinfo3(d *decoder, res *encoder) status {
-	id, ok := d.fh(maxFH3)
+	id, gen, ok := d.fh(maxFH3)
 	if d.err != nil {
 		return stInval
 	}
-	p, st := s.path3(id, ok)
+	p, st := s.path3(id, gen, ok)
 	if st != stOK {
 		return st
 	}
@@ -368,11 +370,11 @@ func (s *Server) fsinfo3(d *decoder, res *encoder) status {
 
 // pathconf3 answers PATHCONF (section 3.3.20).
 func (s *Server) pathconf3(d *decoder, res *encoder) status {
-	id, ok := d.fh(maxFH3)
+	id, gen, ok := d.fh(maxFH3)
 	if d.err != nil {
 		return stInval
 	}
-	p, st := s.path3(id, ok)
+	p, st := s.path3(id, gen, ok)
 	if st != stOK {
 		return st
 	}

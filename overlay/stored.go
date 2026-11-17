@@ -6,13 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/stencil-hq/ovnfs/internal/clone"
 	"github.com/stencil-hq/ovnfs/internal/durable"
 	"github.com/stencil-hq/ovnfs/internal/hostfile"
+	"github.com/stencil-hq/ovnfs/internal/ident"
 )
 
 // Blobs serves the content of stored layer entries by blob id; checkout adapts
@@ -35,15 +37,18 @@ type Blobs interface {
 // prefix keeps it out of any index of the directory.
 const manifestName = metaPrefix + "manifest"
 
-// manifestVersion is the only manifest layout this package reads.
-const manifestVersion = 1
+// manifestVersion is the manifest layout this package writes. Version 2
+// records every entry's identity; version 1, which it also reads, did not
+// (see [legacyIdentity]).
+const manifestVersion = 2
 
 // manifest describes a stored layer completely: every entry in [Layer.Walk]
 // order with the metadata the host reported when the layer was frozen.
 type manifest struct {
-	Version int             `json:"v"`
-	Tree    string          `json:"r,omitempty"` // store tree reaching every blob, the layer's GC root
-	Entries []manifestEntry `json:"e"`
+	Version   int             `json:"v"`
+	Tree      string          `json:"r,omitempty"` // store tree reaching every blob, the layer's GC root
+	Synthetic uint64          `json:"n,omitempty"` // the layer's Synthetic high-water mark
+	Entries   []manifestEntry `json:"e"`
 }
 
 // manifestEntry restores one indexed path; whiteouts carry only Path and Kind.
@@ -57,20 +62,23 @@ type manifestEntry struct {
 	Sec    int64  `json:"t,omitempty"` // modification time
 	Nsec   int64  `json:"u,omitempty"`
 	Sys    []byte `json:"x,omitempty"` // native stat record, see encodeSys
-	Link   int    `json:"l,omitempty"` // 1 + index of the first entry naming the same host file
+	ID     uint64 `json:"i,omitempty"` // the entry's ident.ID, shared by hard links; version 2
+	Link   int    `json:"l,omitempty"` // 1 + index of the first entry naming the same host file; version 1
 	Blob   string `json:"b,omitempty"` // stored content; absent: the raw file stays in the directory
 	Origin string `json:"q,omitempty"` // rename's source path in the parent layer view
 }
 
 // storedInfo is metadata a manifest restores: exactly what the host reported
-// for the entry when the layer was frozen.
+// for the entry when the layer was frozen, and the entry's identity.
 type storedInfo struct {
 	name  string
 	size  int64
 	mode  os.FileMode
 	mtime time.Time
 	sys   any
-	link  uint64 // shared by the hard links of one host file; 0 when alone
+	id    ident.ID
+
+	legacyLink int // a version 1 entry's hard-link group, see [manifestEntry.Link]
 }
 
 // Name returns the base name.
@@ -91,16 +99,8 @@ func (i storedInfo) IsDir() bool { return i.mode.IsDir() }
 // Sys returns the recorded native stat record.
 func (i storedInfo) Sys() any { return i.sys }
 
-// storedLinks numbers the hard-link groups of stored entries in this process.
-var storedLinks atomic.Uint64
-
-// sameStored reports whether a and b are restored hard links of one host file,
-// which [os.SameFile] cannot tell without the file.
-func sameStored(a, b os.FileInfo) bool {
-	x, ok := a.(storedInfo)
-	y, ok2 := b.(storedInfo)
-	return ok && ok2 && x.link != 0 && x.link == y.link
-}
+// Identity returns the recorded identity.
+func (i storedInfo) Identity() ident.ID { return i.id }
 
 // Stored reports whether the layer is described by its manifest, some of its
 // content served from blobs.
@@ -156,20 +156,22 @@ func (l *Layer) open(p, name string, flag int) (billy.File, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	v := l.view()
+	e := v.entries[p]
 	if id, ok := v.ids[p]; ok {
 		c, err := l.blobs.Open(id)
 		if err != nil {
 			return nil, err
 		}
-		return wrapContent(c, name), nil
+		return wrapContent(c, name, handleID(e.Info)), nil
 	}
-	if l.blobs != nil && v.entries[p].Kind == KindDir {
+	if l.blobs != nil && e.Kind == KindDir {
 		return nil, &fs.PathError{Op: "open", Path: name, Err: syscall.EISDIR}
 	}
 	h, err := open(filepath.Join(l.dir, filepath.FromSlash(p)), name, flag, 0, nil)
 	if err != nil {
 		return nil, err
 	}
+	h.id = handleID(e.Info)
 	return h, nil
 }
 
@@ -276,13 +278,18 @@ func (l *Layer) Store(ids map[string]string, tree string, blobs Blobs) error {
 	return nil
 }
 
-// manifest describes every entry, linking hard links of one host file.
+// manifest describes every entry with its identity, which hard links of one
+// host file share.
 func (l *Layer) manifest(ids map[string]string, tree string) (manifest, error) {
-	m := manifest{Version: manifestVersion, Tree: tree}
-	first := make(map[inodeKey]int)
+	m := manifest{Version: manifestVersion, Tree: tree, Synthetic: l.synthetic}
 	err := l.Walk(func(p string, e Entry) error {
 		me := manifestEntry{Path: p, Kind: e.Kind, Opaque: e.Opaque, Blob: ids[p], Origin: e.Origin}
 		if e.Kind != KindWhiteout {
+			id, ok := ident.Of(e.Info)
+			if !ok {
+				return fmt.Errorf("overlay: record %q: no identity", p)
+			}
+			me.ID = uint64(id)
 			if p == "" {
 				me.Name = e.Info.Name()
 			}
@@ -293,20 +300,6 @@ func (l *Layer) manifest(ids map[string]string, tree string) (manifest, error) {
 				return fmt.Errorf("overlay: record %q: %w", p, err)
 			}
 			me.Sys = sys
-		}
-		if e.Kind == KindFile || e.Kind == KindSymlink {
-			// Windows reads a raw entry's file id from its path on first use;
-			// load it before Store removes the file, or Rename stops telling
-			// this layer's hard links apart from other files.
-			_ = primeInfo(e.Info)
-			if key, err := identity(l.dir, filepath.FromSlash(p), e.Info); err == nil {
-				if i, ok := first[key]; ok {
-					me.Link = i + 1
-					m.Entries[i].Link = i + 1
-				} else {
-					first[key] = len(m.Entries)
-				}
-			}
 		}
 		m.Entries = append(m.Entries, me)
 		return nil
@@ -467,29 +460,33 @@ func RestoreLayer(dir string, data []byte, blobs Blobs) (*Layer, error) {
 	if err != nil {
 		return nil, err
 	}
-	l.tree = v.tree
+	l.tree, l.synthetic = v.tree, v.synthetic
 	l.resident.Store(v)
 	return l, nil
 }
 
 // decode builds the index l's metadata describes, one manifest entry at a time:
 // buffering the whole document and its entry slice cost several times the
-// index itself. Hard-link groups keep their numbers across decodes, so
-// [sameStored] holds between them.
+// index itself. Every decode restores the same identities.
 func (l *Layer) decode() (*Layer, error) {
 	reader := flate.NewReader(bytes.NewReader(l.metadata))
 	defer reader.Close()
-	if l.links == 0 {
-		l.links = storedLinks.Add(1) << 32
+	if l.legacy == 0 {
+		h := fnv.New64a()
+		h.Write(l.metadata)
+		l.legacy = h.Sum64()
 	}
-	v := &Layer{dir: l.dir}
+	v := &Layer{dir: l.dir, legacy: l.legacy}
 	var m manifest
-	loadErr, err := v.decodeManifest(reader, &m, l.links)
+	loadErr, err := v.decodeManifest(reader, &m)
 	if err != nil {
 		return nil, fmt.Errorf("overlay: layer manifest %s: %w", l.dir, err)
 	}
-	if m.Version != manifestVersion {
-		return nil, fmt.Errorf("overlay: layer manifest in %s has version %d, want %d", l.dir, m.Version, manifestVersion)
+	if m.Version != manifestVersion && m.Version != 1 {
+		return nil, fmt.Errorf("overlay: layer manifest in %s has version %d, want 1 or %d", l.dir, m.Version, manifestVersion)
+	}
+	if loadErr == nil {
+		loadErr = v.identify(m.Version)
 	}
 	if loadErr != nil {
 		return nil, fmt.Errorf("overlay: layer manifest in %s: %w", l.dir, loadErr)
@@ -497,8 +494,58 @@ func (l *Layer) decode() (*Layer, error) {
 	if e, ok := v.entries[""]; !ok || e.Kind != KindDir {
 		return nil, fmt.Errorf("overlay: layer manifest in %s has no root directory", l.dir)
 	}
-	v.tree = m.Tree
+	v.tree, v.synthetic = m.Tree, m.Synthetic
 	return v, nil
+}
+
+// identify checks the identities [Layer.load] restored against the manifest's
+// version, which may follow its entries: version 2 records one for every
+// entry, version 1 for none, whose entries get their [legacyIdentity].
+func (v *Layer) identify(version int) error {
+	for p, e := range v.entries {
+		info, ok := e.Info.(storedInfo)
+		if !ok {
+			continue
+		}
+		switch {
+		case version != 1 && info.id == 0:
+			return fmt.Errorf("%q has no identity", p)
+		case version == 1 && info.id != 0:
+			return fmt.Errorf("%q has an identity in a version 1 manifest", p)
+		case version == 1:
+			info.id = v.legacyIdentity(p, info)
+			e.Info = info
+			v.set(p, e)
+		}
+	}
+	return nil
+}
+
+// legacyIdentity returns the identity of entry p of a version 1 manifest: the
+// [ident.State] identity of the inode its native stat recorded, which the
+// layer's raw files had; or, where the record holds none (Windows), a value
+// hashed from the layer's metadata and the entry's path (its hard-link
+// group's for linked entries) in the top half of [ident.Synthetic], which
+// allocation never reaches.
+func (v *Layer) legacyIdentity(p string, info storedInfo) ident.ID {
+	if key, ok := nativeKey(info); ok {
+		if id, ok := ident.New(ident.State, stateValue(key)); ok {
+			return id
+		}
+	}
+	h := fnv.New64a()
+	var seed [8]byte
+	for i := range seed {
+		seed[i] = byte(v.legacy >> (8 * i))
+	}
+	h.Write(seed[:])
+	if info.legacyLink != 0 {
+		h.Write([]byte("#" + strconv.Itoa(info.legacyLink)))
+	} else {
+		h.Write([]byte(p))
+	}
+	id, _ := ident.New(ident.Synthetic, syntheticLimit|h.Sum64()&(syntheticLimit-1))
+	return id
 }
 
 // decodeManifest reads m's fields in any order, case-insensitively as
@@ -506,7 +553,7 @@ func (l *Layer) decode() (*Layer, error) {
 // The containers must close; a repeated entries key replaces the earlier
 // array. The caller checks the final version before loadErr, the first load
 // failure of the last array.
-func (v *Layer) decodeManifest(r io.Reader, m *manifest, links uint64) (loadErr, err error) {
+func (v *Layer) decodeManifest(r io.Reader, m *manifest) (loadErr, err error) {
 	dec := json.NewDecoder(r)
 	if err := delim(dec, '{'); err != nil {
 		return nil, err
@@ -522,6 +569,8 @@ func (v *Layer) decodeManifest(r io.Reader, m *manifest, links uint64) (loadErr,
 			err = dec.Decode(&m.Version)
 		case strings.EqualFold(name, "r"):
 			err = dec.Decode(&m.Tree)
+		case strings.EqualFold(name, "n"):
+			err = dec.Decode(&m.Synthetic)
 		case strings.EqualFold(name, "e"):
 			v.entries, v.children, v.gits, v.ids = make(map[string]Entry), make(map[string]map[string]Entry), nil, make(map[string]string)
 			loadErr = nil
@@ -535,7 +584,7 @@ func (v *Layer) decodeManifest(r io.Reader, m *manifest, links uint64) (loadErr,
 			for i := 0; err == nil && dec.More(); i++ {
 				var me manifestEntry
 				if err = dec.Decode(&me); err == nil && loadErr == nil {
-					loadErr = v.load(i, me, links)
+					loadErr = v.load(i, me)
 				}
 			}
 			if err == nil {
@@ -599,7 +648,7 @@ func (l *Layer) RemoveMetadata() error {
 }
 
 // load indexes manifest entry i after its parent directory.
-func (l *Layer) load(i int, me manifestEntry, links uint64) error {
+func (l *Layer) load(i int, me manifestEntry) error {
 	p := me.Path
 	if p != Clean(p) || reserved(p) {
 		return fmt.Errorf("invalid path %q", p)
@@ -623,15 +672,20 @@ func (l *Layer) load(i int, me manifestEntry, links uint64) error {
 	if err != nil {
 		return fmt.Errorf("%q: %w", p, err)
 	}
-	info := storedInfo{name: me.Name, size: me.Size, mode: os.FileMode(me.Mode), mtime: time.Unix(me.Sec, me.Nsec), sys: sys}
+	info := storedInfo{name: me.Name, size: me.Size, mode: os.FileMode(me.Mode), mtime: time.Unix(me.Sec, me.Nsec), sys: sys, id: ident.ID(me.ID)}
 	if p != "" {
 		info.name = path.Base(p)
+	}
+	if me.ID != 0 {
+		if id := ident.ID(me.ID); uint64(id)>>ident.Bits != 0 || id.Space() == ident.None {
+			return fmt.Errorf("%q has invalid identity %#x", p, me.ID)
+		}
 	}
 	if me.Link != 0 {
 		if me.Link < 1 || me.Link > i+1 {
 			return fmt.Errorf("%q links to entry %d", p, me.Link)
 		}
-		info.link = links + uint64(me.Link)
+		info.legacyLink = me.Link
 	}
 	e := entry(info)
 	if e.Kind != me.Kind {
@@ -661,6 +715,8 @@ func (l *Layer) prune() bool {
 	ids := l.view().ids
 	l.mu.RUnlock()
 	_ = os.Remove(filepath.Join(l.dir, originsName))
+	_ = os.Remove(filepath.Join(l.dir, tableName))
+	_ = os.Remove(filepath.Join(l.dir, tableName+".tmp"))
 	_ = os.Remove(filepath.Join(l.dir, originsName+".tmp"))
 	var dirs []string
 	held := make(map[string]bool) // directories holding a raw entry, the root included

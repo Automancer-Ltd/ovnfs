@@ -61,7 +61,7 @@ func postOpOf(t testing.TB, d *decoder) (wireAttr, bool) {
 
 // dirop encodes diropargs3.
 func dirop(e *encoder, dir uint64, name string) {
-	e.fh(dir)
+	e.fh(dir, 0)
 	e.str(name)
 }
 
@@ -103,8 +103,20 @@ func TestV3HandlesAndNames(t *testing.T) {
 	if st, _ := c.v3call(v3GetAttr, func(e *encoder) { e.opaque(make([]byte, 7)) }); st != stBadHandle {
 		t.Errorf("7-byte handle: %d, want BADHANDLE", st)
 	}
-	if st, _ := c.v3call(v3GetAttr, func(e *encoder) { e.fh(999) }); st != stStale {
+	if st, _ := c.v3call(v3GetAttr, func(e *encoder) { e.fh(999, 0) }); st != stStale {
 		t.Errorf("unknown id: %d, want STALE", st)
+	}
+	// A client upgraded across the handle change still holds id-only
+	// handles: STALE makes it look the name up again.
+	if st, _ := c.v3call(v3GetAttr, func(e *encoder) { e.opaque(binary.BigEndian.AppendUint64(nil, 1)) }); st != stStale {
+		t.Errorf("legacy 8-byte handle: %d, want STALE", st)
+	}
+	f := fs.FileID("f")
+	if st, _ := c.v3call(v3GetAttr, func(e *encoder) { e.fh(f, 0) }); st != stOK {
+		t.Errorf("current handle: %d", st)
+	}
+	if st, _ := c.v3call(v3GetAttr, func(e *encoder) { e.fh(f, 1) }); st != stStale {
+		t.Errorf("wrong generation: %d, want STALE", st)
 	}
 	if stat, _ := c.call(progNFS, 3, v3GetAttr, func(e *encoder) { e.opaque(make([]byte, 65)) }); stat != rpcGarbageArgs {
 		t.Errorf("65-byte handle: accept_stat %d, want GARBAGE_ARGS", stat)
@@ -152,7 +164,7 @@ func TestV3Lookup(t *testing.T) {
 		if st != stOK {
 			return st, 0, wireAttr{}, wireAttr{}
 		}
-		id, ok := d.fh(maxFH3)
+		id, _, ok := d.fh(maxFH3)
 		obj, ok1 := postOpOf(t, d)
 		da, ok2 := postOpOf(t, d)
 		if !ok || !ok1 || !ok2 || d.err != nil || len(d.buf) != 0 {
@@ -179,17 +191,18 @@ func TestV3Lookup(t *testing.T) {
 }
 
 // TestV3SizeRegressionRetiresHandle checks that an unexpected shrink makes
-// the old handle stale, while a client-requested truncate preserves it.
+// the old handle stale while a fresh LOOKUP returns a working handle with
+// the same fileid, and that a client-requested truncate preserves it.
 func TestV3SizeRegressionRetiresHandle(t *testing.T) {
 	fs := newTestFS(t)
 	fs.write(t, "f", "12345678")
 	addr := startServer(t, &Server{FS: fs, Concurrency: 4})
 	first, second := dial(t, addr), dial(t, addr)
-	id := fs.FileID("f")
+	id, gen := fs.FileID("f"), uint64(0)
 
-	getattr := func(c *rpcClient, id uint64) (status, wireAttr) {
+	getattr := func(c *rpcClient, gen uint64) (status, wireAttr) {
 		t.Helper()
-		st, d := c.v3call(v3GetAttr, func(e *encoder) { e.fh(id) })
+		st, d := c.v3call(v3GetAttr, func(e *encoder) { e.fh(id, gen) })
 		if st != stOK {
 			if len(d.buf) != 0 {
 				t.Fatalf("GETATTR failure %d has %d body bytes", st, len(d.buf))
@@ -202,40 +215,48 @@ func TestV3SizeRegressionRetiresHandle(t *testing.T) {
 		}
 		return st, a
 	}
+	// lookup returns the generation of the handle LOOKUP of "f" returns,
+	// which must name the same file id.
 	lookup := func(c *rpcClient) (uint64, wireAttr) {
 		t.Helper()
 		st, d := c.v3call(v3Lookup, func(e *encoder) { dirop(e, 1, "f") })
 		if st != stOK {
 			t.Fatalf("LOOKUP: %d", st)
 		}
-		id, ok := d.fh(maxFH3)
+		got, gen, ok := d.fh(maxFH3)
 		a, attrs := postOpOf(t, d)
 		if _, dirAttrs := postOpOf(t, d); !ok || !attrs || !dirAttrs || d.err != nil || len(d.buf) != 0 {
 			t.Fatal("LOOKUP: malformed reply")
 		}
-		return id, a
+		if got != id || a.fileid != id {
+			t.Fatalf("LOOKUP: handle id %d fileid %d, want %d", got, a.fileid, id)
+		}
+		return gen, a
 	}
 
-	if st, a := getattr(first, id); st != stOK || a.size != 8 {
+	if st, a := getattr(first, gen); st != stOK || a.size != 8 {
 		t.Fatalf("initial GETATTR: %d, size %d", st, a.size)
 	}
 	if err := os.Truncate(fs.host("f"), 3); err != nil {
 		t.Fatal(err)
 	}
-	if st, _ := getattr(first, id); st != stStale {
+	if st, _ := getattr(first, gen); st != stStale {
 		t.Fatalf("GETATTR after shrink: %d, want STALE", st)
 	}
-	if st, _ := getattr(second, id); st != stStale {
+	if st, _ := getattr(second, gen); st != stStale {
 		t.Fatalf("old handle on another connection: %d, want STALE", st)
 	}
 	next, a := lookup(first)
-	if next == id || a.size != 3 {
-		t.Fatalf("fresh lookup: id %d size %d, old id %d", next, a.size, id)
+	if next == gen || a.size != 3 {
+		t.Fatalf("fresh lookup: generation %d size %d, old generation %d", next, a.size, gen)
 	}
-	id = next
+	gen = next
+	if st, a := getattr(second, gen); st != stOK || a.size != 3 {
+		t.Fatalf("fresh handle: %d, size %d", st, a.size)
+	}
 
 	st, d := first.v3call(v3SetAttr, func(e *encoder) {
-		e.fh(id)
+		e.fh(id, gen)
 		e.u32(0) // mode
 		e.u32(0) // uid
 		e.u32(0) // gid
@@ -256,25 +277,25 @@ func TestV3SizeRegressionRetiresHandle(t *testing.T) {
 	if !ok || post.size != 2 || d.err != nil || len(d.buf) != 0 {
 		t.Fatalf("SETATTR post-op attributes %+v, present %v", post, ok)
 	}
-	if got, a := getattr(first, id); got != stOK || a.size != 2 {
+	if got, a := getattr(first, gen); got != stOK || a.size != 2 {
 		t.Fatalf("requested shrink: %d, size %d", got, a.size)
 	}
 
 	if err := os.Truncate(fs.host("f"), 12); err != nil {
 		t.Fatal(err)
 	}
-	if got, a := getattr(first, id); got != stOK || a.size != 12 {
+	if got, a := getattr(first, gen); got != stOK || a.size != 12 {
 		t.Fatalf("growth: %d, size %d", got, a.size)
 	}
 	if err := os.Truncate(fs.host("f"), 1); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := getattr(first, id); got != stStale {
+	if got, _ := getattr(first, gen); got != stStale {
 		t.Fatalf("second shrink: %d, want STALE", got)
 	}
 	fresh, a := lookup(first)
-	if fresh == id || a.size != 1 {
-		t.Fatalf("second fresh lookup: id %d size %d, old id %d", fresh, a.size, id)
+	if fresh == gen || a.size != 1 {
+		t.Fatalf("second fresh lookup: generation %d size %d, old generation %d", fresh, a.size, gen)
 	}
 }
 
@@ -283,19 +304,19 @@ func TestV3SizeRegressionRetiresHandle(t *testing.T) {
 func TestV3FailureBodies(t *testing.T) {
 	c := v3server(t, newTestFS(t))
 	const stale = 999
-	fh := func(e *encoder) { e.fh(stale) }
+	fh := func(e *encoder) { e.fh(stale, 0) }
 	for _, tc := range []struct {
 		proc uint32
 		args func(*encoder)
 		body int
 	}{
 		{v3GetAttr, fh, 0},
-		{v3SetAttr, func(e *encoder) { e.fh(stale); noSattr(e); e.u32(0) }, 8},
+		{v3SetAttr, func(e *encoder) { e.fh(stale, 0); noSattr(e); e.u32(0) }, 8},
 		{v3Lookup, func(e *encoder) { dirop(e, stale, "a") }, 4},
-		{v3Access, func(e *encoder) { e.fh(stale); e.u32(0x3f) }, 4},
+		{v3Access, func(e *encoder) { e.fh(stale, 0); e.u32(0x3f) }, 4},
 		{v3Readlink, fh, 4},
-		{v3Read, func(e *encoder) { e.fh(stale); e.u64(0); e.u32(10) }, 4},
-		{v3Write, func(e *encoder) { e.fh(stale); e.u64(0); e.u32(1); e.u32(2); e.opaque([]byte{1}) }, 8},
+		{v3Read, func(e *encoder) { e.fh(stale, 0); e.u64(0); e.u32(10) }, 4},
+		{v3Write, func(e *encoder) { e.fh(stale, 0); e.u64(0); e.u32(1); e.u32(2); e.opaque([]byte{1}) }, 8},
 		{v3Create, func(e *encoder) { dirop(e, stale, "a"); e.u32(createGuarded); noSattr(e) }, 8},
 		{v3Mkdir, func(e *encoder) { dirop(e, stale, "a"); noSattr(e) }, 8},
 		{v3Symlink, func(e *encoder) { dirop(e, stale, "a"); noSattr(e); e.str("t") }, 8},
@@ -303,13 +324,13 @@ func TestV3FailureBodies(t *testing.T) {
 		{v3Remove, func(e *encoder) { dirop(e, stale, "a") }, 8},
 		{v3Rmdir, func(e *encoder) { dirop(e, stale, "a") }, 8},
 		{v3Rename, func(e *encoder) { dirop(e, stale, "a"); dirop(e, stale, "b") }, 16},
-		{v3Link, func(e *encoder) { e.fh(stale); dirop(e, stale, "a") }, 12},
-		{v3ReadDir, func(e *encoder) { e.fh(stale); e.u64(0); e.u64(0); e.u32(4096) }, 4},
-		{v3ReadDirPlus, func(e *encoder) { e.fh(stale); e.u64(0); e.u64(0); e.u32(4096); e.u32(4096) }, 4},
+		{v3Link, func(e *encoder) { e.fh(stale, 0); dirop(e, stale, "a") }, 12},
+		{v3ReadDir, func(e *encoder) { e.fh(stale, 0); e.u64(0); e.u64(0); e.u32(4096) }, 4},
+		{v3ReadDirPlus, func(e *encoder) { e.fh(stale, 0); e.u64(0); e.u64(0); e.u32(4096); e.u32(4096) }, 4},
 		{v3FSStat, fh, 4},
 		{v3FSInfo, fh, 4},
 		{v3PathConf, fh, 4},
-		{v3Commit, func(e *encoder) { e.fh(stale); e.u64(0); e.u32(0) }, 8},
+		{v3Commit, func(e *encoder) { e.fh(stale, 0); e.u64(0); e.u32(0) }, 8},
 	} {
 		st, d := c.v3call(tc.proc, tc.args)
 		if st != stStale || !bytes.Equal(d.buf, make([]byte, tc.body)) {
@@ -334,7 +355,7 @@ func TestV3MknodRefused(t *testing.T) {
 // read3 reads count bytes at off from file id.
 func (c *rpcClient) read3(id, off uint64, count uint32) (status, []byte, bool) {
 	c.t.Helper()
-	st, d := c.v3call(v3Read, func(e *encoder) { e.fh(id); e.u64(off); e.u32(count) })
+	st, d := c.v3call(v3Read, func(e *encoder) { e.fh(id, 0); e.u64(off); e.u32(count) })
 	if st != stOK {
 		return st, nil, false
 	}
@@ -405,7 +426,7 @@ func TestV3ReadClampsCount(t *testing.T) {
 func (c *rpcClient) write3(id, off uint64, how uint32, data []byte) (status, uint32, uint32, []byte) {
 	c.t.Helper()
 	st, d := c.v3call(v3Write, func(e *encoder) {
-		e.fh(id)
+		e.fh(id, 0)
 		e.u64(off)
 		e.u32(uint32(len(data)))
 		e.u32(how)
@@ -431,7 +452,7 @@ func (c *rpcClient) write3(id, off uint64, how uint32, data []byte) (status, uin
 // commit3 commits file id and returns the status and verifier.
 func (c *rpcClient) commit3(id uint64) (status, []byte) {
 	c.t.Helper()
-	st, d := c.v3call(v3Commit, func(e *encoder) { e.fh(id); e.u64(0); e.u32(0) })
+	st, d := c.v3call(v3Commit, func(e *encoder) { e.fh(id, 0); e.u64(0); e.u32(0) })
 	if st != stOK {
 		return st, nil
 	}
@@ -479,7 +500,7 @@ func TestV3WriteCommitVerifier(t *testing.T) {
 	if st, _, _, _ := c.write3(1, 0, 2, []byte("x")); st != stInval {
 		t.Errorf("WRITE to a directory: %d, want INVAL", st)
 	}
-	if stat, _ := c.call(progNFS, 3, v3Write, func(e *encoder) { e.fh(id); e.u64(0); e.u32(5); e.u32(2) }); stat != rpcGarbageArgs {
+	if stat, _ := c.call(progNFS, 3, v3Write, func(e *encoder) { e.fh(id, 0); e.u64(0); e.u32(5); e.u32(2) }); stat != rpcGarbageArgs {
 		t.Errorf("WRITE without data: accept_stat %d", stat)
 	}
 }
@@ -495,7 +516,7 @@ func TestV3SetattrGuard(t *testing.T) {
 	id := fs.FileID("f")
 	getattr := func() wireAttr {
 		t.Helper()
-		st, d := c.v3call(v3GetAttr, func(e *encoder) { e.fh(id) })
+		st, d := c.v3call(v3GetAttr, func(e *encoder) { e.fh(id, 0) })
 		if st != stOK {
 			t.Fatalf("GETATTR: %d", st)
 		}
@@ -507,7 +528,7 @@ func TestV3SetattrGuard(t *testing.T) {
 	}
 	setattr := func(ctime [2]uint32) (status, *decoder) {
 		return c.v3call(v3SetAttr, func(e *encoder) {
-			e.fh(id)
+			e.fh(id, 0)
 			e.u32(1)
 			e.u32(0o400) // mode
 			e.u32(0)
@@ -548,7 +569,7 @@ func TestV3SetattrTimes(t *testing.T) {
 	fs.write(t, "f", "")
 	c := v3server(t, fs)
 	st, _ := c.v3call(v3SetAttr, func(e *encoder) {
-		e.fh(fs.FileID("f"))
+		e.fh(fs.FileID("f"), 0)
 		for range 4 {
 			e.u32(0)
 		}
@@ -566,7 +587,7 @@ func TestV3SetattrTimes(t *testing.T) {
 		t.Fatalf("mtime %v, %v", info.ModTime(), err)
 	}
 	if stat, _ := c.call(progNFS, 3, v3SetAttr, func(e *encoder) {
-		e.fh(fs.FileID("f"))
+		e.fh(fs.FileID("f"), 0)
 		for range 4 {
 			e.u32(0)
 		}
@@ -596,7 +617,7 @@ func (c *rpcClient) create3(name string, how uint32, args func(*encoder)) (statu
 	if !d.bool() {
 		c.t.Fatal("CREATE: no handle")
 	}
-	id, ok := d.fh(maxFH3)
+	id, _, ok := d.fh(maxFH3)
 	if a, aok := postOpOf(c.t, d); !ok || !aok || a.fileid != id {
 		c.t.Fatal("CREATE: handle and attributes disagree")
 	}
@@ -690,7 +711,7 @@ func TestV3WritesAfterOwnerWriteGoes(t *testing.T) {
 	setattr := func(id uint64, sattr func(*encoder)) status {
 		t.Helper()
 		st, _ := c.v3call(v3SetAttr, func(e *encoder) {
-			e.fh(id)
+			e.fh(id, 0)
 			sattr(e)
 			e.u32(0) // no guard
 		})
@@ -748,7 +769,7 @@ func TestV3MkdirSymlinkReadlink(t *testing.T) {
 	if st != stOK || !d.bool() {
 		t.Fatalf("MKDIR: %d", st)
 	}
-	if id, _ := d.fh(maxFH3); id != fs.FileID("d") {
+	if id, _, _ := d.fh(maxFH3); id != fs.FileID("d") {
 		t.Fatalf("MKDIR handle %d", id)
 	}
 	if info, err := os.Stat(fs.host("d")); err != nil || !info.IsDir() || info.Mode().Perm() != hostPerm(0o700, true) {
@@ -760,7 +781,7 @@ func TestV3MkdirSymlinkReadlink(t *testing.T) {
 	if st, _ := c.v3call(v3Symlink, func(e *encoder) { dirop(e, 1, "l"); noSattr(e); e.str("d") }); st != stOK {
 		t.Fatalf("SYMLINK: %d", st)
 	}
-	st, d = c.v3call(v3Readlink, func(e *encoder) { e.fh(fs.FileID("l")) })
+	st, d = c.v3call(v3Readlink, func(e *encoder) { e.fh(fs.FileID("l"), 0) })
 	if st != stOK {
 		t.Fatalf("READLINK: %d", st)
 	}
@@ -770,7 +791,7 @@ func TestV3MkdirSymlinkReadlink(t *testing.T) {
 	if target := d.str(maxPath3); target != "d" || len(d.buf) != 0 {
 		t.Fatalf("READLINK target %q", target)
 	}
-	if st, _ := c.v3call(v3Readlink, func(e *encoder) { e.fh(fs.FileID("d")) }); st != stInval {
+	if st, _ := c.v3call(v3Readlink, func(e *encoder) { e.fh(fs.FileID("d"), 0) }); st != stInval {
 		t.Fatalf("READLINK of a directory: %d, want INVAL", st)
 	}
 	if st, _ := c.v3call(v3Symlink, func(e *encoder) { dirop(e, 1, "l"); noSattr(e); e.str("x") }); st != stExist {
@@ -825,7 +846,7 @@ func TestV3RemoveRmdir(t *testing.T) {
 	if _, err := os.Stat(fs.host("full/f")); err != nil {
 		t.Errorf("REMOVE of a link followed it: %v", err)
 	}
-	if st, _ := c.v3call(v3GetAttr, func(e *encoder) { e.fh(fid) }); st != stStale {
+	if st, _ := c.v3call(v3GetAttr, func(e *encoder) { e.fh(fid, 0) }); st != stStale {
 		t.Errorf("handle of a removed file: %d, want STALE", st)
 	}
 }
@@ -833,7 +854,7 @@ func TestV3RemoveRmdir(t *testing.T) {
 // TestV3FSInfoStatPathconf checks the file system procedures' layouts.
 func TestV3FSInfoStatPathconf(t *testing.T) {
 	c := v3server(t, newTestFS(t))
-	root := func(e *encoder) { e.fh(1) }
+	root := func(e *encoder) { e.fh(1, 0) }
 
 	st, d := c.v3call(v3FSStat, root)
 	if _, ok := postOpOf(t, d); st != stOK || !ok {
@@ -866,7 +887,7 @@ func TestV3FSInfoStatPathconf(t *testing.T) {
 		t.Errorf("PATHCONF %v", pc)
 	}
 
-	st, d = c.v3call(v3Access, func(e *encoder) { e.fh(1); e.u32(0x3f) })
+	st, d = c.v3call(v3Access, func(e *encoder) { e.fh(1, 0); e.u32(0x3f) })
 	if _, ok := postOpOf(t, d); st != stOK || !ok || d.u32() != 0x3f || len(d.buf) != 0 {
 		t.Errorf("ACCESS: %d", st)
 	}
@@ -935,9 +956,9 @@ func TestV3ConcurrencyLimit(t *testing.T) {
 	slow := fs.FileID("slow")
 
 	c := dial(t, addr)
-	c.send(1, v3GetAttr, func(e *encoder) { e.fh(slow) })
-	c.send(2, v3GetAttr, func(e *encoder) { e.fh(slow) })
-	c.send(3, v3GetAttr, func(e *encoder) { e.fh(1) })
+	c.send(1, v3GetAttr, func(e *encoder) { e.fh(slow, 0) })
+	c.send(2, v3GetAttr, func(e *encoder) { e.fh(slow, 0) })
+	c.send(3, v3GetAttr, func(e *encoder) { e.fh(1, 0) })
 	if xid, ok := c.replyXID(200 * time.Millisecond); ok {
 		t.Fatalf("reply %d while both workers block; want the third call held back", xid)
 	}
@@ -985,8 +1006,8 @@ func TestV3ServeDrainsAcceptedCallsOnDisconnect(t *testing.T) {
 	}()
 
 	slow := fs.FileID("slow")
-	c.send(1, v3GetAttr, func(e *encoder) { e.fh(slow) })
-	c.send(2, v3GetAttr, func(e *encoder) { e.fh(slow) })
+	c.send(1, v3GetAttr, func(e *encoder) { e.fh(slow, 0) })
+	c.send(2, v3GetAttr, func(e *encoder) { e.fh(slow, 0) })
 	for range 2 {
 		select {
 		case <-fs.entered:
@@ -1021,8 +1042,8 @@ func TestV3ConcurrentCalls(t *testing.T) {
 		c := dial(t, startServer(t, &Server{FS: fs, Concurrency: conc}))
 		slow := fs.FileID("slow")
 
-		c.send(1, v3GetAttr, func(e *encoder) { e.fh(slow) })
-		c.send(2, v3GetAttr, func(e *encoder) { e.fh(1) })
+		c.send(1, v3GetAttr, func(e *encoder) { e.fh(slow, 0) })
+		c.send(2, v3GetAttr, func(e *encoder) { e.fh(1, 0) })
 		if conc > 1 {
 			if xid, ok := c.replyXID(5 * time.Second); !ok || xid != 2 {
 				t.Fatalf("Concurrency %d: first reply %d (%v), want 2 while 1 blocks", conc, xid, ok)

@@ -32,6 +32,8 @@ type diskState struct {
 	Proto        string         `json:"proto"`
 	Port         int            `json:"port"`
 	NextSnapshot uint64         `json:"next_snapshot"`
+	NextSlot     uint16         `json:"next_slot,omitempty"` // Registry.nextSlot
+	NextLife     uint32         `json:"next_life,omitempty"` // Registry.nextLife
 	Bases        []base.Meta    `json:"bases"`
 	Checkouts    []diskCheckout `json:"checkouts"`
 	Snapshots    []diskSnapshot `json:"snapshots"`
@@ -101,7 +103,7 @@ func (i diskIntent) dir() string {
 // stateLocked snapshots metadata while the registry mutex is held.
 func (r *Registry) stateLocked() diskState {
 	lineage := r.retainedLineageLocked()
-	d := diskState{Version: stateVersion, Proto: r.proto, Port: r.port, NextSnapshot: r.nextSnapshot,
+	d := diskState{Version: stateVersion, Proto: r.proto, Port: r.port, NextSnapshot: r.nextSnapshot, NextSlot: r.nextSlot, NextLife: r.nextLife,
 		Bases: []base.Meta{}, Checkouts: []diskCheckout{}, Snapshots: []diskSnapshot{}, Layers: []diskLayer{}, Intents: []diskIntent{}}
 	for _, b := range r.bases {
 		d.Bases = append(d.Bases, b.view.Meta())

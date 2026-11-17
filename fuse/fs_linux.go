@@ -17,14 +17,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// rootID is the kernel's fixed root inode, which is also the export root's node id.
+// rootID is the kernel's fixed root inode, which is also the export root's file id.
 const rootID = gofuse.FUSE_ROOT_ID
 
 // openMask keeps the open(2) flags the export honors on an existing file.
 const openMask = os.O_RDONLY | os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_TRUNC
 
-// exportFS answers raw FUSE requests from the export, using stable node ids as
-// kernel node ids. Ids persist, so lookups need no reference counts and FORGET
+// exportFS answers raw FUSE requests from the export, using stable export file
+// ids as kernel node ids. Ids persist, so lookups need no reference counts and FORGET
 // is a no-op, as with NFS file handles.
 type exportFS struct {
 	gofuse.RawFileSystem
@@ -41,15 +41,13 @@ type exportFS struct {
 
 // fileHandle is an open regular file and the node it was opened through.
 type fileHandle struct {
-	release func()
-	ino     uint64
-	file    billy.File
-	append  bool
+	ino    uint64
+	file   billy.File
+	append bool
 }
 
 // dirHandle is an open directory's listing, snapshotted for stable offsets.
 type dirHandle struct {
-	release func()
 	mu      sync.Mutex
 	ino     uint64
 	path    string
@@ -87,16 +85,10 @@ func (x *exportFS) Init(s *gofuse.Server) { x.kernel = s }
 // String names the filesystem in go-fuse debug output.
 func (x *exportFS) String() string { return "ovnfs" }
 
-// path resolves a kernel node id to its current export path.
+// path resolves a kernel node id (export file id) to its current export path.
 func (x *exportFS) path(ino uint64) (string, gofuse.Status) {
-	if x.nodes.IdentityError() != nil {
-		return "", gofuse.EIO
-	}
 	p, ok := x.nodes.Path(ino)
 	if !ok {
-		if x.nodes.IdentityError() != nil {
-			return "", gofuse.EIO
-		}
 		return "", gofuse.Status(syscall.ESTALE)
 	}
 	return p, gofuse.OK
@@ -117,8 +109,8 @@ func (x *exportFS) entry(p string, out *gofuse.EntryOut) gofuse.Status {
 	if err != nil {
 		return errno(err)
 	}
-	ino := x.nodes.ID(p)
-	if ino == 0 || x.nodes.IdentityError() != nil {
+	ino := x.nodes.IDOf(p, info)
+	if ino == 0 {
 		return gofuse.EIO
 	}
 	out.NodeId, out.Generation = ino, 0
@@ -128,9 +120,9 @@ func (x *exportFS) entry(p string, out *gofuse.EntryOut) gofuse.Status {
 	return gofuse.OK
 }
 
-// attrTTL is how long the kernel may cache a. Every hard link of a file has
-// its own node id, so the kernel cannot see a write through another link;
-// multiply linked files are therefore revalidated on every use.
+// attrTTL is how long the kernel may cache a. The kernel may not see a write
+// made through another hard link of a file, so multiply linked files are
+// revalidated on every use.
 func attrTTL(a *gofuse.Attr) time.Duration {
 	if a.Mode&syscall.S_IFMT == syscall.S_IFREG && a.Nlink > 1 {
 		return 0
@@ -235,22 +227,6 @@ func errno(err error) gofuse.Status {
 
 // add registers an open handle and returns its kernel file handle.
 func (x *exportFS) add(h any) uint64 {
-	switch h := h.(type) {
-	case *fileHandle:
-		h.release = x.nodes.HoldFileID(h.ino)
-	case *dirHandle:
-		h.release = x.nodes.HoldFileID(h.ino)
-	}
-	if x.nodes.IdentityError() != nil {
-		switch h := h.(type) {
-		case *fileHandle:
-			h.release()
-			h.file.Close()
-		case *dirHandle:
-			h.release()
-		}
-		return 0
-	}
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	x.next++
@@ -280,16 +256,6 @@ func (x *exportFS) drop(fh uint64) any {
 	h := x.handles[fh]
 	delete(x.handles, fh)
 	x.mu.Unlock()
-	switch h := h.(type) {
-	case *fileHandle:
-		if h.release != nil {
-			h.release()
-		}
-	case *dirHandle:
-		if h.release != nil {
-			h.release()
-		}
-	}
 	return h
 }
 
@@ -320,7 +286,7 @@ func (x *exportFS) created(p string, mode uint32, caller *gofuse.Caller, out *go
 	return x.entry(p, out)
 }
 
-// Lookup resolves one name and returns its stable node id.
+// Lookup resolves one name and returns its stable file id.
 func (x *exportFS) Lookup(_ <-chan struct{}, in *gofuse.InHeader, name string, out *gofuse.EntryOut) gofuse.Status {
 	p, st := x.child(in.NodeId, name)
 	if !st.Ok() {
@@ -338,14 +304,8 @@ func (x *exportFS) GetAttr(_ <-chan struct{}, in *gofuse.GetAttrIn, out *gofuse.
 
 // attr reports node ino's attributes by name, else through an open file.
 func (x *exportFS) attr(ino, fh uint64, hasFh bool, out *gofuse.AttrOut) gofuse.Status {
-	if x.nodes.IdentityError() != nil {
-		return gofuse.EIO
-	}
 	info, st := x.stat(ino)
 	if !st.Ok() {
-		if x.nodes.IdentityError() != nil {
-			return gofuse.EIO
-		}
 		var f *fileHandle
 		if hasFh {
 			f = x.file(fh)
@@ -436,9 +396,6 @@ func (x *exportFS) SetAttr(_ <-chan struct{}, in *gofuse.SetAttrIn, out *gofuse.
 
 // truncate resizes through the caller's open file when given, else by path.
 func (x *exportFS) truncate(fh uint64, hasFh bool, p string, st gofuse.Status, size int64) error {
-	if err := x.nodes.IdentityError(); err != nil {
-		return err
-	}
 	if hasFh {
 		if f := x.file(fh); f != nil {
 			return f.file.Truncate(size)
@@ -572,7 +529,7 @@ func (x *exportFS) Rename(_ <-chan struct{}, in *gofuse.RenameIn, oldName, newNa
 	return errno(x.nodes.Rename(from, to))
 }
 
-// Link creates a hard link within one checkout; the new name gets its own node id.
+// Link creates a hard link within one checkout.
 func (x *exportFS) Link(_ <-chan struct{}, in *gofuse.LinkIn, name string, out *gofuse.EntryOut) gofuse.Status {
 	from, st := x.path(in.Oldnodeid)
 	if !st.Ok() {
@@ -643,9 +600,6 @@ func (x *exportFS) Create(_ <-chan struct{}, in *gofuse.CreateIn, name string, o
 		return st
 	}
 	out.Fh = x.add(&fileHandle{ino: out.NodeId, file: f, append: flags&os.O_APPEND != 0})
-	if out.Fh == 0 {
-		return gofuse.EIO
-	}
 	return gofuse.OK
 }
 
@@ -662,17 +616,11 @@ func (x *exportFS) Open(_ <-chan struct{}, in *gofuse.OpenIn, out *gofuse.OpenOu
 		return errno(err)
 	}
 	out.Fh = x.add(&fileHandle{ino: in.NodeId, file: f, append: flags&os.O_APPEND != 0})
-	if out.Fh == 0 {
-		return gofuse.EIO
-	}
 	return gofuse.OK
 }
 
 // Read reads at the kernel's offset.
 func (x *exportFS) Read(_ <-chan struct{}, in *gofuse.ReadIn, buf []byte) (gofuse.ReadResult, gofuse.Status) {
-	if x.nodes.IdentityError() != nil {
-		return nil, gofuse.EIO
-	}
 	f := x.file(in.Fh)
 	if f == nil {
 		return nil, gofuse.EBADF
@@ -692,9 +640,6 @@ func (x *exportFS) Write(cancel <-chan struct{}, in *gofuse.WriteIn, data []byte
 // Writev writes at the kernel's offset, or at the current end of file for
 // O_APPEND handles, where the kernel's cached size may be stale.
 func (x *exportFS) Writev(_ <-chan struct{}, in *gofuse.WriteIn, data [][]byte) (uint32, gofuse.Status) {
-	if x.nodes.IdentityError() != nil {
-		return 0, gofuse.EIO
-	}
 	f := x.file(in.Fh)
 	if f == nil {
 		return 0, gofuse.EBADF
@@ -730,9 +675,6 @@ func (x *exportFS) Flush(<-chan struct{}, *gofuse.FlushIn) gofuse.Status { retur
 
 // Fsync makes an open file's data durable.
 func (x *exportFS) Fsync(_ <-chan struct{}, in *gofuse.FsyncIn) gofuse.Status {
-	if x.nodes.IdentityError() != nil {
-		return gofuse.EIO
-	}
 	f := x.file(in.Fh)
 	if f == nil {
 		return gofuse.EBADF
@@ -761,9 +703,6 @@ func (x *exportFS) OpenDir(_ <-chan struct{}, in *gofuse.OpenIn, out *gofuse.Ope
 		return errno(err)
 	}
 	out.Fh = x.add(d)
-	if out.Fh == 0 {
-		return gofuse.EIO
-	}
 	return gofuse.OK
 }
 
@@ -785,9 +724,8 @@ func (x *exportFS) list(d *dirHandle) error {
 		dirEntry{name: ".", ino: d.ino, mode: syscall.S_IFDIR},
 		dirEntry{name: "..", ino: parent, mode: syscall.S_IFDIR})
 	for _, info := range infos {
-		p := path.Join(d.path, info.Name())
-		ino := x.nodes.ID(p)
-		if ino == 0 || x.nodes.IdentityError() != nil {
+		ino := x.nodes.ChildID(d.path, info)
+		if ino == 0 {
 			return syscall.EIO
 		}
 		entries = append(entries, dirEntry{name: info.Name(), ino: ino, mode: unixMode(info.Mode())})
@@ -856,7 +794,7 @@ func (x *exportFS) readDir(in *gofuse.ReadIn, out *gofuse.DirEntryList, plus boo
 func (x *exportFS) lookupEntry(dir string, e dirEntry, eo *gofuse.EntryOut) {
 	p := path.Join(dir, e.name)
 	info, err := x.nodes.Lstat(p)
-	if err != nil || x.nodes.ID(p) != e.ino {
+	if err != nil || x.nodes.IDOf(p, info) != e.ino {
 		return
 	}
 	eo.NodeId = e.ino

@@ -387,9 +387,6 @@ func statHandle(h handle) (Stamp, Type, int64, error) {
 	return stampOf(&st), typeFromMode(uint32(st.Mode)), st.Size, err
 }
 
-// statChange is st's status change time in Unix nanoseconds.
-func statChange(st *syscall.Stat_t) int64 { return nanos(st.Ctimespec.Sec, st.Ctimespec.Nsec) }
-
 func stampOf(st *unix.Stat_t) Stamp {
 	return Stamp{Dev: uint64(uint32(st.Dev)), Ino: st.Ino, Mtime: nanos(st.Mtim.Sec, st.Mtim.Nsec), Ctime: nanos(st.Ctim.Sec, st.Ctim.Nsec)}
 }
@@ -485,7 +482,7 @@ func (s *session) metadataEntry(dir handle, rec []byte, slab *[]nativeInfo, name
 	}
 	info.name = name
 	info.mode = modeFromStat(uint32(info.st.Mode))
-	info.mod = time.Unix(info.st.Mtimespec.Sec, info.st.Mtimespec.Nsec)
+	info.mod = mtimeOf(&info.st)
 	return info, nil
 }
 
@@ -558,6 +555,9 @@ func vtypeMode(vtype uint32) os.FileMode {
 	}
 	return 0
 }
+
+// mtimeOf is st's modification time.
+func mtimeOf(st *syscall.Stat_t) time.Time { return time.Unix(st.Mtimespec.Sec, st.Mtimespec.Nsec) }
 
 // fstatat is lstat (with flags AT_SYMLINK_NOFOLLOW) of cname, NUL-terminated,
 // relative to directory dir, into st.

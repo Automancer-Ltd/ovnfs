@@ -1,5 +1,5 @@
-// Package durable flushes ovnfs's own metadata files (state.json, pins.log,
-// nodes.log and the directories holding them) to stable storage.
+// Package durable flushes ovnfs's own metadata files (state.json, pins.log
+// and the directories holding them) to stable storage.
 //
 // On macOS, (*os.File).Sync issues F_FULLFSYNC, which also drains the drive's
 // write cache and costs tens of milliseconds per call. ovnfs's metadata must

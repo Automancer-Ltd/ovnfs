@@ -20,6 +20,7 @@ import (
 	"github.com/go-git/go-billy/v5"
 	"github.com/go-git/go-billy/v5/helper/chroot"
 	"github.com/stencil-hq/ovnfs/internal/hostfile"
+	"github.com/stencil-hq/ovnfs/internal/ident"
 )
 
 // Marker names are reserved in every component of an overlay path.
@@ -43,6 +44,8 @@ type FS struct {
 	tmpSeq      uint64
 	pathIDs     map[string]inodeKey
 	aliases     map[inodeKey]inodeNames
+	paths       map[ident.ID]string // upper name holding each identity while the index is loaded, see [FS.Locate]
+	ids         *idStore            // identities of upper files; nil for a read-only stack
 	mem         *Memory             // nil: every write goes to upper on disk
 	files       map[string]*memFile // upper names whose data is in memory
 	hosts       map[*file]struct{}  // open descriptors of upper files, see [FS.CloseFiles]
@@ -54,12 +57,26 @@ type FS struct {
 	origins       map[string]string // rename hints kept while the index is cold
 	lastAccess    atomic.Int64      // Unix nanoseconds of the last index use, see [FS.Cool]
 	memoryHandles int               // open memory handles, including unlinked files'
+	names         atomic.Uint64     // see [FS.Names]
 }
+
+// Names returns the generation of the overlay's namespace, which advances
+// after every change that may move or remove a visible entry: Remove,
+// Rename, Rebase and Discard. Creating an entry moves none, nor does
+// copy-up, spill or freeze. A path [FS.Locate] returned for an identity
+// stays that identity's while Names, read before the Locate, is unchanged:
+// the export caches resolutions on it.
+func (f *FS) Names() uint64 { return f.names.Load() }
 
 // Filesystem interface assertions keep the overlay compatible with protocols.
 var (
 	_ billy.Filesystem = (*FS)(nil)
 	_ billy.Change     = (*FS)(nil)
+
+	// Every handle FS opens knows its entry's identity.
+	_ ident.Identifier = (*file)(nil)
+	_ ident.Identifier = (*contentFile)(nil)
+	_ ident.Identifier = (*memHandle)(nil)
 )
 
 // New opens upper over layers (top first) and bottom. An empty upper is
@@ -93,6 +110,12 @@ func New(upper string, layers []*Layer, bottom Bottom, mem *Memory) (*FS, error)
 	if err := os.MkdirAll(f.upper, 0o755); err != nil {
 		return nil, err
 	}
+	if f.ids, err = newUpperStore(f.upper, f.layers); err != nil {
+		return nil, err
+	}
+	if err := f.inheritRoot(); err != nil {
+		return nil, err
+	}
 	f.work = filepath.Join(f.upper, workName)
 	if err := os.RemoveAll(f.work); err != nil {
 		return nil, err
@@ -100,7 +123,7 @@ func New(upper string, layers []*Layer, bottom Bottom, mem *Memory) (*FS, error)
 	if err := os.Mkdir(f.work, 0o700); err != nil {
 		return nil, err
 	}
-	f.index, err = walkLayer(f.upper, true, false, "")
+	f.index, err = walkLayer(f.upper, true, false, "", f.ids)
 	if err != nil {
 		return nil, err
 	}
@@ -124,8 +147,35 @@ func New(upper string, layers []*Layer, bottom Bottom, mem *Memory) (*FS, error)
 	return f, nil
 }
 
+// inheritRoot gives the upper's root directory the identity of the lower
+// root it covers, so the checkout's root keeps one identity while freezes
+// replace its upper: the frozen root carries it on into the next layer.
+func (f *FS) inheritRoot() error {
+	if id, err := f.ids.stored(f.upper); err != nil || id != 0 {
+		return err
+	}
+	var lower os.FileInfo
+	if len(f.layers) != 0 {
+		lower = f.layers[0].view().entries[""].Info
+	} else if f.bottom != nil {
+		info, err := f.bottom.Lstat("")
+		if err != nil && !missing(err) {
+			return err
+		}
+		lower = info
+	}
+	if lower == nil {
+		return nil
+	}
+	if id, ok := ident.Of(lower); ok {
+		return f.ids.persist(f.upper, id)
+	}
+	return nil
+}
+
 // Rebase changes the immutable bottom without disturbing open files or inode identities.
 func (f *FS) Rebase(bottom Bottom) {
+	defer f.names.Add(1)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.bottom = bottom
@@ -151,6 +201,7 @@ func (f *FS) Upper() string { return f.upper }
 // memory files. Lease policies use it to exclude immutable and live lower data;
 // disk metadata is refreshed so hard-link aliases cannot gain separate caches.
 func (f *FS) UpperFile(name string) (os.FileInfo, bool) {
+	f.await(name)
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	p := Clean(name)
@@ -197,7 +248,7 @@ func (f *FS) Freeze(dir string) (*Layer, error) {
 	if err != nil {
 		return nil, err
 	}
-	info, err := hostLstat(root)
+	info, err := statHost(root, f.ids)
 	if err != nil {
 		return nil, err
 	}
@@ -215,10 +266,11 @@ func (f *FS) Freeze(dir string) (*Layer, error) {
 	if wrote, err := l.saveOrigins(root); err != nil {
 		return nil, err
 	} else if wrote {
-		if info, err = hostLstat(root); err != nil {
+		if info, err = statHost(root, f.ids); err != nil {
 			return nil, err
 		}
 	}
+	l.synthetic = f.ids.syn.mark()
 	e := entry(info)
 	e.Opaque = l.entries[""].Opaque
 	l.set("", e)
@@ -226,11 +278,14 @@ func (f *FS) Freeze(dir string) (*Layer, error) {
 	f.index = nil
 	f.pathIDs = nil
 	f.aliases = nil
+	f.paths = nil
+	f.ids = nil
 	f.upper, f.work = "", ""
 	return l, nil
 }
 
-// Empty reports whether the upper has no data or markers outside its work dir.
+// Empty reports whether the upper has no data or markers outside its work
+// dir and its identity table.
 func (f *FS) Empty() (bool, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -245,7 +300,7 @@ func (f *FS) Empty() (bool, error) {
 		return false, err
 	}
 	for _, item := range items {
-		if item.Name() != workName {
+		if item.Name() != workName && item.Name() != tableName {
 			return false, nil
 		}
 	}
@@ -339,6 +394,7 @@ func (f *FS) readlink(s source, p string) (string, error) {
 // served by the bottom: neither the upper nor a frozen layer provides or
 // hides it.
 func (f *FS) InBottom(name string) bool {
+	f.await(name)
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	s, _, err := f.lookupRead(Clean(name))
@@ -347,6 +403,7 @@ func (f *FS) InBottom(name string) bool {
 
 // Lstat describes name without following its final symlink.
 func (f *FS) Lstat(name string) (os.FileInfo, error) {
+	f.await(name)
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	_, info, err := f.lookupRead(Clean(name))
@@ -355,6 +412,7 @@ func (f *FS) Lstat(name string) (os.FileInfo, error) {
 
 // Stat describes name, resolving relative final symlinks within the overlay.
 func (f *FS) Stat(name string) (os.FileInfo, error) {
+	f.await(name)
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	p := Clean(name)
@@ -377,6 +435,7 @@ func (f *FS) Stat(name string) (os.FileInfo, error) {
 
 // Readlink returns a symlink's stored target.
 func (f *FS) Readlink(name string) (string, error) {
+	f.await(name)
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	p := Clean(name)
@@ -389,11 +448,12 @@ func (f *FS) Readlink(name string) (string, error) {
 
 // ReadDir merges direct entries from all visible levels in name order.
 func (f *FS) ReadDir(name string) ([]os.FileInfo, error) {
+	f.await(name)
 	p := Clean(name)
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	if f.index == nil && f.upper != "" {
-		index, err := walkLayer(f.upper, true, false, p)
+		index, err := walkLayer(f.upper, true, false, p, f.ids)
 		if err != nil {
 			return nil, err
 		}
@@ -542,7 +602,7 @@ func (f *FS) openLower(name string, flag int) (h billy.File, ok bool, err error)
 	if err != nil {
 		return nil, true, err
 	}
-	return wrapContent(c, p), true, nil
+	return wrapContent(c, p, handleID(info)), true, nil
 }
 
 // Create creates or truncates a file in the writable upper.
@@ -552,6 +612,7 @@ func (f *FS) Create(name string) (billy.File, error) {
 
 // OpenFile copies immutable data up before opening with any write intent.
 func (f *FS) OpenFile(name string, flag int, perm os.FileMode) (billy.File, error) {
+	f.await(name)
 	writing := flag&writeFlags != 0
 	if !writing {
 		if h, ok, err := f.openLower(name, flag); ok {
@@ -641,17 +702,18 @@ retry:
 		if err != nil {
 			return nil, err
 		}
-		return wrapContent(fh, original), nil
+		return wrapContent(fh, original, handleID(info)), nil
 	}
 	if p == "" || reserved(p) {
 		return nil, &fs.PathError{Op: "open", Path: name, Err: syscall.EPERM}
 	}
-	// startMem makes p an empty memory file; nil means disk.
-	startMem := func(mode os.FileMode) *memFile {
+	// startMem makes p an empty memory file with identity id (0: a new
+	// one); nil means disk.
+	startMem := func(mode os.FileMode, id ident.ID) *memFile {
 		if f.mem == nil {
 			return nil
 		}
-		return f.addMem(p, mode, time.Now(), nil)
+		return f.addMem(p, mode, time.Now(), nil, id)
 	}
 	creating := err != nil
 	if err == nil {
@@ -663,7 +725,9 @@ retry:
 				if err := f.ensureDir(parent(p)); err != nil {
 					return nil, err
 				}
-				if m := startMem(info.Mode().Perm()); m != nil {
+				// The replacement keeps the identity of the file it truncates.
+				id := inherited(s, info)
+				if m := startMem(info.Mode().Perm(), id); m != nil {
 					return f.openMem(m, original, flag)
 				}
 				err := f.preserveDirTime(parent(p), func() error {
@@ -676,6 +740,9 @@ retry:
 						return err
 					}
 					if err := fh.Close(); err != nil {
+						return err
+					}
+					if err := f.ids.persist(f.up(p), id); err != nil {
 						return err
 					}
 					return keepMode(f.up(p), info.Mode())
@@ -710,7 +777,7 @@ retry:
 		if err := f.ensureDir(parent(p)); err != nil {
 			return nil, err
 		}
-		if m := startMem(perm & memModeBits &^ umask); m != nil {
+		if m := startMem(perm&memModeBits&^umask, 0); m != nil {
 			// A new name changes the parent like a host create; the creating open skips the permission check.
 			if err := f.touchDir(parent(p)); err != nil {
 				return nil, err
@@ -724,6 +791,9 @@ retry:
 	}
 	if creating {
 		err = keepMode(f.up(p), perm&^umask)
+		if err == nil {
+			err = f.ids.created(f.up(p))
+		}
 	}
 	if err == nil {
 		err = f.clearWhiteout(p)
@@ -746,6 +816,7 @@ retry:
 
 // TempFile creates a uniquely named upper file in an existing merged directory.
 func (f *FS) TempFile(dir, prefix string) (billy.File, error) {
+	f.await(dir)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	d := Clean(dir)
@@ -764,6 +835,10 @@ func (f *FS) TempFile(dir, prefix string) (billy.File, error) {
 	}
 	p := path.Join(d, filepath.Base(fh.Name()))
 	if err := keepMode(fh.Name(), 0o600); err != nil {
+		fh.Close()
+		return nil, err
+	}
+	if err := f.ids.created(fh.Name()); err != nil {
 		fh.Close()
 		return nil, err
 	}
@@ -786,6 +861,7 @@ func (f *FS) TempFile(dir, prefix string) (billy.File, error) {
 
 // MkdirAll creates missing directories, making recreated lower names opaque.
 func (f *FS) MkdirAll(name string, perm os.FileMode) error {
+	f.await(name)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p := Clean(name)
@@ -819,6 +895,9 @@ func (f *FS) MkdirAll(name string, perm os.FileMode) error {
 		if err := keepMode(f.up(q), perm&^umask); err != nil {
 			return err
 		}
+		if err := f.ids.created(f.up(q)); err != nil {
+			return err
+		}
 		if err := f.refresh(q); err != nil {
 			return err
 		}
@@ -834,6 +913,7 @@ func (f *FS) MkdirAll(name string, perm os.FileMode) error {
 
 // Mknod creates a socket or FIFO in the writable upper.
 func (f *FS) Mknod(name string, mode os.FileMode) error {
+	f.await(name)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p := Clean(name)
@@ -854,6 +934,10 @@ func (f *FS) Mknod(name string, mode os.FileMode) error {
 	if err := makeNode(f.up(p), f.stagingName(), mode); err != nil {
 		return err
 	}
+	if err := f.ids.created(f.up(p)); err != nil {
+		f.ids.discard(f.up(p))
+		return err
+	}
 	if err := f.clearWhiteout(p); err != nil {
 		return err
 	}
@@ -865,6 +949,7 @@ func (f *FS) Mknod(name string, mode os.FileMode) error {
 
 // Symlink creates a symlink without modifying any immutable source.
 func (f *FS) Symlink(target, link string) error {
+	f.await(link)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p := Clean(link)
@@ -885,6 +970,10 @@ func (f *FS) Symlink(target, link string) error {
 	if err := os.Symlink(target, f.up(p)); err != nil {
 		return err
 	}
+	if err := f.ids.created(f.up(p)); err != nil {
+		f.ids.discard(f.up(p))
+		return err
+	}
 	if err := f.clearWhiteout(p); err != nil {
 		return err
 	}
@@ -896,6 +985,8 @@ func (f *FS) Symlink(target, link string) error {
 
 // Remove removes a file or merged-empty directory and masks all lower copies.
 func (f *FS) Remove(name string) error {
+	defer f.names.Add(1) // after the removal, see [FS.Names]
+	f.await(name)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p := Clean(name)
@@ -934,10 +1025,16 @@ func (f *FS) Remove(name string) error {
 		case inMem:
 		case info.IsDir():
 			// Merged-empty: only markers can remain beneath it.
+			if err := f.ids.release(info); err != nil {
+				return err
+			}
 			if err := os.RemoveAll(f.up(p)); err != nil {
 				return err
 			}
 		default:
+			if err := f.ids.release(info); err != nil {
+				return err
+			}
 			// Unlike os.Remove on Windows, keeps a read-only hard link's other names read-only.
 			if err := hostfile.Remove(f.up(p)); err != nil {
 				return err
@@ -961,6 +1058,8 @@ func (f *FS) Remove(name string) error {
 
 // Link creates a hard link after copying an immutable source into upper.
 func (f *FS) Link(oldname, newname string) error {
+	f.await(oldname)
+	f.await(newname)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	src, dst := Clean(oldname), Clean(newname)
@@ -1007,6 +1106,9 @@ func (f *FS) Link(oldname, newname string) error {
 
 // Rename materializes a merged source tree before moving it entirely in upper.
 func (f *FS) Rename(from, to string) error {
+	defer f.names.Add(1) // after the move, see [FS.Names]
+	f.await(from)
+	f.await(to)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	src, dst := Clean(from), Clean(to)
@@ -1030,7 +1132,7 @@ func (f *FS) Rename(from, to string) error {
 	if derr != nil && !errors.Is(derr, fs.ErrNotExist) {
 		return derr
 	}
-	if derr == nil && (sameFile(sinfo, dinfo) || sameStored(sinfo, dinfo)) {
+	if derr == nil && sameEntry(sinfo, dinfo) {
 		return nil
 	}
 	if derr == nil {
@@ -1067,6 +1169,9 @@ func (f *FS) Rename(from, to string) error {
 	}
 	dstAlias := f.otherAlias(dst)
 	if derr == nil && dinfo.IsDir() && ds.upper {
+		if err := f.ids.release(dinfo); err != nil {
+			return err
+		}
 		if err := os.RemoveAll(f.up(dst)); err != nil {
 			return err
 		}
@@ -1082,6 +1187,12 @@ func (f *FS) Rename(from, to string) error {
 	// Any other memory file moves only in the index.
 	srcMem := f.files[src] != nil
 	if !srcMem {
+		// The rename removes the name of a file it replaces.
+		if derr == nil && ds.upper && !dinfo.IsDir() && f.files[dst] == nil {
+			if err := f.ids.release(dinfo); err != nil {
+				return err
+			}
+		}
 		if err := hostfile.Rename(f.up(src), f.up(dst)); err != nil {
 			return err
 		}
@@ -1200,6 +1311,7 @@ func (f *FS) Chtimes(name string, atime, mtime time.Time) error {
 // symlink: a target inside the mount would re-enter the daemon, which waits
 // for f.mu.
 func (f *FS) change(name, op string, host func(string) error, mem func(*memFile)) error {
+	f.await(name)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p := Clean(name)
@@ -1237,15 +1349,21 @@ func (f *FS) mutable(op, p string) error {
 // refresh synchronizes one upper entry's metadata without forgetting opacity.
 func (f *FS) refresh(p string) error {
 	if m := f.files[p]; m != nil {
-		f.index.set(p, Entry{Kind: KindFile, Info: m.info(path.Base(p))})
+		info := m.info(path.Base(p))
+		f.index.set(p, Entry{Kind: KindFile, Info: info})
+		f.register(p, info)
 		return nil
 	}
-	info, err := hostLstat(f.up(p))
+	info, err := f.stat(p)
 	if err != nil {
 		return err
 	}
-	return f.cacheInfo(p, info)
+	f.cacheInfo(p, info)
+	return nil
 }
+
+// stat reads upper entry p's host metadata with its identity.
+func (f *FS) stat(p string) (os.FileInfo, error) { return statHost(f.up(p), f.ids) }
 
 // placeDir isolates a new or renamed directory from old content beneath it.
 func (f *FS) placeDir(p string, complete bool) error {
@@ -1322,7 +1440,7 @@ func (f *FS) ensureDir(p string) error {
 		}
 		return nil
 	}
-	_, info, err := f.lookup(p)
+	s, info, err := f.lookup(p)
 	if err != nil {
 		return err
 	}
@@ -1334,6 +1452,9 @@ func (f *FS) ensureDir(p string) error {
 	}
 	err = f.preserveDirTime(parent(p), func() error {
 		if err := os.Mkdir(f.up(p), info.Mode().Perm()); err != nil {
+			return err
+		}
+		if err := f.ids.persist(f.up(p), inherited(s, info)); err != nil {
 			return err
 		}
 		if err := os.Chmod(f.up(p), info.Mode().Perm()); err != nil {
@@ -1372,7 +1493,8 @@ func (f *FS) preserveDirTime(d string, fn func() error) error {
 // On reacquiring mu it either publishes that same file or tells OpenFile to
 // resolve the name again if another operation changed its source.
 func (f *FS) copyUpBottomForOpen(p string, info os.FileInfo) (bool, error) {
-	bottom, epoch := f.bottom, f.bottomEpoch
+	bottom, epoch, ids := f.bottom, f.bottomEpoch, f.ids
+	id := inherited(source{}, info)
 	inMemory := f.mem != nil && info.Size() <= f.mem.fileMax
 	for {
 		var tmp string
@@ -1392,6 +1514,9 @@ func (f *FS) copyUpBottomForOpen(p string, info os.FileInfo) (bool, error) {
 		} else {
 			err = bottom.CopyTo(p, tmp)
 			if err == nil {
+				err = ids.persist(tmp, id)
+			}
+			if err == nil {
 				err = keepMode(tmp, info.Mode())
 			}
 		}
@@ -1399,32 +1524,32 @@ func (f *FS) copyUpBottomForOpen(p string, info os.FileInfo) (bool, error) {
 		current, currentInfo, lookupErr := f.lookup(p)
 		if f.bottomEpoch != epoch || lookupErr != nil || current.layer != nil || !currentInfo.Mode().IsRegular() {
 			if tmp != "" {
-				_ = os.RemoveAll(tmp)
+				ids.discard(tmp)
 			}
 			return true, nil
 		}
 		if err != nil {
 			if tmp != "" {
-				_ = os.RemoveAll(tmp)
+				ids.discard(tmp)
 			}
 			return false, err
 		}
 		if err := f.ensureDir(parent(p)); err != nil {
 			if tmp != "" {
-				_ = os.RemoveAll(tmp)
+				ids.discard(tmp)
 			}
 			return false, err
 		}
 		if inMemory {
 			if int64(len(data)) <= f.mem.fileMax {
-				if f.addMem(p, info.Mode(), info.ModTime(), data) != nil {
+				if f.addMem(p, info.Mode(), info.ModTime(), data, id) != nil {
 					return false, nil
 				}
 			}
 			inMemory = false
 			continue
 		}
-		defer os.RemoveAll(tmp)
+		defer ids.discard(tmp)
 		if err := f.preserveDirTime(parent(p), func() error { return hostfile.Rename(tmp, f.up(p)) }); err != nil {
 			return false, err
 		}
@@ -1452,11 +1577,14 @@ func (f *FS) copyUp(p string) error {
 	}
 	f.tmpSeq++
 	tmp := filepath.Join(f.work, strconv.FormatUint(f.tmpSeq, 36))
-	defer os.RemoveAll(tmp)
+	defer f.ids.discard(tmp)
 	if s.layer != nil {
 		err = s.layer.copyTo(p, tmp, info)
 	} else {
 		err = f.bottom.CopyTo(p, tmp)
+	}
+	if err == nil {
+		err = f.ids.persist(tmp, inherited(s, info))
 	}
 	if err == nil && info.Mode()&os.ModeSymlink == 0 {
 		err = keepMode(tmp, info.Mode())
@@ -1515,6 +1643,7 @@ func (f *FS) upperInfo(p string, e Entry) (os.FileInfo, error) {
 type file struct {
 	*os.File
 	name        string
+	id          ident.ID // identity of the entry opened; 0 for a host file outside the overlay
 	inode       inodeKey
 	tracked     bool
 	writable    bool
@@ -1593,6 +1722,30 @@ func (f *file) Close() error {
 
 // Name returns the overlay-relative name instead of the private host path.
 func (f *file) Name() string { return f.name }
+
+// Identity returns the identity of the entry the file was opened as, which
+// the export keeps to find the entry again after the handle closes; 0 for a
+// host file outside the overlay (an absolute symlink's target).
+func (f *file) Identity() ident.ID { return f.id }
+
+// Stat describes the open file with the identity of the entry it was opened as.
+func (f *file) Stat() (os.FileInfo, error) {
+	info, err := f.File.Stat()
+	if err != nil || f.id == 0 {
+		return info, err
+	}
+	return idInfo{FileInfo: info, id: f.id}, nil
+}
+
+// handleID returns the identity of the entry info describes for a handle
+// opened as it; 0 when it has none.
+func handleID(info os.FileInfo) ident.ID {
+	if info == nil {
+		return 0
+	}
+	id, _ := ident.Of(info)
+	return id
+}
 
 // Chmod applies descriptor metadata changes without leaving the upper index stale.
 func (f *file) Chmod(mode os.FileMode) error {

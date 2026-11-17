@@ -59,7 +59,10 @@ func FD(in *os.File, dst string, mode os.FileMode) error {
 // cloning each regular file as [FD] does and skipping special files. A special
 // file at src copies nothing. A Windows junction is a symlink here
 // ([hostfile.Linked]) and copies as one ([hostfile.Symlink]).
-func Tree(src, dst string) error {
+func Tree(src, dst string) error { return hierarchy(src, dst, walk{}) }
+
+// hierarchy clones src to dst in one call where the volume can, else with w.
+func hierarchy(src, dst string, w walk) error {
 	info, err := hostfile.Lstat(src)
 	if err != nil {
 		return err
@@ -70,7 +73,6 @@ func Tree(src, dst string) error {
 	if cloned, err := cloneHierarchy(src, dst, info); cloned || err != nil {
 		return err
 	}
-	var w walk
 	return w.tree(src, dst, info)
 }
 
@@ -79,6 +81,9 @@ type walk struct {
 	// copying is set once a clone was unsupported, so later files skip the
 	// attempt: the rest of the hierarchy is almost always on the same volume.
 	copying bool
+	// shared refuses byte copies: a file whose blocks cannot be shared stops
+	// the walk with errors.ErrUnsupported (see [Shared]).
+	shared bool
 }
 
 // tree copies the entry at src, described by info, to the new path dst.
@@ -134,7 +139,7 @@ func (w *walk) file(src, dst string, mode os.FileMode) error {
 	defer in.Close()
 	if !w.copying {
 		err := Reflink(in, dst, mode)
-		if !errors.Is(err, errors.ErrUnsupported) {
+		if !errors.Is(err, errors.ErrUnsupported) || w.shared {
 			return err
 		}
 		w.copying = true

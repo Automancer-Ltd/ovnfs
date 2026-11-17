@@ -5,15 +5,13 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/stencil-hq/ovnfs/export"
 )
 
 func TestServeOptions(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
-	for _, name := range []string{"OVNFS_NODE_CACHE", "OVNFS_MEMORY", "OVNFS_BLOB_CACHE", "OVNFS_ATIME", "OVNFS_FSYNC", "OVNFS_NFS_IO_SIZE"} {
+	for _, name := range []string{"OVNFS_MEMORY", "OVNFS_BLOB_CACHE", "OVNFS_ATIME", "OVNFS_FSYNC", "OVNFS_NFS_IO_SIZE"} {
 		t.Setenv(name, "")
 	}
 	parse := func(args ...string) (serveCmd, error) {
@@ -98,44 +96,5 @@ func TestServeOptions(t *testing.T) {
 	}
 	if _, err := newCLIParser(&cli{}, []string{"version"}, &verbs{}); err != nil {
 		t.Fatalf("version read user config: %v", err)
-	}
-}
-
-// TestNodeCacheOptions checks user-file, environment and flag precedence.
-func TestNodeCacheOptions(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
-	t.Setenv("OVNFS_NODE_CACHE", "")
-	if err := os.MkdirAll(filepath.Join(home, ".o2"), 0755); err != nil {
-		t.Fatal(err)
-	}
-	parse := func(flags ...string) (byteSize, error) {
-		var commands verbs
-		args := append([]string{"serve"}, flags...)
-		parser, err := newCLIParser(&cli{}, args, &commands)
-		if err == nil {
-			_, err = parser.Parse(args)
-		}
-		return commands.Serve.NodeCache, err
-	}
-	if n, err := parse(); err != nil || n != export.DefaultNodeCache {
-		t.Fatalf("default %d: %v", n, err)
-	}
-	if err := os.WriteFile(filepath.Join(home, ".o2", "ovnfs.yml"), []byte("node_cache: 2M\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if n, err := parse(); err != nil || n != 2<<20 {
-		t.Fatalf("user %d: %v", n, err)
-	}
-	t.Setenv("OVNFS_NODE_CACHE", "1M")
-	if n, err := parse(); err != nil || n != 1<<20 {
-		t.Fatalf("env %d: %v", n, err)
-	}
-	if n, err := parse("--node-cache", "0"); err != nil || n != 0 {
-		t.Fatalf("flag %d: %v", n, err)
-	}
-	if _, err := parse("--node-cache", "-1"); err == nil {
-		t.Fatal("negative node cache accepted")
 	}
 }

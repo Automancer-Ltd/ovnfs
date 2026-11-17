@@ -166,7 +166,7 @@ func TestTakeOrderingModesAndProtectedPaths(t *testing.T) {
 	if _, err := f.reg.New(ctx, args); err != nil {
 		t.Fatal(err)
 	}
-	for p, want := range map[string]string{"dir/a": "working\n", "dir/b": "staged\n", "node_modules/pkg/data": "cache\n", "secret/file": "local\n", "hidden/file": "<absent>"} {
+	for p, want := range map[string]string{"dir/a": "working\n", "dir/b": "staged\n", "node_modules/pkg/data": cached(t, "cache\n"), "secret/file": "local\n", "hidden/file": "<absent>"} {
 		if got := f.read("ordered", p); got != want {
 			t.Errorf("%s = %q, want %q", p, got, want)
 		}

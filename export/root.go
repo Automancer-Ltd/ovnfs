@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v5"
+	"github.com/stencil-hq/ovnfs/internal/ident"
 )
 
 // neverIndex is the empty file at the export root that tells Spotlight never to
@@ -116,6 +117,12 @@ type checkoutRootInfo struct {
 
 // Name returns the immutable checkout folder name.
 func (i checkoutRootInfo) Name() string { return i.name }
+
+// Identity forwards the checkout root's identity, which embedding hides.
+func (i checkoutRootInfo) Identity() ident.ID {
+	id, _ := ident.Of(i.FileInfo)
+	return id
+}
 
 // rootFile is a read-only directory handle for the virtual export root.
 type rootFile struct {

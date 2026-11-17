@@ -8,25 +8,27 @@ import (
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/stencil-hq/ovnfs/checkout"
+	"github.com/stencil-hq/ovnfs/internal/ident"
+	"github.com/stencil-hq/ovnfs/overlay"
 )
 
 // routerFile serializes file calls and redirects stale descriptors into the current upper.
 type routerFile struct {
-	mu       sync.Mutex
-	router   *Router
-	co       string
-	path     string
-	name     string
-	flags    int
-	perm     os.FileMode
-	gen      uint64
-	offset   int64
-	file     billy.File
-	closed   bool
-	life     *routerLife
-	identity *nodeFS
-	id       uint64
-	unpin    func()
+	mu     sync.Mutex
+	router *Router
+	co     string
+	path   string
+	name   string
+	flags  int
+	perm   os.FileMode
+	gen    uint64
+	offset int64
+	file   billy.File
+	closed bool
+	life   *routerLife
+	// identity is the entry's, read at open, which finds it again after a
+	// freeze closed file (see relocate).
+	identity ident.ID
 }
 
 // routerFileInterface checks that generation-aware files provide all billy operations.
@@ -51,22 +53,12 @@ func (f *routerFile) current(op string, s *checkout.Session) error {
 	if s.Gen == f.gen {
 		return nil
 	}
-	if f.identity != nil {
-		name, ok := f.identity.nodes.path(f.id)
-		if !ok {
-			s.Done()
-			if err := f.identity.IdentityError(); err != nil {
-				return err
-			}
-			return &os.PathError{Op: op, Path: f.Name(), Err: os.ErrClosed}
-		}
-		co, p := splitRouterPath(name)
-		if co != f.co {
-			s.Done()
-			return &os.PathError{Op: op, Path: f.Name(), Err: os.ErrClosed}
-		}
-		f.path = p
+	p, ok := f.relocate(s.FS)
+	if !ok {
+		s.Done()
+		return &os.PathError{Op: op, Path: f.Name(), Err: os.ErrClosed}
 	}
+	f.path = p
 	// Creation and truncation are one-time open effects, never replayed at a freeze.
 	flags := f.flags &^ (os.O_CREATE | os.O_EXCL | os.O_TRUNC)
 	next, err := s.FS.OpenFile(f.path, flags, f.perm)
@@ -84,6 +76,19 @@ func (f *routerFile) current(op string, s *checkout.Session) error {
 	f.gen = s.Gen
 	old.Close()
 	return nil
+}
+
+// relocate finds where the stale descriptor's entry is now in fs, the
+// checkout's current generation: it may have been renamed since the open,
+// and keeps its identity through the freeze. False when the entry is gone,
+// so a removed or replaced file is never revived under its old name. A
+// file without an identity is no checkout entry but a host file a symlink
+// to an absolute path led to, which its path finds again.
+func (f *routerFile) relocate(fs *overlay.FS) (string, bool) {
+	if f.identity == 0 {
+		return f.path, true
+	}
+	return fs.Locate(f.identity)
 }
 
 // Name returns the file's canonical export-relative path.
@@ -255,8 +260,14 @@ func (f *routerFile) Close() error {
 		return &os.PathError{Op: "close", Path: f.Name(), Err: os.ErrClosed}
 	}
 	f.closed = true
-	if f.unpin != nil {
-		defer f.unpin()
-	}
 	return f.file.Close()
+}
+
+// identityOf returns the identity of the entry an overlay file was opened
+// on, which the overlay knows without a syscall; 0 for a file without one.
+func identityOf(f billy.File) ident.ID {
+	if i, ok := f.(ident.Identifier); ok {
+		return i.Identity()
+	}
+	return 0
 }

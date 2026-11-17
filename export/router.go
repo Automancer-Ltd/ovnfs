@@ -23,6 +23,7 @@ type Router struct {
 	reg    *checkout.Registry
 	lifeMu sync.Mutex
 	lives  map[string]*routerLife
+	paths  pathCache // see locate
 }
 
 // routerLife identifies one checkout incarnation for retained protocol handles.
@@ -145,7 +146,7 @@ func (r *Router) OpenFile(name string, flag int, perm os.FileMode) (billy.File, 
 	if flag&(os.O_CREATE|os.O_TRUNC) != 0 {
 		s.Touch()
 	}
-	return &routerFile{router: r, co: co, path: p, name: canonical, flags: flag, perm: perm, gen: s.Gen, file: f, life: r.life(co)}, nil
+	return &routerFile{router: r, co: co, path: p, name: canonical, flags: flag, perm: perm, gen: s.Gen, file: f, life: r.life(co), identity: identityOf(f)}, nil
 }
 
 // Stat returns current attributes, following the final symlink within its checkout.
@@ -229,7 +230,7 @@ func (r *Router) TempFile(dir, prefix string) (billy.File, error) {
 	}
 	s.Touch()
 	p = overlay.Clean(f.Name())
-	return &routerFile{router: r, co: co, path: p, name: path.Join(co, p), flags: os.O_RDWR, perm: 0o600, gen: s.Gen, file: f, life: r.life(co)}, nil
+	return &routerFile{router: r, co: co, path: p, name: path.Join(co, p), flags: os.O_RDWR, perm: 0o600, gen: s.Gen, file: f, life: r.life(co), identity: identityOf(f)}, nil
 }
 
 // MkdirAll creates directories below a checkout's root.

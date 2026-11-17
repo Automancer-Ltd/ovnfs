@@ -11,9 +11,12 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/stencil-hq/ovnfs/internal/ident"
 )
 
 // Bottom is the read-only filesystem beneath an overlay's immutable layers.
+// Every FileInfo it returns satisfies [ident.Of] with its entry's identity.
 type Bottom interface {
 	Lstat(p string) (os.FileInfo, error)
 	// ReadDir returns a caller-owned slice sorted by name. It rejects missing
@@ -22,6 +25,19 @@ type Bottom interface {
 	Open(p string) (Content, error)
 	Readlink(p string) (string, error)
 	CopyTo(p, dst string) error
+	// Locate returns the path of the bottom entry whose identity is id, or
+	// false; [FS.Locate] verifies that the overlay still shows it there. It
+	// must not need an earlier lookup of the entry.
+	Locate(id ident.ID) (string, bool)
+}
+
+// Awaiter is implemented by bottoms whose first access to some paths waits
+// for background work (base cache snapshots). [FS] calls Await(p) before
+// taking its lock in every entry point taking a path (p clean,
+// checkout-relative; for Rename and Link both paths), so a waiting access
+// does not hold up the checkout's other operations.
+type Awaiter interface {
+	Await(p string)
 }
 
 // Kind identifies a frozen layer entry, including deletion markers.
@@ -63,7 +79,13 @@ type Layer struct {
 	loading  sync.Mutex            // serializes rebuilding resident
 	used     atomic.Bool           // set by view, cleared by [Layer.Cool]
 	idle     int                   // Cool calls since the last use; Cool's caller owns it
-	links    uint64                // base of this layer's hard-link group numbers
+
+	synthetic uint64 // Synthetic high-water mark of the upper the layer was, see [synthetic]
+	legacy    uint64 // key of hashed identities of a version 1 manifest, see [legacyIdentity]
+
+	locating sync.Once             // builds byID and moreIDs on the index's first [Layer.locate]
+	byID     map[ident.ID]string   // a path of each identity
+	moreIDs  map[ident.ID][]string // further hard-link paths of identities in byID
 }
 
 // IndexLayer indexes a frozen upper after its staging work directory is removed.
@@ -74,12 +96,23 @@ func IndexLayer(dir string) (*Layer, error) { return indexLayer(dir, false) }
 func IndexUpper(dir string) (*Layer, error) { return indexLayer(dir, true) }
 
 // indexLayer also supports a live upper whose staging directory is private.
+// It reads every entry's persisted identity, and a frozen layer's Synthetic
+// high-water mark.
 func indexLayer(dir string, live bool) (*Layer, error) {
-	return walkLayer(dir, live, true, "")
+	ids, err := layerStore(dir)
+	if err != nil {
+		return nil, err
+	}
+	l, err := walkLayer(dir, live, true, "", ids)
+	if err == nil && !live {
+		l.synthetic, err = readAttr(l.dir, nextAttr)
+	}
+	return l, err
 }
 
-// walkLayer can visit only a listing's ancestors and direct children.
-func walkLayer(dir string, live, recursive bool, listing string) (*Layer, error) {
+// walkLayer can visit only a listing's ancestors and direct children. ids
+// holds the identities of dir's files (see [describe]).
+func walkLayer(dir string, live, recursive bool, listing string, ids *idStore) (*Layer, error) {
 	root, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, err
@@ -113,7 +146,7 @@ func walkLayer(dir string, live, recursive bool, listing string) (*Layer, error)
 			if !info.IsDir() {
 				return &fs.PathError{Op: "index", Path: root, Err: fs.ErrInvalid}
 			}
-			if info, err = withMode(real, info); err != nil {
+			if info, err = describe(real, info, ids); err != nil {
 				return err
 			}
 			l.set(p, entry(info))
@@ -140,7 +173,7 @@ func walkLayer(dir string, live, recursive bool, listing string) (*Layer, error)
 				l.set(q, Entry{Kind: KindWhiteout})
 			}
 		default:
-			if info, err = withMode(real, info); err != nil {
+			if info, err = describe(real, info, ids); err != nil {
 				return err
 			}
 			l.set(p, entry(info))
@@ -208,6 +241,45 @@ func (l *Layer) Walk(fn func(p string, e Entry) error) error {
 		return nil
 	}
 	return visit("")
+}
+
+// locate returns a path of the layer's entry with identity id that visible
+// accepts: the overlay shows it there. The index of identities is built on
+// first use and kept as long as the index itself.
+func (l *Layer) locate(id ident.ID, visible func(string) bool) (string, bool) {
+	v := l.view()
+	v.locating.Do(v.indexIDs)
+	if p, ok := v.byID[id]; ok && visible(p) {
+		return p, true
+	}
+	for _, p := range v.moreIDs[id] {
+		if visible(p) {
+			return p, true
+		}
+	}
+	return "", false
+}
+
+// indexIDs maps the identities of the entries of an index that no longer changes.
+func (l *Layer) indexIDs() {
+	l.byID = make(map[ident.ID]string, len(l.entries))
+	for p, e := range l.entries {
+		if e.Info == nil {
+			continue
+		}
+		id, ok := ident.Of(e.Info)
+		if !ok {
+			continue
+		}
+		if _, dup := l.byID[id]; dup {
+			if l.moreIDs == nil {
+				l.moreIDs = make(map[ident.ID][]string)
+			}
+			l.moreIDs[id] = append(l.moreIDs[id], p)
+			continue
+		}
+		l.byID[id] = p
+	}
 }
 
 // entry translates host metadata into an indexed data entry.

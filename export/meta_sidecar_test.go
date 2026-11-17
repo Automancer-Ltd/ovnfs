@@ -12,16 +12,6 @@ import (
 	"github.com/stencil-hq/ovnfs/overlay"
 )
 
-// newMetadataTestFS uses the production overlay's filesystem and metadata methods.
-func newMetadataTestFS(t *testing.T) *nodeFS {
-	t.Helper()
-	fs, err := overlay.New(t.TempDir(), nil, nil, overlay.NewMemory(64<<20, 1<<20, 0))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &nodeFS{Filesystem: fs, Change: fs, nodes: newNodeTable(fs.ReadDir)}
-}
-
 // sidecarRemoveFails fails every removal of an AppleDouble sidecar, as a full
 // disk does when the overlay must record a whiteout.
 type sidecarRemoveFails struct{ billy.Filesystem }
@@ -68,7 +58,7 @@ func TestRemoveReportsSidecarCleanupError(t *testing.T) {
 func TestRenameOntoSidecarOnlyDirectory(t *testing.T) {
 	n := newMetadataTestFS(t)
 	createAll(t, n, "co/dst/._x", "co/src/file")
-	idFile := n.nodes.id("co/src/file")
+	idFile := n.rt.id("co/src/file")
 	if err := n.Rename("co/src", "co/dst"); err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +68,7 @@ func TestRenameOntoSidecarOnlyDirectory(t *testing.T) {
 	if _, err := n.Lstat("co/dst/._x"); !os.IsNotExist(err) {
 		t.Fatalf("sidecar kept: %v", err)
 	}
-	if p, _ := n.nodes.path(idFile); p != "co/dst/file" {
+	if p, _, _ := n.rt.locate(idFile); p != "co/dst/file" {
 		t.Fatalf("moved file id points at %q", p)
 	}
 }
@@ -124,7 +114,7 @@ func TestHiddenSidecarsRemainAddressable(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Close()
-	id := n.nodes.id("co/empty/._file")
+	id := n.rt.id("co/empty/._file")
 	if _, err := n.Lstat("co/empty/._file"); err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +128,7 @@ func TestHiddenSidecarsRemainAddressable(t *testing.T) {
 	if err := n.Remove("co/empty"); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := n.nodes.path(id); ok {
+	if _, _, ok := n.rt.locate(id); ok {
 		t.Fatal("sidecar handle not retired")
 	}
 }

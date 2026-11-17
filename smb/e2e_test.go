@@ -42,6 +42,9 @@ func (b *testBackend) FileID(name string) uint64 {
 	return b.next
 }
 
+// IDOf returns the path-keyed identity; the test backend ignores info.
+func (b *testBackend) IDOf(name string, _ os.FileInfo) uint64 { return b.FileID(name) }
+
 // Rename moves identity mappings for the renamed object and all its descendants.
 func (b *testBackend) Rename(from, to string) error {
 	b.mu.Lock()

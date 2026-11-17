@@ -22,8 +22,10 @@ func TestMount(t *testing.T) {
 	}
 	for _, dirpath := range []string{"/", "/some/where", ""} {
 		stat, d := c.call(progMount, 3, mntMnt, func(e *encoder) { e.str(dirpath) })
-		want := words(0, 8)
-		want = binary.BigEndian.AppendUint64(want, fs.FileID(""))
+		root := fs.FileID("")
+		want := words(0, fhSize)
+		want = binary.BigEndian.AppendUint64(want, root)
+		want = binary.BigEndian.AppendUint64(want, fs.Generation(root))
 		want = append(want, words(1, authNone)...)
 		if stat != rpcSuccess || !bytes.Equal(d.buf, want) {
 			t.Errorf("MNT %q: accept_stat %d, result %x, want %x", dirpath, stat, d.buf, want)
@@ -59,7 +61,7 @@ func TestMount(t *testing.T) {
 		t.Errorf("procedure 6: accept_stat %d, want PROC_UNAVAIL", stat)
 	}
 	// The handle MNT returns serves NFSv3 calls.
-	if st, _ := c.v3call(v3GetAttr, func(e *encoder) { e.fh(fs.FileID("")) }); st != stOK {
+	if st, _ := c.v3call(v3GetAttr, func(e *encoder) { e.fh(fs.FileID(""), 0) }); st != stOK {
 		t.Errorf("GETATTR of the mounted root: %d", st)
 	}
 }

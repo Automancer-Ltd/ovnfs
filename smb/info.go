@@ -93,7 +93,7 @@ func queryFileInfo(r *request, o *open, info os.FileInfo, class byte, pending bo
 	fs := r.c.srv.FS
 	var id uint64
 	if class == 6 || class == 18 || class == 59 || class == 100 {
-		id = fs.FileID(o.path)
+		id = fs.IDOf(o.path, info)
 		if id == 0 {
 			return nil, false, statusInternalError
 		}

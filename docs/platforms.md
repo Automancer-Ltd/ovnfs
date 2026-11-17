@@ -75,18 +75,16 @@ file at its next open.
 
 The server also accepts NFSv4.0 clients on the same socket or port. These may receive
 read delegations, recalled on changes through another protocol, `pull`,
-reattach, checkout removal, and folder edits in cache and local paths reported
-by the folder watcher (FSEvents on macOS, inotify on Linux,
-ReadDirectoryChangesW on Windows). Live folder paths are not delegated while
-the watcher does not cover their folder: on Linux beyond the
-`fs.inotify.max_user_watches` limit, or until a moved or deleted folder exists
-again. NFSv4.0 is not the automatic mount: its stateful open and close traffic
-substantially slows cold Cargo builds on macOS.
+reattach and checkout removal: edits in the source folder never change a
+checkout's files (cache and local paths come from a snapshot, see
+[configuration](configuration.md#classes)). NFSv4.0 is not the automatic
+mount: its stateful open and close traffic substantially slows cold Cargo
+builds on macOS.
 
 ## FUSE
 
 `serve --proto fuse` (the Linux default) mounts through `fusermount3`, with the
-export's stable node ids as inode numbers and one-second entry and attribute
+export's file ids as inode numbers and one-second entry and attribute
 timeouts. A directory's names are fixed when it is opened, so offsets stay
 stable, but READDIRPLUS stats each entry as it answers: the kernel keeps the
 attributes it gets for the attribute timeout, so attributes from the time of
@@ -112,10 +110,9 @@ byte-range locks and change notifications; macOS smbfs caches negative lookups
 for about two seconds.
 
 SMB2.1+ file leases allow read and handle caching, recalled on conflicting
-opens, rename/deletion, and daemon or watched-folder changes. Unwatched live
-paths are not leased. On macOS, `serve --proto smb` also grants write leases
-for regular files already owned by a checkout's writable upper, including
-memory files and build outputs. Live lower files, hard-link aliases and
+opens, rename/deletion, and daemon changes. On macOS, `serve --proto smb` also
+grants write leases for regular files already owned by a checkout's writable
+upper, including memory files and build outputs. Lower files, hard-link aliases and
 private git/jj metadata never receive write leases. Other platforms retain
 read/handle caching only; exclusive/batch oplocks and directory leasing are
 not granted.
@@ -201,7 +198,7 @@ SMB and no port. It is the Windows default where WinFsp is installed and
 the SMB client dials only port 445; elsewhere SMB stays the default, being faster.
 
 Files look as they do to Windows SMB clients: case-sensitive names,
-`FILE_ATTRIBUTE_READONLY` as the owner write bit, node ids as file indexes,
+`FILE_ATTRIBUTE_READONLY` as the owner write bit, file ids as file indexes,
 symlinks as described below. Open files can be deleted and renamed over, as on
 Unix. The driver caches metadata for one second and never caches data.
 
@@ -237,7 +234,10 @@ Unix mode bits that NTFS cannot hold (execute, setuid, setgid, sticky, and any
 mode but 0644/0755 or their read-only forms) live in an `:ovnfs.mode` alternate
 data stream of each upper and layer file, so they follow renames, hard links
 and snapshots; the state directory must be on NTFS or ReFS for such modes. New
-files get 0644 and directories 0755, as with a umask of 022.
+files get 0644 and directories 0755, as with a umask of 022. Likewise an
+`:ovnfs.id` stream keeps the file id of a file copied up from a lower layer or
+written from memory (see [internals](internals.md#file-identity)); a file's
+own id is its NTFS file record number.
 
 Microsoft Defender scans every file the daemon writes into its state and every
 file Windows reads over SMB; excluding the state directory
@@ -253,17 +253,18 @@ as a local disk, 1.2 s as a network volume, which Defender scans less, and
 (`Add-MpPreference -ExclusionProcess`) cut an open and close from 400 µs to
 49 µs, against SMB's 53 µs.
 
-## Live paths and metadata
+## Cache snapshots and metadata
 
-Lookups of live (cache and local) paths prove that the folder's ancestor
-directories are real directories, not symlinks; a proof is reused for one
-second, the frontends' attribute lifetime, and live directory listings take
-their entries' metadata from the listing itself. A checkout's own files are
-described from its in-memory index, which every change made through ovnfs
-refreshes; only a file open for writing is looked up on the host.
+A cache snapshot takes a cache or local root only while each of its ancestors
+in the folder is a real directory, not a symlink, and a lookup below a root
+proves the same of the snapshot's directories once, since a snapshot never
+changes; snapshot directory listings take their entries' metadata from the
+listing itself. A checkout's own files are described from its in-memory
+index, which every change made through ovnfs refreshes; only a file open for
+writing is looked up on the host.
 
-A live symlink whose absolute target lies inside the folder reads as the same
-path relative to the link, so in a checkout it names the checkout's copy:
-Bun on Windows links workspace packages in `node_modules` by absolute path.
-Absolute targets outside the folder stay as stored. Windows junctions, in
-live paths and in source alike, read as the directory symlinks they act as.
+A symlink in a snapshot whose absolute target lies inside the folder reads as
+the same path relative to the link, so in a checkout it names the checkout's
+copy: Bun on Windows links workspace packages in `node_modules` by absolute
+path. Absolute targets outside the folder stay as stored. Windows junctions,
+in snapshots and in source alike, read as the directory symlinks they act as.

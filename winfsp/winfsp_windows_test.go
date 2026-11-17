@@ -64,9 +64,9 @@ func newFixture(t *testing.T, files map[string]string) *fixture {
 	}
 	f := &fixture{state: t.TempDir(), drive: freeDrive(t)}
 	var err error
-	f.reg, err = checkout.Open(checkout.Config{State: f.state, Mount: t.TempDir(), Memory: overlay.NewMemory(64<<20, 1<<20, 0), BlobCache: 64 << 20, Retire: func(name string) {
+	f.reg, err = checkout.Open(checkout.Config{State: f.state, Mount: t.TempDir(), Memory: overlay.NewMemory(64<<20, 1<<20, 0), BlobCache: 64 << 20, Retire: func(name string, slot uint16) {
 		if f.export != nil {
-			f.export.Retire(name)
+			f.export.Retire(name, slot)
 		}
 	}})
 	if err != nil {
@@ -87,15 +87,10 @@ func newFixture(t *testing.T, files map[string]string) *fixture {
 	return f
 }
 
-// open (re)opens the export over the fixture's persistent node log.
+// open (re)opens the export over the fixture's registry.
 func (f *fixture) open(t *testing.T) {
 	t.Helper()
-	e, err := export.New(export.NewRouter(f.reg), filepath.Join(f.state, "nodes.log"), f.state, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.export = e
-	t.Cleanup(func() { e.Close() })
+	f.export = export.New(export.NewRouter(f.reg), f.state)
 }
 
 // mount serves the export on the fixture's drive until the test ends.
@@ -379,14 +374,14 @@ func TestFinalPathsReopen(t *testing.T) {
 	}
 }
 
-// TestFileIDsAreStableNodeIDs checks that file indexes are the export's node
-// ids and survive copy-up, renames, and a remount over the same node log.
-func TestFileIDsAreStableNodeIDs(t *testing.T) {
+// TestFileIDsAreStable checks that file indexes are the export's file ids and
+// survive copy-up, renames, and a remount over a fresh export.
+func TestFileIDsAreStable(t *testing.T) {
 	f := newFixture(t, map[string]string{"file": "lower"})
 	nodes := f.export.Nodes()
 	id := f.fileID(t, "alpha/file")
 	if want := nodes.ID("alpha/file"); id != want {
-		t.Fatalf("file id %d, node id %d", id, want)
+		t.Fatalf("file index %d, export file id %d", id, want)
 	}
 	if id == f.fileID(t, "beta/file") {
 		t.Fatal("checkouts share a file id")
@@ -404,9 +399,6 @@ func TestFileIDsAreStableNodeIDs(t *testing.T) {
 		t.Fatalf("rename changed file id %d -> %d", id, got)
 	}
 	f.unmount(t)
-	if err := f.export.Close(); err != nil {
-		t.Fatal(err)
-	}
 	f.open(t)
 	f.mount(t)
 	if got := f.fileID(t, "alpha/renamed"); got != id {

@@ -215,7 +215,7 @@ func TestCaptureIndexOutlivesClose(t *testing.T) {
 		}
 	}
 	read := func(b *Base) {
-		v := b.Bottom(time.Time{})
+		v := b.Bottom(nil)
 		for p, f := range want {
 			if got, ok := b.Leaf(p); !ok || got != f {
 				fail("leaf %q = %+v %v", p, got, ok)

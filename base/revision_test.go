@@ -79,7 +79,7 @@ func TestRevisionIndexCarriesPresentedStat(t *testing.T) {
 			}
 			continue
 		}
-		info, err := b.Bottom(time.Time{}).Lstat(e.Path)
+		info, err := b.Bottom(nil).Lstat(e.Path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -136,7 +136,7 @@ func TestRevisionIndexCarriesPresentedStat(t *testing.T) {
 			content = strings.ToUpper(content)
 		}
 		writeTestFile(t, host, content)
-		info, err := b.Bottom(time.Time{}).Lstat(e.Path)
+		info, err := b.Bottom(nil).Lstat(e.Path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -157,7 +157,7 @@ func TestRevisionIndexCarriesPresentedStat(t *testing.T) {
 }
 
 // TestRevisionHiddenRootsStayHidden keeps a hidden root absent from a --rev
-// checkout, where ignored content otherwise stays live: built-in hidden names
+// checkout, where ignored content otherwise comes from the cache snapshot: built-in hidden names
 // and a `hidden tmp/` scratch tree alike. REV's tracked files below a hidden
 // root still appear, without the ignored remainder.
 func TestRevisionHiddenRootsStayHidden(t *testing.T) {
@@ -187,9 +187,9 @@ func TestRevisionHiddenRootsStayHidden(t *testing.T) {
 		rules  []string
 		takes  []Take
 		absent []string
-		live   map[string]string
+		cached map[string]string
 	}{
-		{name: "builtins", live: map[string]string{"tmp/copy/repo/file.txt": "scratch copy\n", "vendor/build.log": "ignored log\n"}},
+		{name: "builtins", cached: map[string]string{"tmp/copy/repo/file.txt": "scratch copy\n", "vendor/build.log": "ignored log\n"}},
 		{name: "hidden", rules: []string{"hidden tmp/", "hidden vendor/"}, absent: []string{"tmp", "vendor/build.log"}},
 		{name: "hidden with take", rules: []string{"hidden tmp/", "hidden vendor/"}, takes: []Take{{Source: ".", Path: "src"}}, absent: []string{"tmp", "vendor/build.log"}},
 	} {
@@ -209,11 +209,14 @@ func TestRevisionHiddenRootsStayHidden(t *testing.T) {
 			}
 			defer b.Close()
 			for _, p := range append(slices.Clone(always), tc.absent...) {
-				if info, err := b.Bottom(time.Time{}).Lstat(p); !os.IsNotExist(err) {
+				if info, err := b.Bottom(nil).Lstat(p); !os.IsNotExist(err) {
 					t.Errorf("%s = %v, %v; want absent", p, info, err)
 				}
 			}
-			for p, want := range tc.live {
+			for p, want := range tc.cached {
+				if strings.HasPrefix(p, "tmp/") && !sharesBlocks(t, dir) {
+					continue // below a cache root, which starts empty where the volume cannot clone
+				}
 				if got := readBase(t, b, p); got != want {
 					t.Errorf("%s = %q, want %q", p, got, want)
 				}
@@ -221,7 +224,7 @@ func TestRevisionHiddenRootsStayHidden(t *testing.T) {
 			if got := readBase(t, b, "vendor/lib.txt"); got != "vendored\n" {
 				t.Errorf("tracked file below a hidden root = %q", got)
 			}
-			list, err := b.Bottom(time.Time{}).ReadDir("")
+			list, err := b.Bottom(b.TakeCaches("c1")).ReadDir("")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -230,13 +233,13 @@ func TestRevisionHiddenRootsStayHidden(t *testing.T) {
 				names = append(names, info.Name())
 			}
 			wantNames := []string{".gitignore", "source.txt", "src", "vendor"}
-			if tc.live != nil {
+			if tc.cached != nil {
 				wantNames = []string{".gitignore", "source.txt", "src", "tmp", "vendor"}
 			}
 			if !slices.Equal(names, wantNames) {
 				t.Errorf("root lists %v, want %v", names, wantNames)
 			}
-			if tc.live == nil {
+			if tc.cached == nil {
 				if class, _ := b.Class("tmp"); class != rules.Hidden {
 					t.Errorf("tmp recorded as %q, want a hidden root", class)
 				}

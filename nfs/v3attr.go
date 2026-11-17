@@ -12,10 +12,15 @@ import (
 )
 
 // maxReportedSizes keeps a reconnect from forgetting a size another
-// connection has already reported. It never decreases.
+// connection has already reported. A file's size never decreases until
+// retire, after which clients see the file through new handles and its
+// history starts afresh.
 type maxReportedSizes struct {
 	mu   sync.Mutex
 	byID map[uint64]uint64
+	// epochs counts each file id's retires, so that a size a connection
+	// requested before one (clientReportedSizes) no longer applies.
+	epochs map[uint64]uint64
 }
 
 func (s *maxReportedSizes) observe(id, size uint64) uint64 {
@@ -38,27 +43,65 @@ func (s *maxReportedSizes) previous(id uint64) (uint64, bool) {
 	return size, ok
 }
 
+// epoch is the number of times id was retired.
+func (s *maxReportedSizes) epoch(id uint64) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.epochs[id]
+}
+
+// retire forgets the sizes reported of file id, whose handles getattr3 has
+// just retired: the file ids stay, so without this the new handles would
+// inherit the sizes the regression was measured against.
+func (s *maxReportedSizes) retire(id uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.byID, id)
+	if s.epochs == nil {
+		s.epochs = make(map[uint64]uint64)
+	}
+	s.epochs[id]++
+}
+
 // clientReportedSizes orders size regressions with the operation that caused
 // them; an unexpected regression retires the handle before it is reported.
 type clientReportedSizes struct {
 	mu      sync.Mutex
 	changed *sync.Cond
-	byID    map[uint64]uint64
+	byID    map[uint64]requestedSize
 	pending map[uint64]bool
+}
+
+// requestedSize is a size this connection's client set, recorded in epoch
+// (maxReportedSizes.epoch) of its file.
+type requestedSize struct{ size, epoch uint64 }
+
+// requested returns the size this connection's client set for id, dropping
+// one recorded before id was last retired.
+func (s *clientReportedSizes) requested(maximum *maxReportedSizes, id uint64) (uint64, bool) {
+	r, ok := s.byID[id]
+	if !ok {
+		return 0, false
+	}
+	if r.epoch != maximum.epoch(id) {
+		delete(s.byID, id)
+		return 0, false
+	}
+	return r.size, true
 }
 
 func (s *clientReportedSizes) report(maximum *maxReportedSizes, id, size uint64) uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.wait(id)
-	if previous, ok := s.byID[id]; ok {
+	if previous, ok := s.requested(maximum, id); ok {
 		if previous > size {
 			return previous
 		}
 		if maximum.observe(id, size) <= size {
 			delete(s.byID, id)
 		} else {
-			s.byID[id] = size
+			s.byID[id] = requestedSize{size, maximum.epoch(id)}
 		}
 		return size
 	}
@@ -69,7 +112,7 @@ func (s *clientReportedSizes) regressed(maximum *maxReportedSizes, id, size uint
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.wait(id)
-	if previous, ok := s.byID[id]; ok {
+	if previous, ok := s.requested(maximum, id); ok {
 		return size < previous
 	}
 	previous, ok := maximum.previous(id)
@@ -100,13 +143,13 @@ func (s *clientReportedSizes) begin(id uint64) {
 	s.mu.Unlock()
 }
 
-func (s *clientReportedSizes) finish(id, size uint64, accepted bool) {
+func (s *clientReportedSizes) finish(maximum *maxReportedSizes, id, size uint64, accepted bool) {
 	s.mu.Lock()
 	if accepted {
 		if s.byID == nil {
-			s.byID = make(map[uint64]uint64)
+			s.byID = make(map[uint64]requestedSize)
 		}
-		s.byID[id] = size
+		s.byID[id] = requestedSize{size, maximum.epoch(id)}
 	}
 	delete(s.pending, id)
 	if s.changed != nil {
@@ -136,7 +179,7 @@ func (e *encoder) finishSize(sent bool) {
 	if accepted {
 		e.maxSizes.observe(e.sizeID, e.size)
 	}
-	e.sizes.finish(e.sizeID, e.size, accepted)
+	e.sizes.finish(e.maxSizes, e.sizeID, e.size, accepted)
 	e.sizePending = false
 }
 
@@ -264,12 +307,13 @@ func (s *Server) apply3(p string, a *sattr3) status {
 	if err != nil {
 		return statusOf(err)
 	}
+	id := s.FS.IDOf(p, info)
 	link := info.Mode()&os.ModeSymlink != 0
 	if a.setSize {
 		if link {
 			return stNotSupp
 		}
-		if st := s.truncate3(p, a.size); st != stOK {
+		if st := s.truncate3(id, p, a.size); st != stOK {
 			return st
 		}
 	}
@@ -290,7 +334,7 @@ func (s *Server) apply3(p string, a *sattr3) status {
 	}
 	if a.setMode && !link && a.mode&0o7777 != posixMode(info.Mode()) {
 		if info.Mode().IsRegular() && info.Mode()&0o200 != 0 && a.mode&0o200 == 0 {
-			s.keepWritable3(p)
+			s.keepWritable3(id, p)
 		}
 		if err := s.FS.Chmod(p, goMode(a.mode)); err != nil {
 			return statusOf(err)
@@ -311,10 +355,9 @@ func (s *Server) apply3(p string, a *sattr3) status {
 	return stOK
 }
 
-// keepWritable3 keeps the file at p open for writing before it loses its
+// keepWritable3 keeps file id, at p, open for writing before it loses its
 // owner's write permission, for writes the client still sends (keptFiles).
-func (s *Server) keepWritable3(p string) {
-	id := s.FS.FileID(p)
+func (s *Server) keepWritable3(id uint64, p string) {
 	if s.v3.kept.has(keptKey{id: id}) {
 		return
 	}
@@ -323,10 +366,10 @@ func (s *Server) keepWritable3(p string) {
 	}
 }
 
-// truncate3 sets the size of the file at p, through its kept file when the
+// truncate3 sets the size of file id, at p, through its kept file when the
 // backend refuses to open it for writing (keptFiles). Size 0 opens with
 // O_TRUNC, so a file from a lower layer is not copied up only to be emptied.
-func (s *Server) truncate3(p string, size uint64) status {
+func (s *Server) truncate3(id uint64, p string, size uint64) status {
 	if size > math.MaxInt64 {
 		return stInval
 	}
@@ -336,7 +379,7 @@ func (s *Server) truncate3(p string, size uint64) status {
 	}
 	f, err := s.FS.OpenFile(p, flag, 0)
 	if errors.Is(err, os.ErrPermission) {
-		if ok, kerr := s.v3.kept.with(keptKey{id: s.FS.FileID(p)}, func(f billy.File) error { return f.Truncate(int64(size)) }); ok {
+		if ok, kerr := s.v3.kept.with(keptKey{id: id}, func(f billy.File) error { return f.Truncate(int64(size)) }); ok {
 			return statusOf(kerr)
 		}
 	}

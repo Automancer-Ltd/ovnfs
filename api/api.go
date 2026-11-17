@@ -51,36 +51,32 @@ type Rule struct {
 // Status describes the running daemon. Version is the admin protocol generation;
 // BuildVersion is the daemon's module version, not the CLI's.
 type Status struct {
-	Version        int     `json:"version"`
-	BuildVersion   string  `json:"build_version,omitempty"`
-	PID            int     `json:"pid"`
-	Uptime         float64 `json:"uptime_s"`
-	Proto          string  `json:"proto"`
-	Port           int     `json:"port"`
-	Mount          string  `json:"mount"`
-	State          string  `json:"state"`
-	Socket         string  `json:"socket"` // admin socket clients dial for these operations
-	Checkouts      int     `json:"checkouts"`
-	Snapshots      int     `json:"snapshots"`
-	Bases          int     `json:"bases"`
-	Layers         int     `json:"layers"`
-	Memory         Usage   `json:"memory"`                  // checkouts' written files held in memory before they spill to disk
-	MemoryParked   int     `json:"memory_parked,omitempty"` // memory files whose write to disk failed, retried every second
-	MemoryError    string  `json:"memory_error,omitempty"`  // the latest such failure while MemoryParked is not 0
-	NodeIndexBytes int64   `json:"node_index_bytes"`
-	NodeCacheError string  `json:"node_cache_error,omitempty"`
-	NodeCache      Usage   `json:"node_cache"`  // estimated reconstructible node and listing bytes
-	BlobCache      Usage   `json:"blob_cache"`  // content-addressed blobs served from memory
-	HeapLive       int64   `json:"heap_live"`   // Go heap the last collection found reachable
-	HeapInUse      int64   `json:"heap_in_use"` // Go heap spans holding objects: live, not yet collected garbage and fragmentation
-	GoHeld         int64   `json:"go_held"`     // memory the Go runtime holds from the OS (heap, stacks, metadata), minus what it returned
-	Footprint      int64   `json:"footprint"`   // process memory as the OS charges it (macOS phys_footprint, Linux RssAnon+VmSwap, Windows private bytes); 0 where unknown
+	Version      int     `json:"version"`
+	BuildVersion string  `json:"build_version,omitempty"`
+	PID          int     `json:"pid"`
+	Uptime       float64 `json:"uptime_s"`
+	Proto        string  `json:"proto"`
+	Port         int     `json:"port"`
+	Mount        string  `json:"mount"`
+	State        string  `json:"state"`
+	Socket       string  `json:"socket"` // admin socket clients dial for these operations
+	Checkouts    int     `json:"checkouts"`
+	Snapshots    int     `json:"snapshots"`
+	Bases        int     `json:"bases"`
+	Layers       int     `json:"layers"`
+	Memory       Usage   `json:"memory"`                  // checkouts' written files held in memory before they spill to disk
+	MemoryParked int     `json:"memory_parked,omitempty"` // memory files whose write to disk failed, retried every second
+	MemoryError  string  `json:"memory_error,omitempty"`  // the latest such failure while MemoryParked is not 0
+	BlobCache    Usage   `json:"blob_cache"`              // content-addressed blobs served from memory
+	HeapLive     int64   `json:"heap_live"`               // Go heap the last collection found reachable
+	HeapInUse    int64   `json:"heap_in_use"`             // Go heap spans holding objects: live, not yet collected garbage and fragmentation
+	GoHeld       int64   `json:"go_held"`                 // memory the Go runtime holds from the OS (heap, stacks, metadata), minus what it returned
+	Footprint    int64   `json:"footprint"`               // process memory as the OS charges it (macOS phys_footprint, Linux RssAnon+VmSwap, Windows private bytes); 0 where unknown
 	// Warnings name host settings that slow the mount down, each with its fix.
 	Warnings []string `json:"warnings,omitempty"`
 }
 
-// Usage is resident bytes against a limit. A zero Limit disables file/blob
-// caching; the node cache still keeps the current directory.
+// Usage is resident bytes against a limit. A zero Limit disables the cache.
 type Usage struct {
 	Used  int64 `json:"used"`
 	Limit int64 `json:"limit"`

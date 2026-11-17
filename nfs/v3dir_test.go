@@ -40,7 +40,7 @@ func readdir3(t *testing.T, call dirCaller, plus bool, dir, cookie, verf uint64,
 		proc = v3ReadDirPlus
 	}
 	stat, d := call(proc, func(e *encoder) {
-		e.fh(dir)
+		e.fh(dir, 0)
 		e.u64(cookie)
 		e.u64(verf)
 		if plus {
@@ -68,7 +68,7 @@ func readdir3(t *testing.T, call dirCaller, plus bool, dir, cookie, verf uint64,
 				e.attrs = &a
 			}
 			if e.hasHandle = d.bool(); e.hasHandle {
-				e.handle, _ = d.fh(maxFH3)
+				e.handle, _, _ = d.fh(maxFH3)
 			}
 		}
 		pg.entries = append(pg.entries, e)

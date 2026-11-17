@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/stencil-hq/ovnfs/internal/ident"
 	"github.com/stencil-hq/ovnfs/overlay"
 	"github.com/stencil-hq/ovnfs/rules"
 	"github.com/stencil-hq/ovnfs/source"
@@ -260,12 +261,28 @@ func (v remoteBottom) nodeInfo(p string, n uint32) (os.FileInfo, error) {
 		if mtime.IsZero() {
 			mtime = v.b.meta.ForkTime
 		}
-		return capturedInfo{name: path.Base("/" + p), mode: x.fileMode(n), size: meta.Size, mtime: mtime}, nil
+		return capturedInfo{name: path.Base("/" + p), mode: x.fileMode(n), size: meta.Size, mtime: mtime, id: captureID(n)}, nil
 	}
 	if x.class(n) == rules.Cache && !hasInfo {
-		return capturedInfo{name: path.Base(p), mode: os.ModeDir | 0o755, mtime: v.b.meta.ForkTime}, nil
+		return capturedInfo{name: path.Base(p), mode: os.ModeDir | 0o755, mtime: v.b.meta.ForkTime, id: captureID(n)}, nil
 	}
 	return nil, absent(p)
+}
+
+// Locate returns the path of the offered entry, or empty cache root, whose
+// Capture identity is id.
+func (v remoteBottom) Locate(id ident.ID) (string, bool) {
+	if id.Space() != ident.Capture {
+		return "", false
+	}
+	p, ok := v.b.nodePath(id.Value())
+	if !ok {
+		return "", false
+	}
+	if _, err := v.nodeInfo(p, uint32(id.Value())); err != nil {
+		return "", false
+	}
+	return p, true
 }
 
 // Lstat returns the offered metadata; it never fetches content.
@@ -377,13 +394,19 @@ func (v remoteBottom) CopyTo(p, dst string) error {
 	return setTimes(dst, info.ModTime(), info.Mode()&os.ModeSymlink != 0)
 }
 
-// capturedInfo is captured or offered metadata presented as a FileInfo owned by this process's user.
+// capturedInfo is captured or offered metadata presented as a FileInfo owned
+// by this process's user, with the entry's Capture identity (zero for the
+// classification views of takes, which never reach a frontend).
 type capturedInfo struct {
 	name  string
 	mode  os.FileMode
 	size  int64
 	mtime time.Time
+	id    ident.ID
 }
+
+// Identity returns the entry's Capture identity.
+func (i capturedInfo) Identity() ident.ID { return i.id }
 
 // Name returns the base name.
 func (i capturedInfo) Name() string { return i.name }

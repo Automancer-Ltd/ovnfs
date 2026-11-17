@@ -47,7 +47,6 @@ const memoryFileMax = 256 << 10
 const (
 	defaultMemory    byteSize = 64 << 20
 	defaultBlobCache byteSize = 16 << 20
-	defaultNodeCache byteSize = export.DefaultNodeCache
 )
 
 // memoryIdle is how long a file sits untouched in memory before it is written
@@ -110,7 +109,6 @@ func serveDefaults(conf manifest.Daemon) kong.Option {
 		"default_proto":       cmp.Or(conf.Proto, defaultProto()),
 		"memory_default":      cmp.Or(os.Getenv("OVNFS_MEMORY"), conf.Memory, defaultMemory.String()),
 		"fsync_default":       cmp.Or(os.Getenv("OVNFS_FSYNC"), conf.Fsync, "false"),
-		"node_cache_default":  cmp.Or(os.Getenv("OVNFS_NODE_CACHE"), conf.NodeCache, defaultNodeCache.String()),
 		"blob_cache_default":  cmp.Or(os.Getenv("OVNFS_BLOB_CACHE"), conf.BlobCache, defaultBlobCache.String()),
 		"atime_default":       cmp.Or(os.Getenv("OVNFS_ATIME"), conf.Atime, "false"),
 		"nfs_io_size_default": cmp.Or(os.Getenv("OVNFS_NFS_IO_SIZE"), conf.NFSIOSize, byteSize(defaultNFSIOSize).String()),
@@ -124,7 +122,6 @@ type serveCmd struct {
 	Listen     string   `help:"File server address; defaults to a free local port or a Unix socket for NFS on macOS."`
 	Memory     byteSize `help:"Memory budget for small written files; 0 writes every file to disk." default:"${memory_default}"`
 	Fsync      bool     `help:"Spill and sync memory files on fsync (NFS does not forward fsync)." default:"${fsync_default}"`
-	NodeCache  byteSize `help:"Estimated cache bytes for derived node ids and listings; keeps at least the current directory." default:"${node_cache_default}"`
 	BlobCache  byteSize `help:"Memory budget for small content-addressed blobs; 0 disables." default:"${blob_cache_default}"`
 	Atime      bool     `help:"Allow access time updates on the mount." default:"${atime_default}"`
 	NFSIOSize  byteSize `name:"nfs-io-size" help:"NFS read/write transfer size (power of two, 4K to 1M)." default:"${nfs_io_size_default}"`
@@ -242,13 +239,13 @@ func (cmd *serveCmd) Run(c *cli) (err error) {
 			}
 			return func() {}, nil
 		},
-		Retire: func(name string) {
+		Retire: func(name string, slot uint16) {
 			lk.detach(name)
 			if checkoutShares != nil {
 				checkoutShares.Close(name)
 			}
 			if e != nil {
-				e.Retire(name)
+				e.Retire(name, slot)
 			}
 		},
 		Invalidate: func(name string, paths, trees []string) {
@@ -280,13 +277,9 @@ func (cmd *serveCmd) Run(c *cli) (err error) {
 	defer func() { err = errors.Join(err, reg.Close()) }()
 	lk.reg = reg
 	defer lk.close()
-	e, err = export.New(export.NewRouter(reg), filepath.Join(state, "nodes.log"), state, log.Printf)
-	if err != nil {
-		return fmt.Errorf("export: %w", err)
-	}
-	e.SetNodeCache(int64(cmd.NodeCache))
+	e = export.New(export.NewRouter(reg), state)
 	exported.Store(e)
-	defer e.Close()
+	go removeNodeLogs(state)
 	if checkoutShares, err = newShares(state, reg, e); err != nil {
 		return fmt.Errorf("shares: %w", err)
 	}
@@ -325,7 +318,7 @@ func (cmd *serveCmd) Run(c *cli) (err error) {
 	go lk.listen(linkListener)
 	stops := make(chan stopRequest)
 	welcome := admin.Welcome{Version: protocolVersion, Ops: api.Ops, Features: api.Features, Proto: proto, Port: port, Mount: mount, State: state}
-	handler := &opsHandler{nodeCache: e.NodeCache, nodeIndexBytes: e.NodeIndexBytes, nodeCacheError: e.NodeCacheError, reg: reg, shares: checkoutShares, links: lk, welcome: welcome, started: time.Now(), stop: func(ctx context.Context, a api.StopArgs) error {
+	handler := &opsHandler{reg: reg, shares: checkoutShares, links: lk, welcome: welcome, started: time.Now(), stop: func(ctx context.Context, a api.StopArgs) error {
 		done := make(chan error, 1)
 		select {
 		case stops <- stopRequest{keepMount: a.KeepMount, ctx: ctx, done: done}:
@@ -547,12 +540,6 @@ func listenAndMount(reg *checkout.Registry, e *export.Export, proto, address, st
 		}
 		savedPort, socket = 0, false
 	}
-	if proto == "nfs" && runtime.GOOS == "darwin" && remount {
-		log.Printf("resetting handles for retained NFS mount at %s", mount)
-		if err := e.ResetNFSHandles(); err != nil {
-			return 0, nil, fmt.Errorf("resetting retained NFS handles: %w", err)
-		}
-	}
 	if proto == "nfs" && runtime.GOOS == "darwin" && (remount && socket || !remount && address == "") {
 		files, err := mountLocal(reg, e, state, mount, settings, served)
 		if err == nil || remount || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
@@ -601,12 +588,7 @@ func listenAndMount(reg *checkout.Registry, e *export.Export, proto, address, st
 		if user != "" {
 			s.Users = map[string]string{user: password}
 		}
-		nodes := e.Nodes()
-		e.OnRecall(func(id uint64) {
-			if p, ok := nodes.Path(id); ok {
-				go s.Changed(p, smb.NotifyModified)
-			}
-		})
+		e.OnRecall(func(r export.Recall) { go s.Changed(r.Path, smb.NotifyModified) })
 		if os.Getenv("LOG_LEVEL") != "" {
 			s.Logf = log.Printf
 		}
@@ -662,4 +644,22 @@ func attach(proto string, addr net.Addr, mount, user, password string, settings 
 		return fmt.Errorf("mount: %w", err)
 	}
 	return nil
+}
+
+// removeNodeLogs deletes STATE/nodes.log and the files named after it
+// (nodes.log.cache and its discard directories): the node id table of
+// builds before file ids came from the entries themselves (export.Nodes).
+// Nothing reads them any more; the index alone can take gigabytes, so the
+// daemon removes them in the background, and an interrupted removal
+// continues at the next start.
+func removeNodeLogs(state string) {
+	matches, err := filepath.Glob(filepath.Join(state, "nodes.log*"))
+	if err != nil {
+		return
+	}
+	for _, m := range matches {
+		if err := os.RemoveAll(m); err != nil {
+			log.Printf("remove obsolete node ids %s: %v", m, err)
+		}
+	}
 }

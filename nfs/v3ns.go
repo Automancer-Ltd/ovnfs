@@ -13,8 +13,8 @@ import (
 
 // dir3 resolves the directory of a diropargs3 naming an entry to create or
 // remove, and vets the name; dot is the status for "." and "..".
-func (s *Server) dir3(id uint64, ok bool, name string, dot status) (string, os.FileInfo, status) {
-	p, st := s.path3(id, ok)
+func (s *Server) dir3(id, gen uint64, ok bool, name string, dot status) (string, os.FileInfo, status) {
+	p, st := s.path3(id, gen, ok)
 	if st != stOK {
 		return "", nil, st
 	}
@@ -34,18 +34,24 @@ func (s *Server) dir3(id uint64, ok bool, name string, dot status) (string, os.F
 	return p, info, stOK
 }
 
-// created3 appends the result of a CREATE, MKDIR, SYMLINK or MKNOD of p in dir: the
-// new handle, its attributes and the directory's wcc_data (without pre-op
-// attributes, which could not be read atomically with the change).
-func (s *Server) created3(res *encoder, dir, p string) status {
-	fid := s.FS.FileID(p)
+// created3 appends the result of a CREATE, MKDIR, SYMLINK or MKNOD of p in
+// directory dirID, at dir: the new handle, its attributes and the
+// directory's wcc_data (without pre-op attributes, which could not be read
+// atomically with the change). IO when p's id cannot be determined.
+func (s *Server) created3(res *encoder, dirID uint64, dir, p string) status {
+	info, err := s.FS.Lstat(p)
+	if err != nil {
+		return stIO
+	}
+	fid := s.FS.IDOf(p, info)
 	if fid == 0 {
 		return stIO
 	}
 	res.bool(true)
-	res.fh(fid)
-	s.postOp3(res, fid, p)
-	s.wcc3(res, nil, s.FS.FileID(dir), dir)
+	res.fh(fid, s.FS.Generation(fid))
+	a := attrsOf(fid, info)
+	postAttrs3(res, &a)
+	s.wcc3(res, nil, dirID, dir)
 	return stOK
 }
 
@@ -68,7 +74,7 @@ const (
 // A file created without its owner's write permission stays open for the
 // creator's writes (keptFiles).
 func (s *Server) create3(d *decoder, res *encoder) status {
-	id, ok := d.fh(maxFH3)
+	id, gen, ok := d.fh(maxFH3)
 	name := d.str(maxPath3)
 	how := d.u32()
 	var sa sattr3
@@ -84,13 +90,13 @@ func (s *Server) create3(d *decoder, res *encoder) status {
 	if d.err != nil {
 		return stInval
 	}
-	dir, _, st := s.dir3(id, ok, name, stExist)
+	dir, _, st := s.dir3(id, gen, ok, name, stExist)
 	if st != stOK {
 		return st
 	}
 	p := path.Join(dir, name)
 	if info, err := s.FS.Lstat(p); err == nil {
-		return s.exists3(res, dir, p, info, how, &sa, verf)
+		return s.exists3(res, id, dir, p, info, how, &sa, verf)
 	}
 	perm := os.FileMode(0o666)
 	if sa.setMode {
@@ -100,7 +106,7 @@ func (s *Server) create3(d *decoder, res *encoder) status {
 	if errors.Is(err, os.ErrExist) {
 		// Created meanwhile by someone else.
 		if info, err := s.FS.Lstat(p); err == nil {
-			return s.exists3(res, dir, p, info, how, &sa, verf)
+			return s.exists3(res, id, dir, p, info, how, &sa, verf)
 		}
 	}
 	if err != nil {
@@ -124,23 +130,24 @@ func (s *Server) create3(d *decoder, res *encoder) status {
 	if st := s.apply3(p, &sa); st != stOK {
 		return st
 	}
-	return s.created3(res, dir, p)
+	return s.created3(res, id, dir, p)
 }
 
-// exists3 answers a CREATE of p, which exists as info: EXIST for GUARDED,
+// exists3 answers a CREATE of p in directory dirID, at dir, where p exists
+// as info: EXIST for GUARDED,
 // for anything but a regular file, and for EXCLUSIVE but a retransmission
 // with verifier verf; else the file as it is, truncated first to a
 // requested size.
-func (s *Server) exists3(res *encoder, dir, p string, info os.FileInfo, how uint32, sa *sattr3, verf [8]byte) status {
+func (s *Server) exists3(res *encoder, dirID uint64, dir, p string, info os.FileInfo, how uint32, sa *sattr3, verf [8]byte) status {
 	switch {
 	case how == createGuarded, !info.Mode().IsRegular():
 		return stExist
 	case how == createExclusive:
-		if !s.v3.verfs.match(s.FS.FileID(p), verf) {
+		if !s.v3.verfs.match(s.FS.IDOf(p, info), verf) {
 			return stExist
 		}
 	case sa.setSize:
-		id := s.FS.FileID(p)
+		id := s.FS.IDOf(p, info)
 		res.beginSize(id, sa.size)
 		s.Recall(id)
 		st := s.apply3(p, &sattr3{size: sa.size, setSize: true})
@@ -150,7 +157,7 @@ func (s *Server) exists3(res *encoder, dir, p string, info os.FileInfo, how uint
 		}
 		res.acceptSize()
 	}
-	return s.created3(res, dir, p)
+	return s.created3(res, dirID, dir, p)
 }
 
 // createVerfs remembers the verifiers of recent EXCLUSIVE creates by file
@@ -189,13 +196,13 @@ func (c *createVerfs) match(id uint64, verf [8]byte) bool {
 
 // mkdir3 answers MKDIR (section 3.3.9).
 func (s *Server) mkdir3(d *decoder, res *encoder) status {
-	id, ok := d.fh(maxFH3)
+	id, gen, ok := d.fh(maxFH3)
 	name := d.str(maxPath3)
 	sa := decodeSattr3(d)
 	if d.err != nil {
 		return stInval
 	}
-	dir, _, st := s.dir3(id, ok, name, stExist)
+	dir, _, st := s.dir3(id, gen, ok, name, stExist)
 	if st != stOK {
 		return st
 	}
@@ -213,20 +220,20 @@ func (s *Server) mkdir3(d *decoder, res *encoder) status {
 	if st := s.apply3(p, &sa); st != stOK {
 		return st
 	}
-	return s.created3(res, dir, p)
+	return s.created3(res, id, dir, p)
 }
 
 // symlink3 answers SYMLINK (section 3.3.10). A dangling link is an existing
 // name too.
 func (s *Server) symlink3(d *decoder, res *encoder) status {
-	id, ok := d.fh(maxFH3)
+	id, gen, ok := d.fh(maxFH3)
 	name := d.str(maxPath3)
 	sa := decodeSattr3(d)
 	target := d.str(maxPath3)
 	if d.err != nil {
 		return stInval
 	}
-	dir, _, st := s.dir3(id, ok, name, stExist)
+	dir, _, st := s.dir3(id, gen, ok, name, stExist)
 	if st != stOK {
 		return st
 	}
@@ -240,12 +247,12 @@ func (s *Server) symlink3(d *decoder, res *encoder) status {
 	if st := s.apply3(p, &sa); st != stOK {
 		return st
 	}
-	return s.created3(res, dir, p)
+	return s.created3(res, id, dir, p)
 }
 
 // mknod3 creates sockets and FIFOs; device nodes remain unsupported.
 func (s *Server) mknod3(d *decoder, res *encoder) status {
-	id, ok := d.fh(maxFH3)
+	id, gen, ok := d.fh(maxFH3)
 	name := d.str(maxPath3)
 	typ := fileType(d.u32())
 	var sa sattr3
@@ -265,7 +272,7 @@ func (s *Server) mknod3(d *decoder, res *encoder) status {
 	if d.err != nil {
 		return stInval
 	}
-	dir, _, st := s.dir3(id, ok, name, stExist)
+	dir, _, st := s.dir3(id, gen, ok, name, stExist)
 	if st != stOK {
 		return st
 	}
@@ -294,7 +301,7 @@ func (s *Server) mknod3(d *decoder, res *encoder) status {
 	if st := s.apply3(p, &sa); st != stOK {
 		return st
 	}
-	return s.created3(res, dir, p)
+	return s.created3(res, id, dir, p)
 }
 
 // remove3 answers REMOVE (section 3.3.12).
@@ -307,12 +314,12 @@ func (s *Server) rmdir3(d *decoder, res *encoder) status { return s.unlink3(d, r
 // recalling NFSv4 delegations of it. Entries are examined
 // without following symlinks, so REMOVE takes a link to a directory.
 func (s *Server) unlink3(d *decoder, res *encoder, isDir bool) status {
-	id, ok := d.fh(maxFH3)
+	id, gen, ok := d.fh(maxFH3)
 	name := d.str(maxPath3)
 	if d.err != nil {
 		return stInval
 	}
-	dir, dinfo, st := s.dir3(id, ok, name, stInval)
+	dir, dinfo, st := s.dir3(id, gen, ok, name, stInval)
 	if st != stOK {
 		return st
 	}
@@ -336,7 +343,7 @@ func (s *Server) unlink3(d *decoder, res *encoder, isDir bool) status {
 			return stNotEmpty
 		}
 	}
-	fid := s.FS.FileID(p)
+	fid := s.FS.IDOf(p, info)
 	if fid == 0 {
 		return stIO
 	}
@@ -353,30 +360,30 @@ func (s *Server) unlink3(d *decoder, res *encoder, isDir bool) status {
 // rename3 answers RENAME (section 3.3.14), after recalling NFSv4
 // delegations of the moved file and of any file it replaces.
 func (s *Server) rename3(d *decoder, res *encoder) status {
-	fromID, fromOK := d.fh(maxFH3)
+	fromID, fromGen, fromOK := d.fh(maxFH3)
 	fromName := d.str(maxPath3)
-	toID, toOK := d.fh(maxFH3)
+	toID, toGen, toOK := d.fh(maxFH3)
 	toName := d.str(maxPath3)
 	if d.err != nil {
 		return stInval
 	}
-	fromDir, fromInfo, st := s.dir3(fromID, fromOK, fromName, stInval)
+	fromDir, fromInfo, st := s.dir3(fromID, fromGen, fromOK, fromName, stInval)
 	if st != stOK {
 		return st
 	}
-	toDir, toInfo, st := s.dir3(toID, toOK, toName, stInval)
+	toDir, toInfo, st := s.dir3(toID, toGen, toOK, toName, stInval)
 	if st != stOK {
 		return st
 	}
 	fromPre, toPre := attrsOf(fromID, fromInfo), attrsOf(toID, toInfo)
 	from, to := path.Join(fromDir, fromName), path.Join(toDir, toName)
-	// Look before taking an id, so a missing source allocates none.
-	if _, err := s.FS.Lstat(from); err != nil {
+	fromEntry, err := s.FS.Lstat(from)
+	if err != nil {
 		return statusOf(err)
 	}
-	moved, replaced := s.FS.FileID(from), uint64(0)
-	if _, err := s.FS.Lstat(to); err == nil {
-		replaced = s.FS.FileID(to)
+	moved, replaced := s.FS.IDOf(from, fromEntry), uint64(0)
+	if toEntry, err := s.FS.Lstat(to); err == nil {
+		replaced = s.FS.IDOf(to, toEntry)
 	}
 	recall := func() {
 		s.Recall(moved)
@@ -385,7 +392,7 @@ func (s *Server) rename3(d *decoder, res *encoder) status {
 		}
 	}
 	recall()
-	err := s.FS.Rename(from, to)
+	err = s.FS.Rename(from, to)
 	recall()
 	if err != nil {
 		return statusOf(err)
@@ -401,17 +408,17 @@ func (s *Server) rename3(d *decoder, res *encoder) status {
 // cannot be linked (PERM). The file's delegations are recalled, since its
 // link count changes.
 func (s *Server) link3(d *decoder, res *encoder) status {
-	id, ok := d.fh(maxFH3)
-	dirID, dirOK := d.fh(maxFH3)
+	id, gen, ok := d.fh(maxFH3)
+	dirID, dirGen, dirOK := d.fh(maxFH3)
 	name := d.str(maxPath3)
 	if d.err != nil {
 		return stInval
 	}
-	p, st := s.path3(id, ok)
+	p, st := s.path3(id, gen, ok)
 	if st != stOK {
 		return st
 	}
-	dir, dinfo, st := s.dir3(dirID, dirOK, name, stExist)
+	dir, dinfo, st := s.dir3(dirID, dirGen, dirOK, name, stExist)
 	if st != stOK {
 		return st
 	}

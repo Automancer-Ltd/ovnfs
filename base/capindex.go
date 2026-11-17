@@ -264,6 +264,14 @@ func (x *captureIndex) nameOf(n uint32) string {
 	return s
 }
 
+// pathOf returns a copy of node n's root-relative path.
+func (x *captureIndex) pathOf(n uint32) string {
+	start, _, end := x.span(n)
+	s := string(x.paths[start:end])
+	runtime.KeepAlive(x)
+	return s
+}
+
 // compareName compares node n's name with s.
 func (x *captureIndex) compareName(n uint32, s string) int {
 	_, name, end := x.span(n)

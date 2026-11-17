@@ -68,7 +68,6 @@ const (
 	fdiCreationTime    = 8
 	fdiLastAccessTime  = 16
 	fdiLastWriteTime   = 24
-	fdiChangeTime      = 32
 	fdiEndOfFile       = 40
 	fdiFileAttributes  = 56
 	fdiFileNameLength  = 60

@@ -191,14 +191,15 @@ func (f *v4fsstat) get(s *Server) error {
 // but the write-only.
 func reported4(req v4bitmap) v4bitmap { return req.and(attr4Supported).andNot(attr4WriteOnly) }
 
-// putAttrs4 appends the fattr4 of the file a describes: the requested
-// attributes this server reports, and their values.
-func (s *Server) putAttrs4(e *encoder, a *attrs, req v4bitmap, fs *v4fsstat) status {
+// putAttrs4 appends the fattr4 of the file a describes, whose handle has
+// generation gen: the requested attributes this server reports, and their
+// values.
+func (s *Server) putAttrs4(e *encoder, a *attrs, gen uint64, req v4bitmap, fs *v4fsstat) status {
 	mask := reported4(req)
 	mask.put(e)
 	at := e.len()
 	e.u32(0)
-	if st := s.putAttrVals4(e, a, mask, fs); st != stOK {
+	if st := s.putAttrVals4(e, a, gen, mask, fs); st != stOK {
 		return st
 	}
 	e.put32(at, uint32(e.len()-at-4))
@@ -206,8 +207,9 @@ func (s *Server) putAttrs4(e *encoder, a *attrs, req v4bitmap, fs *v4fsstat) sta
 }
 
 // putAttrVals4 appends the values of the attributes in mask, which must be
-// reportable ones, as a fattr4's attr_vals holds them.
-func (s *Server) putAttrVals4(e *encoder, a *attrs, mask v4bitmap, fs *v4fsstat) status {
+// reportable ones, as a fattr4's attr_vals holds them; gen is the
+// generation of a's handle (FATTR4_FILEHANDLE).
+func (s *Server) putAttrVals4(e *encoder, a *attrs, gen uint64, mask v4bitmap, fs *v4fsstat) status {
 	if mask.intersects(attr4Space) {
 		if err := fs.get(s); err != nil {
 			return statusOf(err)
@@ -221,7 +223,7 @@ func (s *Server) putAttrVals4(e *encoder, a *attrs, mask v4bitmap, fs *v4fsstat)
 		case attr4Type:
 			e.u32(uint32(a.typ))
 		case attr4FHExpireType:
-			e.u32(0) // FH4_PERSISTENT: handles are file ids
+			e.u32(0) // FH4_PERSISTENT: handles are file ids and generations
 		case attr4Change:
 			e.u64(v4Change(a))
 		case attr4Size, attr4SpaceUsed:
@@ -241,7 +243,7 @@ func (s *Server) putAttrVals4(e *encoder, a *attrs, mask v4bitmap, fs *v4fsstat)
 		case attr4ACLSupport:
 			e.u32(0)
 		case attr4FileHandle:
-			e.fh(a.fileid)
+			e.fh(a.fileid, gen)
 		case attr4FileID, attr4MountedOnFileID:
 			e.u64(a.fileid)
 		case attr4FilesAvail, attr4FilesFree:
@@ -327,7 +329,7 @@ func v4Change(a *attrs) uint64 {
 
 // changeAt4 is the change attribute of the file at p, 0 if it is gone.
 func (s *Server) changeAt4(p string) uint64 {
-	a, err := s.stat(s.FS.FileID(p), p)
+	a, err := s.statAt(p)
 	if err != nil {
 		return 0
 	}
@@ -424,7 +426,7 @@ func (s *Server) apply4(p string, sa *v4sattr, kept billy.File) status {
 	if sa.mask == (v4bitmap{}) {
 		return stOK
 	}
-	a, err := s.stat(s.FS.FileID(p), p)
+	a, err := s.statAt(p)
 	if err != nil {
 		return statusOf(err)
 	}

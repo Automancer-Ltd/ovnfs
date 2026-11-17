@@ -469,16 +469,11 @@ func statusRows(st api.Status, clientVersion string) [][2]string {
 		rows = append(rows, [2]string{"memory error", fmt.Sprintf("%d parked: %s", st.MemoryParked, st.MemoryError)})
 	}
 	rows = append(rows, [][2]string{
-		{"node cache", usage(st.NodeCache, "current directory")},
-		{"node index", humanBytes(st.NodeIndexBytes)},
 		{"blob cache", usage(st.BlobCache, "off")},
 		{"go heap", humanBytes(st.HeapLive) + " live, " + humanBytes(st.HeapInUse) + " in use, " + humanBytes(st.GoHeld) + " held"},
 	}...)
 	if st.Footprint != 0 {
 		rows = append(rows, [2]string{"footprint", humanBytes(st.Footprint)})
-	}
-	if st.NodeCacheError != "" {
-		rows = append(rows, [2]string{"node cache error", st.NodeCacheError})
 	}
 	return rows
 }

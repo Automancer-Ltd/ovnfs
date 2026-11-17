@@ -29,17 +29,13 @@ func (s *Server) mount(c *call, res *encoder) acceptStat {
 		if d.err != nil {
 			break
 		}
-		if identityError(s.FS) != nil {
-			res.u32(uint32(stIO))
-			break
-		}
 		id := s.FS.FileID("")
-		if id == 0 || identityError(s.FS) != nil {
+		if id == 0 {
 			res.u32(uint32(stIO))
 			break
 		}
 		res.u32(0) // MNT3_OK
-		res.fh(id)
+		res.fh(id, s.FS.Generation(id))
 		res.u32(1) // one auth flavor
 		res.u32(authNone)
 	case mntDump:

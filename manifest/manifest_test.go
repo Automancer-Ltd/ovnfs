@@ -200,7 +200,7 @@ func TestUserDaemon(t *testing.T) {
 }
 
 func TestDaemonSettingsUserOnlyAndTypes(t *testing.T) {
-	for _, key := range []string{"proto", "memory", "fsync", "blob_cache", "node_cache", "atime", "nfs_io_size"} {
+	for _, key := range []string{"proto", "memory", "fsync", "blob_cache", "atime", "nfs_io_size"} {
 		t.Run(key, func(t *testing.T) {
 			root := t.TempDir()
 			writeManifest(t, root, key+": value\n")

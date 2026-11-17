@@ -11,25 +11,6 @@ import (
 	"github.com/go-git/go-billy/v5"
 )
 
-// TestFailedRenameDoesNotLogAncestors keeps failed probes from accumulating
-// logged identities for destination directories which do not exist.
-func TestFailedRenameDoesNotLogAncestors(t *testing.T) {
-	n := newMetadataTestFS(t)
-	f, err := n.Create("source")
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.Close()
-	n.nodes.id("source")
-	before, next := len(n.nodes.byID), n.nodes.next
-	if err := n.Rename("source", "missing/deep/destination"); !os.IsNotExist(err) {
-		t.Fatalf("rename: %v", err)
-	}
-	if len(n.nodes.byID) != before || n.nodes.next != next {
-		t.Fatal("failed rename logged nonexistent ancestors")
-	}
-}
-
 // TestRenameMetadataByProtocol covers the metadata clients see when a linker
 // replaces its output while keeping the temporary file open. Only NFS needs
 // a synthetic mtime change; SMB and inode-based frontends must preserve it.
@@ -37,7 +18,7 @@ func TestRenameMetadataByProtocol(t *testing.T) {
 	for _, protocol := range []string{"SMB", "Nodes", "NFS"} {
 		for name, mode := range map[string]os.FileMode{"executable": 0o755, "archive": 0o644} {
 			t.Run(protocol+"/"+name, func(t *testing.T) {
-				e := &Export{fs: newMetadataTestFS(t)}
+				e := newTestExport(t)
 				var fs billy.Filesystem
 				var change billy.Change
 				switch protocol {
@@ -52,7 +33,7 @@ func TestRenameMetadataByProtocol(t *testing.T) {
 					fs, change = backend, backend
 				}
 
-				const from, to = "output.tmp", "output"
+				const from, to = "co/output.tmp", "co/output"
 				f, err := fs.OpenFile(from, os.O_CREATE|os.O_RDWR, mode)
 				if err != nil {
 					t.Fatal(err)

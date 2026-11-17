@@ -245,7 +245,7 @@ func TestV4VerifyAndNVerify(t *testing.T) {
 		r.skip(op4PutRootFH, op4Lookup)
 		r.next(tc.op, tc.want)
 		if tc.want == stOK {
-			r.next(op4GetFH, stOK).fh(8)
+			r.next(op4GetFH, stOK).fh(fhSize)
 		}
 		r.end()
 	}

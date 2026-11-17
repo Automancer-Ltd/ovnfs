@@ -491,7 +491,7 @@ func assertIndexMatchesDisk(t *testing.T, f *FS) {
 		if !ok || got.Kind != want.Kind || got.Opaque != want.Opaque {
 			t.Fatalf("index mismatch at %s: %+v != %+v", p, got, want)
 		}
-		if want.Info != nil && (!sameFile(got.Info, want.Info) || got.Info.Name() != want.Info.Name()) {
+		if want.Info != nil && (!sameEntry(got.Info, want.Info) || got.Info.Name() != want.Info.Name()) {
 			t.Fatalf("stale inode or name at %s", p)
 		}
 		if !reflect.DeepEqual(slices.Sorted(maps.Keys(disk.children[p])), slices.Sorted(maps.Keys(f.index.children[p]))) {

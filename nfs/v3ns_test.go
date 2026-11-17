@@ -70,8 +70,11 @@ func xdrOpaque(dst, b []byte) []byte {
 	return append(dst, make([]byte, -len(b)&3)...)
 }
 
-// handle is the wire form of file id's handle.
-func handle(id uint64) []byte { return binary.BigEndian.AppendUint64(nil, id) }
+// handle is the wire form of file id's handle at generation 0, which
+// testFS ids have until RetireHandle.
+func handle(id uint64) []byte {
+	return binary.BigEndian.AppendUint64(binary.BigEndian.AppendUint64(nil, id), 0)
+}
 
 // raw appends pre-encoded arguments.
 func raw(b []byte) func(*encoder) { return func(e *encoder) { e.buf = append(e.buf, b...) } }
@@ -142,10 +145,10 @@ func TestV3Rename(t *testing.T) {
 	if len(d.buf) != 0 {
 		t.Fatal("trailing bytes")
 	}
-	if p, ok := fs.Path(moved); !ok || p != "d/b" {
+	if p, ok := fs.Path(moved, 0); !ok || p != "d/b" {
 		t.Fatalf("moved file's handle resolves to %q %v", p, ok)
 	}
-	if _, ok := fs.Path(replaced); ok {
+	if _, ok := fs.Path(replaced, 0); ok {
 		t.Fatal("replaced file's handle still resolves")
 	}
 	if got, _ := os.ReadFile(fs.host("d/b")); string(got) != "moved" {
@@ -338,14 +341,14 @@ func TestSymlinkModeDoesNotFollowDanglingTarget(t *testing.T) {
 	}
 
 	link := fs.FileID("link")
-	if st, _ := c.v3call(v3SetAttr, func(e *encoder) { e.fh(link); modeSattr(e, 0o600); e.u32(0) }); st != stOK {
+	if st, _ := c.v3call(v3SetAttr, func(e *encoder) { e.fh(link, 0); modeSattr(e, 0o600); e.u32(0) }); st != stOK {
 		t.Fatalf("SETATTR mode of a symlink: %d", st)
 	}
 	if n := fs.chmods.Load(); n != 0 {
 		t.Fatalf("SETATTR called Chmod %d times for a symlink", n)
 	}
 	st, _ := c.v3call(v3SetAttr, func(e *encoder) {
-		e.fh(link)
+		e.fh(link, 0)
 		for _, v := range []uint32{0, 0, 0, 1, 0, 0, 0, 0} { // size 0
 			e.u32(v)
 		}

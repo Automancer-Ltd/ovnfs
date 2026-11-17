@@ -213,7 +213,7 @@ func assertFrozenIndexMatchesDisk(t *testing.T, frozen *Layer) {
 			if !reflect.DeepEqual(stableSystemInfo(got.Info), stableSystemInfo(want.Info)) {
 				t.Fatalf("system metadata differs at %q: %v != %v", p, stableSystemInfo(got.Info), stableSystemInfo(want.Info))
 			}
-			if got.Info.Name() != want.Info.Name() || got.Info.Size() != want.Info.Size() || got.Info.Mode() != want.Info.Mode() || !got.Info.ModTime().Equal(want.Info.ModTime()) || got.Info.IsDir() != want.Info.IsDir() || !sameFile(got.Info, want.Info) {
+			if got.Info.Name() != want.Info.Name() || got.Info.Size() != want.Info.Size() || got.Info.Mode() != want.Info.Mode() || !got.Info.ModTime().Equal(want.Info.ModTime()) || got.Info.IsDir() != want.Info.IsDir() || !sameEntry(got.Info, want.Info) {
 				t.Fatalf("metadata %q: got %s %d %s %v; want %s %d %s %v", p, got.Info.Name(), got.Info.Size(), got.Info.Mode(), got.Info.ModTime(), want.Info.Name(), want.Info.Size(), want.Info.Mode(), want.Info.ModTime())
 			}
 		}

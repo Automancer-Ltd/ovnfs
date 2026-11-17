@@ -87,9 +87,8 @@ func (d *decoder) opaque(limit int) []byte {
 func (d *decoder) str(limit int) string { return string(d.opaque(limit)) }
 
 // fh reads a file handle (nfs_fh3, nfs_fh4) of at most limit bytes and
-// returns the file id it encodes; ok is false for a handle this server
-// cannot have issued.
-func (d *decoder) fh(limit int) (id uint64, ok bool) { return fileID(d.opaque(limit)) }
+// returns the file id and generation it encodes (handleOf).
+func (d *decoder) fh(limit int) (id, gen uint64, ok bool) { return handleOf(d.opaque(limit)) }
 
 // encoder appends XDR items to a reply.
 type encoder struct {
@@ -136,10 +135,12 @@ func (e *encoder) str(s string) {
 	e.buf = append(e.buf, zeros[:pad(len(s))]...)
 }
 
-// fh appends the file handle (nfs_fh3, nfs_fh4) of file id.
-func (e *encoder) fh(id uint64) {
+// fh appends the file handle (nfs_fh3, nfs_fh4) of file id at generation
+// gen, which callers take from Backend.Generation.
+func (e *encoder) fh(id, gen uint64) {
 	e.u32(fhSize)
 	e.u64(id)
+	e.u64(gen)
 }
 
 // opaqueFrom appends variable-length opaque data of at most n bytes that

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"syscall"
 
+	"github.com/stencil-hq/ovnfs/internal/ident"
 	"golang.org/x/sys/windows"
 )
 
@@ -31,26 +32,8 @@ type modeInfo struct {
 // Mode returns the stored Unix mode with the host's type bits.
 func (i modeInfo) Mode() os.FileMode { return i.mode }
 
-// rawInfo returns the host's own metadata beneath an alias name and a stored mode.
-func rawInfo(info os.FileInfo) os.FileInfo {
-	info = unalias(info)
-	if m, ok := info.(modeInfo); ok {
-		return m.FileInfo
-	}
-	return info
-}
-
-// sameFile is [os.SameFile] for metadata that may carry an alias name or a stored mode.
-func sameFile(a, b os.FileInfo) bool { return os.SameFile(rawInfo(a), rawInfo(b)) }
-
-// hostLstat is [os.Lstat] with the stored mode of an upper or layer file.
-func hostLstat(name string) (os.FileInfo, error) {
-	info, err := os.Lstat(name)
-	if err != nil {
-		return nil, err
-	}
-	return withMode(name, info)
-}
+// Identity forwards the identity of the metadata beneath the stored mode.
+func (i modeInfo) Identity() ident.ID { id, _ := ident.Of(i.FileInfo); return id }
 
 // defaultPerm is the mode a file or directory without a mode stream reports:
 // owner-writable unless the read-only attribute is set.
@@ -84,14 +67,15 @@ func withMode(name string, info os.FileInfo) (os.FileInfo, error) {
 	return modeInfo{FileInfo: info, mode: m&os.ModeType | perm}, nil
 }
 
-// lstatIndexed is [os.Lstat] for an upper entry whose mode the index already
-// holds (indexed): only data and times change without the overlay knowing.
+// lstatIndexed is [os.Lstat] for an upper entry whose mode and identity the
+// index already holds (indexed): only data and times change without the
+// overlay knowing.
 func lstatIndexed(name string, indexed os.FileInfo) (os.FileInfo, error) {
 	info, err := os.Lstat(name)
 	if err != nil || indexed == nil || indexed.Mode().Type() != info.Mode().Type() {
 		return info, err
 	}
-	return modeInfo{FileInfo: info, mode: indexed.Mode()}, nil
+	return keepIdentity(modeInfo{FileInfo: info, mode: indexed.Mode()}, indexed), nil
 }
 
 // readMode reads name's mode stream; ok is false when it has none.

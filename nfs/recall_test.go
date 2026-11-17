@@ -22,7 +22,7 @@ func TestV3ChangesRecallV4Delegations(t *testing.T) {
 		return holder.mustDelegate("o-"+name, name), fs.FileID(name)
 	}
 	dirop := func(e *encoder, name string) {
-		e.fh(1)
+		e.fh(1, 0)
 		e.str(name)
 	}
 	type recalled struct {
@@ -55,7 +55,7 @@ func TestV3ChangesRecallV4Delegations(t *testing.T) {
 
 	id, file = delegate("chmodded")
 	if st, _ := v3.v3call(v3SetAttr, func(e *encoder) {
-		e.fh(file)
+		e.fh(file, 0)
 		e.u32(1) // set mode
 		e.u32(0o600)
 		for range 5 { // uid, gid, size, atime, mtime: unchanged
@@ -85,7 +85,7 @@ func TestV3ChangesRecallV4Delegations(t *testing.T) {
 
 	id, file = delegate("linked")
 	if st, _ := v3.v3call(v3Link, func(e *encoder) {
-		e.fh(file)
+		e.fh(file, 0)
 		dirop(e, "link")
 	}); st != stOK {
 		t.Fatalf("LINK: status %d", st)

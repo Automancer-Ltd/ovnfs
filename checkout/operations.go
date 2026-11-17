@@ -360,6 +360,7 @@ func (r *Registry) publishBase(ctx context.Context, name, id string, b *baseReco
 			} else {
 				delete(r.checkouts, name)
 				r.releaseLocked(b, nil)
+				r.dropCaches(h)
 			}
 		}
 	}
@@ -599,10 +600,15 @@ func (r *Registry) installCheckoutLocked(ctx context.Context, name string, b *ba
 	if err == nil {
 		err = r.installWorkspace(h, ws)
 	}
+	if err == nil {
+		err = r.addCheckoutLocked(name, h)
+	}
 	if err != nil {
+		if h != nil {
+			r.dropCaches(h)
+		}
 		return nil, err
 	}
-	r.checkouts[name] = h
 	r.retainLocked(b, stack)
 	return h, nil
 }
@@ -613,7 +619,7 @@ func (r *Registry) installCheckoutLocked(ctx context.Context, name string, b *ba
 // carry (installGitfiles), so with an empty stack it runs without r.mu while the
 // name is reserved; owners are lineageCheckoutsLocked's for parent. An empty name
 // prepares a checkout to be named later (see namePrepared): its git directory is
-// not marked yet.
+// not marked yet, and it reads no cache snapshot until then (see useCaches).
 func (r *Registry) prepareCheckout(name, dir string, b *baseRecord, layers []*overlay.Layer, stack []string, parent *string, gs gitSource, owners map[string]bool) (*checkoutRecord, error) {
 	upper := r.upperPath(dir)
 	if err := os.MkdirAll(upper, 0o755); err != nil {
@@ -645,22 +651,26 @@ func (r *Registry) prepareCheckout(name, dir string, b *baseRecord, layers []*ov
 			return nil, err
 		}
 	}
-	created := time.Now().UTC()
-	fs, err := overlay.New(upper, layers, b.view.Bottom(created), r.config.Memory)
-	if err != nil {
-		return nil, err
+	h := &checkoutRecord{meta: checkoutMeta{Name: name, Base: b.view.Meta().ID, Parent: copyString(parent), Git: hasGit, Created: time.Now().UTC()}, base: b, stack: append([]string{}, stack...), upper: upper}
+	if dir != name {
+		h.meta.Dir = dir
 	}
-	var copied map[string]copiedDir
-	if hasGit {
-		if copied, err = r.installGitfiles(fs, name, dir, b.view, owners); err != nil {
+	if name != "" {
+		caches, err := r.useCaches(b)
+		if err != nil {
 			return nil, err
 		}
+		h.setCaches(caches)
 	}
-	meta := checkoutMeta{Name: name, Base: b.view.Meta().ID, Parent: copyString(parent), Git: hasGit, Created: created, Copied: copied}
-	if dir != name {
-		meta.Dir = dir
+	fs, err := overlay.New(upper, layers, b.view.Bottom(h.caches), r.config.Memory)
+	if err == nil && hasGit {
+		h.meta.Copied, err = r.installGitfiles(fs, name, dir, b.view, owners)
 	}
-	h := &checkoutRecord{meta: meta, base: b, stack: append([]string{}, stack...), upper: upper, fs: fs}
+	if err != nil {
+		r.dropCaches(h)
+		return nil, err
+	}
+	h.fs = fs
 	h.generation.Store(1)
 	return h, nil
 }
@@ -907,6 +917,7 @@ func (r *Registry) createFromSnapshotLocked(ctx context.Context, name string, s 
 		}
 		delete(r.checkouts, name)
 		r.releaseLocked(s.base, s.stack)
+		r.dropCaches(h)
 	}
 	return nil, errors.Join(err, r.removeCheckoutFiles(name), r.persistLocked())
 }
@@ -1265,7 +1276,7 @@ func (r *Registry) freezeLocked(ctx context.Context, h *checkoutRecord, label st
 		if renamed {
 			layers, e := r.layerStackLocked(oldStack, h.meta.Base)
 			if e == nil {
-				h.fs, e = overlay.New(h.upper, layers, h.base.view.Bottom(h.meta.Created), r.config.Memory)
+				h.fs, e = overlay.New(h.upper, layers, h.base.view.Bottom(h.caches), r.config.Memory)
 			}
 			rollbackErr = errors.Join(rollbackErr, e)
 		}
@@ -1313,7 +1324,7 @@ func (r *Registry) freezeLocked(ctx context.Context, h *checkoutRecord, label st
 				return rollback(err)
 			}
 		}
-		fresh, freshErr := overlay.New(h.upper, layers, h.base.view.Bottom(h.meta.Created), r.config.Memory)
+		fresh, freshErr := overlay.New(h.upper, layers, h.base.view.Bottom(h.caches), r.config.Memory)
 		if freshErr != nil {
 			return rollback(freshErr)
 		}
@@ -1382,14 +1393,16 @@ func (r *Registry) remove(ctx context.Context, name string, picked time.Time, st
 	}
 	h.retired.Store(true)
 	if r.config.Retire != nil {
-		r.config.Retire(name)
+		r.config.Retire(name, h.meta.Slot)
 	}
 	// Taken while the checkout still holds its base, which collection may close once released.
 	repo := localRepo(h.base)
 	h.fs.Discard()
 	h.fs.CloseFiles()
 	delete(r.checkouts, name)
+	delete(r.bySlot, h.meta.Slot)
 	r.reserved[name] = true
+	r.dropCaches(h)
 	r.releaseLocked(h.base, h.stack)
 	r.moveRootLocked()
 	seq := r.requestCommitLocked()
@@ -1575,7 +1588,7 @@ func (r *Registry) scheduleHashesLocked() {
 			r.finishHashLocked(s, "", err)
 			continue
 		}
-		view, err := overlay.New("", stack, s.base.view.Bottom(time.Time{}), nil)
+		view, err := overlay.New("", stack, s.base.view.Bottom(nil), nil)
 		if err != nil {
 			r.finishHashLocked(s, "", err)
 			continue

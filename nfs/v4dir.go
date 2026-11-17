@@ -127,12 +127,16 @@ func (x *v4compound) readdir() status {
 			v4bitmap{}.put(x.e)
 			x.e.u32(0)
 		} else {
-			id := x.s.FS.ChildID(cur.path, info.Name())
+			id := x.s.FS.ChildID(cur.path, info)
 			if id == 0 {
 				return stIO
 			}
 			a := attrsOf(id, info)
-			if s := x.s.putAttrs4(x.e, &a, req, &fs); s != stOK {
+			var gen uint64
+			if req.has(attr4FileHandle) {
+				gen = x.s.FS.Generation(id)
+			}
+			if s := x.s.putAttrs4(x.e, &a, gen, req, &fs); s != stOK {
 				return s
 			}
 		}
@@ -238,7 +242,7 @@ func (x *v4compound) create() status {
 	if s != stOK {
 		return s
 	}
-	x.setCurrent(p)
+	x.setCurrent(x.s.FS.FileID(p), p)
 	cinfo.put(x.e)
 	sa.mask.put(x.e)
 	return stOK
@@ -307,7 +311,8 @@ func (x *v4compound) rename() status {
 	if s := x.s.dir4(dst.path); s != stOK {
 		return s
 	}
-	if _, s := x.conflictName(src.path, from); s != stOK {
+	moved, s := x.conflictName(src.path, from)
+	if s != stOK {
 		return s
 	}
 	replaced, s := x.conflictName(dst.path, to)
@@ -331,8 +336,8 @@ func (x *v4compound) rename() status {
 	if replaced != 0 {
 		x.changed(replaced)
 	}
-	if x.s.v4.active() {
-		x.changed(x.s.FS.FileID(newPath))
+	if moved != 0 {
+		x.changed(moved)
 	}
 	srcInfo.put(x.e)
 	dstInfo.put(x.e)

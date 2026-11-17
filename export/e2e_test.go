@@ -54,9 +54,9 @@ func newStackWithMemory(t *testing.T, files map[string]string, memory *overlay.M
 	}
 	state, mount := t.TempDir(), t.TempDir()
 	var e *exportfs.Export
-	reg, err := checkout.Open(checkout.Config{State: state, Mount: mount, Memory: memory, BlobCache: 64 << 20, Retire: func(name string) {
+	reg, err := checkout.Open(checkout.Config{State: state, Mount: mount, Memory: memory, BlobCache: 64 << 20, Retire: func(name string, slot uint16) {
 		if e != nil {
-			e.Retire(name)
+			e.Retire(name, slot)
 		}
 	}})
 	if err != nil {
@@ -67,15 +67,7 @@ func newStackWithMemory(t *testing.T, files map[string]string, memory *overlay.M
 			t.Error(err)
 		}
 	})
-	e, err = exportfs.New(exportfs.NewRouter(reg), filepath.Join(state, "nodes.log"), state, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := e.Close(); err != nil {
-			t.Error(err)
-		}
-	})
+	e = exportfs.New(exportfs.NewRouter(reg), state)
 	return &stackFixture{reg: reg, export: e, lower: lower, state: state}
 }
 

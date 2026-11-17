@@ -35,9 +35,9 @@ func exportFixture(t *testing.T) (*export.Export, string, string) {
 	reg, err := checkout.Open(checkout.Config{
 		State: state,
 		Mount: filepath.Join(dir, "mount"),
-		Retire: func(name string) {
+		Retire: func(name string, slot uint16) {
 			if exported != nil {
-				exported.Retire(name)
+				exported.Retire(name, slot)
 			}
 		},
 	})
@@ -48,16 +48,8 @@ func exportFixture(t *testing.T) (*export.Export, string, string) {
 		if err := reg.Close(); err != nil {
 			t.Errorf("close registry: %v", err)
 		}
-		if exported != nil {
-			if err := exported.Close(); err != nil {
-				t.Errorf("close export: %v", err)
-			}
-		}
 	})
-	exported, err = export.New(export.NewRouter(reg), filepath.Join(state, "nodes.log"), state, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	exported = export.New(export.NewRouter(reg), state)
 	reply, err := reg.New(context.Background(), api.NewArgs{Dir: src, Name: "vm"})
 	if err != nil {
 		t.Fatalf("new checkout: %v", err)
@@ -98,7 +90,7 @@ func serveExport(t *testing.T, share remotefs.Share, opts remotefs.Options) *rem
 }
 
 // TestExportCheckoutOverRemoteFS drives a real checkout through the VMM's op set and
-// checks copy-on-write isolation and node ids that follow renames.
+// checks copy-on-write isolation and file ids that follow renames.
 func TestExportCheckoutOverRemoteFS(t *testing.T) {
 	e, name, src := exportFixture(t)
 	nodes := e.Nodes()
@@ -159,7 +151,7 @@ func TestExportCheckoutOverRemoteFS(t *testing.T) {
 		t.Fatalf("rename: %v", err)
 	}
 	if got := nodes.ID(name + "/out/b.txt"); got != id {
-		t.Fatalf("node id after rename = %d, want %d", got, id)
+		t.Fatalf("file id after rename = %d, want %d", got, id)
 	}
 	if err := c.Unlink("out/b.txt"); err != nil {
 		t.Fatalf("unlink: %v", err)

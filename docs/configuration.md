@@ -61,32 +61,43 @@ Opening a folder classifies every path into one of four classes:
 | class | in the checkout | in a snapshot | on another machine |
 | --- | --- | --- | --- |
 | `source` | as captured at open | hashed: the snapshot's identity | sent by content id |
-| `cache` | the folder, live until the checkout writes the path | not hashed | an empty directory, rebuilt there |
-| `local` | the folder, live until the checkout writes the path | not hashed | absent |
+| `cache` | a snapshot of the folder's, copy-on-write | not hashed | an empty directory, rebuilt there |
+| `local` | a snapshot of the folder's, copy-on-write | not hashed | absent |
 | `hidden` | absent | — | absent |
 
-Nothing is copied to make this view. A source file is the folder's own file
-while its size, mtime and inode still match the capture, and its captured
-content (from the store or the repository's objects) once they do not; a file
-the user adds later stays out. Local paths are the folder as it is now. Cache
-paths are too, minus every file the folder changed or added after the checkout
-opened (directories stay): build tools such as cargo trust mtimes, so output
-the folder rebuilt would pass for the checkout's own and link the folder's
-code. Hidden, it is rebuilt; untouched output stays warm, and a deleted cache
-directory costs a full rebuild. A file's change time decides, which content,
-metadata and renames move and no tool sets back. Writes in the checkout copy
-up into its own upper, so the folder is never
-written: a cache or local path the checkout wrote or deleted is its own from
-then on, no longer follows the folder, and is ignored by `diff` and `apply`.
+Nothing is copied to make the source view. A source file is the folder's own
+file while its size, mtime and inode still match the capture, and its
+captured content (from the store or the repository's objects) once they do
+not; a file the user adds later stays out.
+
+Cache and local paths never show the folder as it is now: each checkout
+reads a snapshot of the folder's cache and local roots that ovnfs owns, below
+`STATE/bases/BASE/caches/`. It clones the roots' whole trees, sharing their
+blocks (APFS clonefile, reflinks on Btrfs and XFS, block cloning on ReFS and
+Dev Drive), in the background: creating a checkout never waits for it, and
+the first access below a root waits until the snapshot is complete (about
+9 s for a 500,000-entry `target/` on APFS). A host build writing the folder
+afterwards changes no checkout, so build tools such as cargo, which trust
+mtimes, never mistake the folder's newer output for the checkout's own. A
+checkout opened after the folder changed below those roots gets a newer
+snapshot; one opened while they did not change, as the folder watcher reports
+it, shares the newest. A snapshot goes once no checkout uses it.
+
+Where the state cannot share the folder's blocks (another volume than the
+folder, a filesystem without cloning) or cloning fails, cache directories
+start empty, as on another machine, and are rebuilt in the checkout; local
+paths are copied whole. Writes in the checkout copy up into its own upper, so
+the folder is never written: a cache or local path the checkout wrote or
+deleted is its own, and is ignored by `diff` and `apply`.
 
 Ignored directories (build output, scratch copies of repositories) are cache
-or local, so every checkout inherits them live, and each whole-tree walk
+or local, so every checkout gets a snapshot of them, and each whole-tree walk
 (`rsync`, `find`, `rg --no-ignore`) in each checkout repeats their metadata
 work. A `hidden DIR/` rule in `.o2/ovnfs.yml` leaves such a directory out of
 checkouts, `--rev` ones included.
 
 Python environments are hidden instead: their scripts and editable installs
-name the folder by absolute path, so a live one would run the folder's
+name the folder by absolute path, so a copied one would run the folder's
 interpreter and code. A checkout starts without them and creates its own
 (`uv sync`, or `uv run` on first use).
 
@@ -190,7 +201,6 @@ env:
 | `proto` | string | user file only: default file server protocol (`nfs`, `smb`, `fuse`, or `winfsp`) |
 | `memory` | size | user file only: memory budget for written files (default 64M) |
 | `fsync` | boolean | user file only: spill and sync memory-backed files on fsync |
-| `node_cache` | size | user file only: estimated cache budget for derived ids and directory listings (default 256M) |
 | `blob_cache` | size | user file only: memory budget for content-addressed blobs (default 16M) |
 | `atime` | boolean | user file only: allow access time updates |
 | `nfs_io_size` | size | user file only: NFS transfer size, power of two from 4K to 1M (default 128K; 0 uses default) |
@@ -219,7 +229,6 @@ proto: smb
 memory: 2G
 fsync: true
 blob_cache: 64M
-node_cache: 64M
 atime: false
 git_remotes: true
 ```
@@ -227,7 +236,7 @@ git_remotes: true
 For each setting, the explicit `serve` flag wins over its environment variable,
 which wins over the user file, which wins over the built-in default. The
 environment variables are `OVNFS_MEMORY`, `OVNFS_FSYNC`, `OVNFS_BLOB_CACHE`,
-`OVNFS_NODE_CACHE`, `OVNFS_ATIME` and `OVNFS_GIT_REMOTES`; `proto` has no environment variable.
+`OVNFS_ATIME` and `OVNFS_GIT_REMOTES`; `proto` has no environment variable.
 Serve settings take effect when the daemon starts; restart it after changing
 them.
 
@@ -249,7 +258,7 @@ ovnfs config edit --global
 
 The keys are `rules`, `cache.ROOT.rebuild`, `cache.ROOT.key`, `env.image`,
 `env.setup` and the daemon settings `state`, `mount`, `proto`, `memory`,
-`fsync`, `blob_cache`, `node_cache`, `atime`, `nfs_io_size` and `git_remotes`. A cache root may hold dots
+`fsync`, `blob_cache`, `atime`, `nfs_io_size` and `git_remotes`. A cache root may hold dots
 (`cache.web/.next.key`) and matches its entry however it is spelled
 (`cache.web/dist.rebuild` finds `./web/dist`). `rules`, `env.setup` and
 `cache.ROOT.key` take several values, one rule line or item each, and
@@ -296,12 +305,3 @@ source root is the home directory reads `~/.o2/ovnfs.yml` once, as its own
 file. Parsing is strict: unknown keys, a list for `rules`, wrong types and
 invalid predicates fail `new`, `explain` and `plan` with `FILE:LINE: message`,
 e.g. `.o2/ovnfs.yml:3: unknown key "env.imge"`.
-
-The node cache's ownership index lives below `STATE/nodes.log.cache`; a clean
-stop completes it for the next start, and it is reclaimed after a crash when the
-state lock is next acquired. Keep state
-on a disk-backed volume, since tmpfs uses RAM. `status` reports index bytes
-separately from estimated resident node-cache bytes. Failed spill writes leave
-existing handles usable and temporarily refuse fresh identity allocation while
-resident usage exceeds the budget. Invalidation that frees enough cache resumes
-normal listing admission; an unreadable authoritative index instead fails closed.

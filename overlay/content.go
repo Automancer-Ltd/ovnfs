@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/go-git/go-billy/v5"
+	"github.com/stencil-hq/ovnfs/internal/ident"
 )
 
 // Content is an open read-only regular file served by a [Bottom]: a host file,
@@ -31,10 +32,14 @@ func (byteContent) Close() error { return nil }
 type contentFile struct {
 	Content
 	name string
+	id   ident.ID
 }
 
 // Name returns the overlay-relative name.
 func (c *contentFile) Name() string { return c.name }
+
+// Identity returns the identity of the entry the file was opened as.
+func (c *contentFile) Identity() ident.ID { return c.id }
 
 // Write fails like a write to a read-only descriptor.
 func (c *contentFile) Write([]byte) (int, error) { return 0, c.badDescriptor("write") }
@@ -54,10 +59,11 @@ func (c *contentFile) badDescriptor(op string) error {
 }
 
 // wrapContent keeps host files on the ordinary descriptor path so locks and
-// descriptor-level calls still reach the OS.
-func wrapContent(c Content, name string) billy.File {
+// descriptor-level calls still reach the OS; id is the identity of the entry
+// opened.
+func wrapContent(c Content, name string, id ident.ID) billy.File {
 	if f, ok := c.(*os.File); ok {
-		return &file{File: f, name: name}
+		return &file{File: f, name: name, id: id}
 	}
-	return &contentFile{Content: c, name: name}
+	return &contentFile{Content: c, name: name, id: id}
 }

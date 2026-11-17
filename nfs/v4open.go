@@ -172,6 +172,7 @@ func (x *v4compound) open() status {
 	if !exists && !create {
 		return statusOf(err)
 	}
+	var id uint64
 	if exists {
 		switch {
 		case info.IsDir():
@@ -181,7 +182,7 @@ func (x *v4compound) open() status {
 		case !info.Mode().IsRegular():
 			return stInval
 		}
-		id := x.s.FS.FileID(p)
+		id = x.s.FS.IDOf(p, info)
 		a := attrsOf(id, info)
 		if claim == claim4Previous {
 			cinfo.before = v4Change(&a)
@@ -202,7 +203,7 @@ func (x *v4compound) open() status {
 
 	var kept billy.File
 	// Until st.keep owns a retained creation descriptor, every error path
-	// (including identity refusal after the backend commit) must close it.
+	// must close it.
 	defer func() {
 		if kept != nil {
 			kept.Close()
@@ -223,8 +224,10 @@ func (x *v4compound) open() status {
 		cinfo.after = cinfo.before
 	}
 
-	x.setCurrent(p)
-	id := x.cur.id
+	if !exists {
+		id = x.s.FS.FileID(p)
+	}
+	x.setCurrent(id, p)
 	if id == 0 {
 		return stIO
 	}
@@ -232,7 +235,13 @@ func (x *v4compound) open() status {
 		x.changed(id)
 	}
 	g := x.prepareDelegate(owner.client, claim, access, id, p)
-	sid, did, delegated, s := st.openDelegated(owner, id, access&share4AccessAll, g)
+	var gen uint64
+	if g != nil {
+		// Read after the grant began, so a retirement that recalls the
+		// file from here on refuses the grant (see v4Grant.changed).
+		gen = x.handleGen(&x.cur)
+	}
+	sid, did, delegated, s := st.openDelegated(owner, id, access&share4AccessAll, g, gen)
 	if s != stOK {
 		return s
 	}

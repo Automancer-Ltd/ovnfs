@@ -18,7 +18,7 @@ func (s *Server) readdirplus3(d *decoder, res *encoder) status { return s.list3(
 // added while the result stays within the client's byte budgets, measured on
 // the encoded reply; when not even one fits, the call fails TOOSMALL.
 func (s *Server) list3(d *decoder, res *encoder, plus bool) status {
-	id, ok := d.fh(maxFH3)
+	id, gen, ok := d.fh(maxFH3)
 	cookie := d.u64()
 	verf := d.u64()
 	r := dirReply3{s: s, res: res, plus: plus, base: res.len() - 4, dircount: math.MaxUint32}
@@ -29,7 +29,7 @@ func (s *Server) list3(d *decoder, res *encoder, plus bool) status {
 	if d.err != nil {
 		return stInval
 	}
-	p, st := s.path3(id, ok)
+	p, st := s.path3(id, gen, ok)
 	if st != stOK {
 		return st
 	}
@@ -67,15 +67,21 @@ func (s *Server) list3(d *decoder, res *encoder, plus bool) status {
 	}
 	if fits && cookie <= 1 {
 		up := parentOf(p)
-		upID := s.FS.FileID(up)
-		if upID == 0 {
-			return stIO
-		}
+		var upID uint64
 		var a *attrs
 		if plus {
-			if pa, err := s.stat(upID, up); err == nil {
-				a = &pa
+			info, err := s.FS.Lstat(up)
+			if err != nil {
+				return stIO
 			}
+			upID = s.FS.IDOf(up, info)
+			pa := attrsOf(upID, info)
+			a = &pa
+		} else {
+			upID = s.FS.FileID(up)
+		}
+		if upID == 0 {
+			return stIO
 		}
 		fits = r.add("..", 2, upID, a)
 	}
@@ -83,16 +89,18 @@ func (s *Server) list3(d *decoder, res *encoder, plus bool) status {
 	var lastName string
 	for i := start; fits && i < len(l.entries); i++ {
 		info := l.entries[i]
-		var child string
+		var childID uint64
 		if plus && cookie != 0 {
 			// Refresh before checking space: a vanished entry must not
 			// prevent a later, shorter name from fitting this page.
-			child = path.Join(p, info.Name())
+			child := path.Join(p, info.Name())
 			fresh, err := s.FS.Lstat(child)
 			if err != nil {
 				continue
 			}
-			info = fresh
+			info, childID = fresh, s.FS.IDOf(child, fresh)
+		} else {
+			childID = s.FS.ChildID(p, info)
 		}
 		var a attrs
 		if !r.room(info.Name(), &a) {
@@ -100,7 +108,6 @@ func (s *Server) list3(d *decoder, res *encoder, plus bool) status {
 			break
 		}
 		c := l.first + uint64(i)
-		childID := s.FS.ChildID(p, info.Name())
 		if childID == 0 {
 			return stIO
 		}
@@ -157,7 +164,7 @@ func (r *dirReply3) add(name string, cookie, id uint64, a *attrs) bool {
 		if a != nil {
 			postAttrs3(r.res, a)
 			r.res.bool(true)
-			r.res.fh(id)
+			r.res.fh(id, r.s.FS.Generation(id))
 		} else {
 			r.res.bool(false)
 			r.res.bool(false)
@@ -169,7 +176,7 @@ func (r *dirReply3) add(name string, cookie, id uint64, a *attrs) bool {
 	return true
 }
 
-// room checks encoded sizes before identity lookup or reply buffer growth.
+// room checks encoded sizes before the reply buffer grows.
 func (r *dirReply3) room(name string, a *attrs) bool {
 	entry := uint64(20 + len(name) + pad(len(name)))
 	extra := uint64(0)

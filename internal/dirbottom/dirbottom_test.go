@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/stencil-hq/ovnfs/internal/hostfile"
+	"github.com/stencil-hq/ovnfs/internal/ident"
 )
 
 // TestDirectoryBottom exercises host reads and recursive copy-up without changing the lower.
@@ -122,5 +123,45 @@ func TestSymlinkCopy(t *testing.T) {
 	}
 	if !after.ModTime().Equal(original.ModTime()) {
 		t.Fatal("symlink copy changed target timestamp")
+	}
+}
+
+// TestIdentityByPath gives a listed entry the identity its lookup reports,
+// resolvable back to its path until it disappears.
+func TestIdentityByPath(t *testing.T) {
+	lower := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(lower, "dir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(lower, "dir", "file"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	b := New(lower)
+	entries, err := b.ReadDir("dir")
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("ReadDir = %v, %v", entries, err)
+	}
+	listed, ok := ident.Of(entries[0])
+	if !ok || listed.Space() != ident.Capture {
+		t.Fatalf("listed identity = %v, %v", listed, ok)
+	}
+	if p, ok := b.Locate(listed); !ok || p != "dir/file" {
+		t.Fatalf("Locate = %q, %v", p, ok)
+	}
+	info, err := b.Lstat("dir/file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := ident.Of(info); got != listed {
+		t.Fatalf("Lstat identity %v, listed %v", got, listed)
+	}
+	if dir, _ := b.Lstat("dir"); func() bool { id, _ := ident.Of(dir); return id == listed }() {
+		t.Fatal("two paths share an identity")
+	}
+	if err := os.Remove(filepath.Join(lower, "dir", "file")); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := b.Locate(listed); ok {
+		t.Fatal("Locate found a removed entry")
 	}
 }

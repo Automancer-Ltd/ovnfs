@@ -3,6 +3,7 @@ package base
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -10,18 +11,19 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stencil-hq/ovnfs/git"
-	"github.com/stencil-hq/ovnfs/internal/search/fsys"
+	"github.com/stencil-hq/ovnfs/internal/ident"
 	"github.com/stencil-hq/ovnfs/rules"
 	"github.com/stencil-hq/ovnfs/source"
 	"github.com/stencil-hq/ovnfs/store"
 )
 
 // repository creates a hermetic checkout with tracked sources and ignored roots.
-func repository(t *testing.T) (*git.Repo, string) {
+func repository(t testing.TB) (*git.Repo, string) {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git is unavailable")
@@ -43,7 +45,7 @@ func repository(t *testing.T) (*git.Repo, string) {
 }
 
 // runGit runs fixture Git commands with actionable diagnostics.
-func runGit(t *testing.T, dir string, args ...string) string {
+func runGit(t testing.TB, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
 	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull)
@@ -55,7 +57,7 @@ func runGit(t *testing.T, dir string, args ...string) string {
 }
 
 // writeTestFile creates a fixture entry and all of its parent directories.
-func writeTestFile(t *testing.T, p, content string) {
+func writeTestFile(t testing.TB, p, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		t.Fatal(err)
@@ -66,7 +68,7 @@ func writeTestFile(t *testing.T, p, content string) {
 }
 
 // createTestBase separates ctime boundaries before capturing a fixture with the built-in rules.
-func createTestBase(t *testing.T, repo *git.Repo, configure func(*Config, *source.Options)) (*Base, Config) {
+func createTestBase(t testing.TB, repo *git.Repo, configure func(*Config, *source.Options)) (*Base, Config) {
 	t.Helper()
 	time.Sleep(10 * time.Millisecond)
 	st, err := store.Open(filepath.Join(t.TempDir(), "store"), 64<<20)
@@ -97,10 +99,14 @@ func prepend(t *testing.T, o *source.Options, line string) {
 	o.Rules.Rules = append([]rules.Rule{rule}, o.Rules.Rules...)
 }
 
-// readBase reads through the production bottom interface rather than the donor.
+// snapshots numbers the cache snapshots readBase takes.
+var snapshots atomic.Int64
+
+// readBase reads through the production bottom interface rather than the
+// donor, with a cache snapshot of the folder as it is now.
 func readBase(t *testing.T, b *Base, p string) string {
 	t.Helper()
-	f, err := b.Bottom(time.Time{}).Open(p)
+	f, err := b.Bottom(b.TakeCaches(fmt.Sprintf("read%d", snapshots.Add(1)))).Open(p)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +134,7 @@ func TestSourceFallbackPreservesCapturedMtime(t *testing.T) {
 	if got := readBase(t, b, "source.txt"); got != "fork source\n" {
 		t.Fatalf("source = %q", got)
 	}
-	info, err := b.Bottom(time.Time{}).Lstat("source.txt")
+	info, err := b.Bottom(nil).Lstat("source.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,156 +147,8 @@ func TestSourceFallbackPreservesCapturedMtime(t *testing.T) {
 	if got := readBase(t, b, "src/nested.txt"); got != "nested source\n" {
 		t.Fatalf("deleted source = %q", got)
 	}
-	if _, err := b.Bottom(time.Time{}).Lstat(".git"); !os.IsNotExist(err) {
+	if _, err := b.Bottom(nil).Lstat(".git"); !os.IsNotExist(err) {
 		t.Fatalf(".git visible: %v", err)
-	}
-}
-
-// TestLiveRootsFollowTheFolder serves cache and local roots from the folder as
-// it is now, while new source paths stay out and symlinked ancestors inside a
-// live root cannot lead outside the folder.
-func TestLiveRootsFollowTheFolder(t *testing.T) {
-	repo, dir := repository(t)
-	writeTestFile(t, filepath.Join(dir, "node_modules", "pkg", "index.js"), "v1")
-	writeTestFile(t, filepath.Join(dir, ".env"), "SECRET=1")
-	outside := t.TempDir()
-	writeTestFile(t, filepath.Join(outside, "leak"), "outside")
-	b, _ := createTestBase(t, repo, nil)
-	if got := readBase(t, b, "node_modules/pkg/index.js"); got != "v1" {
-		t.Fatalf("cache file = %q", got)
-	}
-	writeTestFile(t, filepath.Join(dir, "node_modules", "pkg", "index.js"), "v2")
-	writeTestFile(t, filepath.Join(dir, "node_modules", "added", "x.js"), "added")
-	writeTestFile(t, filepath.Join(dir, ".env"), "SECRET=2")
-	writeTestFile(t, filepath.Join(dir, "new-source"), "new source")
-	if err := os.Symlink(outside, filepath.Join(dir, "node_modules", "escape")); err != nil {
-		t.Fatal(err)
-	}
-	for p, want := range map[string]string{"node_modules/pkg/index.js": "v2", "node_modules/added/x.js": "added", ".env": "SECRET=2"} {
-		if got := readBase(t, b, p); got != want {
-			t.Errorf("%s = %q, want the folder's current %q", p, got, want)
-		}
-	}
-	if _, err := b.Bottom(time.Time{}).Lstat("new-source"); !os.IsNotExist(err) {
-		t.Errorf("new source path visible: %v", err)
-	}
-	if _, err := b.Bottom(time.Time{}).Lstat("node_modules/escape/leak"); err == nil {
-		t.Error("a symlink inside a live root led outside the folder")
-	}
-	entries, err := b.Bottom(time.Time{}).ReadDir("node_modules")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var names []string
-	for _, e := range entries {
-		names = append(names, e.Name())
-	}
-	if strings.Join(names, " ") != "added escape pkg" {
-		t.Fatalf("live listing = %v", names)
-	}
-	if err := os.RemoveAll(filepath.Join(dir, "node_modules", "pkg")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := b.Bottom(time.Time{}).Lstat("node_modules/pkg/index.js"); !os.IsNotExist(err) {
-		t.Fatalf("deleted cache file still visible: %v", err)
-	}
-}
-
-// TestFencedCacheHidesLaterFolderChanges serves a checkout's cache paths as the
-// folder held them when it opened: files the folder rewrites or adds later are
-// absent (a build rebuilds them rather than trusting the folder's newer
-// output, #58), untouched ones and directories stay, and local paths follow
-// the folder.
-func TestFencedCacheHidesLaterFolderChanges(t *testing.T) {
-	repo, dir := repository(t)
-	writeTestFile(t, filepath.Join(dir, "node_modules", "kept", "a.js"), "kept")
-	writeTestFile(t, filepath.Join(dir, "node_modules", "pkg", "index.js"), "v1")
-	writeTestFile(t, filepath.Join(dir, ".env"), "SECRET=1")
-	b, _ := createTestBase(t, repo, nil)
-	opened := time.Now()
-	view := b.Bottom(opened)
-	awaitFileClock(t, opened)
-	writeTestFile(t, filepath.Join(dir, "node_modules", "pkg", "index.js"), "v2")
-	writeTestFile(t, filepath.Join(dir, "node_modules", "pkg", "added.js"), "added")
-	writeTestFile(t, filepath.Join(dir, ".env"), "SECRET=2")
-	for _, p := range []string{"node_modules/pkg/index.js", "node_modules/pkg/added.js"} {
-		if _, err := view.Lstat(p); !os.IsNotExist(err) {
-			t.Errorf("%s changed after the open is visible: %v", p, err)
-		}
-	}
-	entries, err := view.ReadDir("node_modules/pkg")
-	if err != nil || len(entries) != 0 {
-		t.Errorf("listing after the folder rewrote pkg = %d entries, %v; want none", len(entries), err)
-	}
-	for p, want := range map[string]string{"node_modules/kept/a.js": "kept", ".env": "SECRET=2"} {
-		f, err := view.Open(p)
-		if err != nil {
-			t.Fatalf("open %s: %v", p, err)
-		}
-		got, err := io.ReadAll(f)
-		f.Close()
-		if err != nil || string(got) != want {
-			t.Errorf("%s = %q, %v; want %q", p, got, err, want)
-		}
-	}
-	if got := readBase(t, b, "node_modules/pkg/index.js"); got != "v2" {
-		t.Errorf("unfenced view = %q, want the folder's current v2", got)
-	}
-}
-
-// awaitFileClock returns once a file written now is stamped later than
-// after. Linux stamps files from the clock as of the last scheduler tick, so a
-// write made right after time.Now can carry an earlier change time.
-func awaitFileClock(t *testing.T, after time.Time) {
-	t.Helper()
-	probe := filepath.Join(t.TempDir(), "clock")
-	for {
-		writeTestFile(t, probe, "")
-		info, err := os.Lstat(probe)
-		if err != nil {
-			t.Fatal(err)
-		}
-		changed, err := fsys.ChangeTime(probe, info)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if changed > after.UnixNano() {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-}
-
-// TestLiveLinksIntoTheFolderAreRelative serves a live link's absolute target
-// inside the folder relative to the link, so a checkout's link names the
-// checkout's copy; targets outside the folder and relative ones stay as stored.
-func TestLiveLinksIntoTheFolderAreRelative(t *testing.T) {
-	repo, dir := repository(t)
-	writeTestFile(t, filepath.Join(dir, "node_modules", "pkg", "index.js"), "v1")
-	b, _ := createTestBase(t, repo, nil)
-	outside := t.TempDir()
-	for link, target := range map[string]string{
-		"node_modules/@x/src":  filepath.Join(b.Meta().Dir, "src"),
-		"node_modules/root":    b.Meta().Dir,
-		"node_modules/escape":  outside,
-		"node_modules/sibling": "pkg",
-	} {
-		if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, link)), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Symlink(target, filepath.Join(dir, filepath.FromSlash(link))); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for link, want := range map[string]string{
-		"node_modules/@x/src":  "../../src",
-		"node_modules/root":    "..",
-		"node_modules/escape":  filepath.ToSlash(outside),
-		"node_modules/sibling": "pkg",
-	} {
-		if got, err := b.Bottom(time.Time{}).Readlink(link); err != nil || got != want {
-			t.Errorf("readlink %s = %q, %v; want %q", link, got, err, want)
-		}
 	}
 }
 
@@ -333,7 +191,7 @@ func TestCapturedNamesOutliveTheFolder(t *testing.T) {
 		writeTestFile(t, filepath.Join(dir, "built", name), name)
 	}
 	b, _ := createTestBase(t, repo, nil)
-	entries, err := b.Bottom(time.Time{}).ReadDir("built")
+	entries, err := b.Bottom(nil).ReadDir("built")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,7 +201,7 @@ func TestCapturedNamesOutliveTheFolder(t *testing.T) {
 	if err := os.RemoveAll(filepath.Join(dir, "built")); err != nil {
 		t.Fatal(err)
 	}
-	if entries, err = b.Bottom(time.Time{}).ReadDir("built"); err != nil || len(entries) != 8 {
+	if entries, err = b.Bottom(nil).ReadDir("built"); err != nil || len(entries) != 8 {
 		t.Fatalf("listing after the folder deleted it = %d entries, %v", len(entries), err)
 	}
 	for _, entry := range entries {
@@ -358,16 +216,19 @@ func TestReadDirPreservesCapturedMetadata(t *testing.T) {
 	repo, dir := repository(t)
 	writeTestFile(t, filepath.Join(dir, "cache", "old"), "old")
 	b, _ := createTestBase(t, repo, nil)
+	caches := b.TakeCaches("c1")
+	caches.Wait()
+	view := b.Bottom(caches)
 	check := func(p string, names []string) {
 		t.Helper()
-		entries, err := b.Bottom(time.Time{}).ReadDir(p)
+		entries, err := view.ReadDir(p)
 		if err != nil {
 			t.Fatal(err)
 		}
 		var got []string
 		for _, entry := range entries {
 			got = append(got, entry.Name())
-			info, err := b.Bottom(time.Time{}).Lstat(filepath.ToSlash(filepath.Join(p, entry.Name())))
+			info, err := view.Lstat(filepath.ToSlash(filepath.Join(p, entry.Name())))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -378,6 +239,11 @@ func TestReadDirPreservesCapturedMetadata(t *testing.T) {
 			if entry.Mode() != info.Mode() || entry.Size() != info.Size() || !staleDirTime && !entry.ModTime().Equal(info.ModTime()) {
 				t.Errorf("%s/%s: listing metadata differs from stat: %v, %v", p, entry.Name(), entry, info)
 			}
+			listed, okListed := ident.Of(entry)
+			stat, okStat := ident.Of(info)
+			if !okListed || !okStat || listed != stat {
+				t.Errorf("%s/%s: listed identity %v, stat identity %v", p, entry.Name(), listed, stat)
+			}
 		}
 		if !reflect.DeepEqual(got, names) {
 			t.Fatalf("%s: got %v, want %v", p, got, names)
@@ -386,13 +252,15 @@ func TestReadDirPreservesCapturedMetadata(t *testing.T) {
 	check("", []string{".gitignore", "cache", "source.txt", "src"})
 	writeTestFile(t, filepath.Join(dir, "source.txt"), "different source bytes")
 	writeTestFile(t, filepath.Join(dir, "new-source"), "not captured")
-	writeTestFile(t, filepath.Join(dir, "cache", "new"), "live")
+	writeTestFile(t, filepath.Join(dir, "cache", "new"), "after the snapshot")
 	if err := os.RemoveAll(filepath.Join(dir, "src")); err != nil {
 		t.Fatal(err)
 	}
 	check("", []string{".gitignore", "cache", "source.txt", "src"})
 	check("src", []string{"nested.txt"})
-	check("cache", []string{"new", "old"})
+	if sharesBlocks(t, dir) {
+		check("cache", []string{"old"})
+	}
 }
 
 // TestCaptureKeepsOriginalIndex verifies staged state, dirty content and carried files.
@@ -426,8 +294,12 @@ func TestCaptureKeepsOriginalIndex(t *testing.T) {
 	if got := readBase(t, b, "source.txt"); got != "dirty\n" {
 		t.Fatalf("dirty source = %q", got)
 	}
-	if got := readBase(t, b, "cache/secret"); got != "carried" {
-		t.Fatalf("carry = %q", got)
+	// cache/secret lies below the cache root cache, which starts empty where
+	// the volume cannot clone.
+	if sharesBlocks(t, dir) {
+		if got := readBase(t, b, "cache/secret"); got != "carried" {
+			t.Fatalf("carry = %q", got)
+		}
 	}
 	if got := readBase(t, b, "untracked"); got != "untracked" {
 		t.Fatalf("untracked = %q", got)
@@ -456,7 +328,7 @@ func TestAncestorReplacementCannotSubstituteOldInodes(t *testing.T) {
 	replacement := t.TempDir()
 	writeTestFile(t, filepath.Join(replacement, "nested.txt"), "foreign old source")
 	b, _ := createTestBase(t, repo, nil)
-	if _, err := b.Bottom(time.Time{}).Lstat("src"); err != nil {
+	if _, err := b.Bottom(nil).Lstat("src"); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Rename(filepath.Join(dir, "src"), filepath.Join(dir, "old-src")); err != nil {
@@ -488,14 +360,14 @@ func TestCapturedSymlinkAndMode(t *testing.T) {
 	if err := os.Symlink("elsewhere", filepath.Join(dir, "link")); err != nil {
 		t.Fatal(err)
 	}
-	target, err := b.Bottom(time.Time{}).Readlink("link")
+	target, err := b.Bottom(nil).Readlink("link")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if target != "source.txt" {
 		t.Fatalf("link = %q", target)
 	}
-	info, err := b.Bottom(time.Time{}).Lstat("link")
+	info, err := b.Bottom(nil).Lstat("link")
 	if err != nil {
 		t.Fatal(err)
 	}

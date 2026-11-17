@@ -29,7 +29,7 @@ func openLinks(t *testing.T, node string) *links {
 	reg, err := checkout.Open(checkout.Config{
 		State: filepath.Join(root, "state"), Mount: filepath.Join(root, "mount"), Node: node,
 		Memory: overlay.NewMemory(64<<20, 1<<20, 0), BlobCache: 64 << 20,
-		Fetch: l.fetch, Search: l.search, Retire: l.detach,
+		Fetch: l.fetch, Search: l.search, Retire: func(name string, _ uint16) { l.detach(name) },
 		Emit: func(e checkout.Event) {
 			if l.emit != nil {
 				l.emit(e)

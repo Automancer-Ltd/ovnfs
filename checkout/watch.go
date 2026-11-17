@@ -11,27 +11,10 @@ import (
 	"github.com/stencil-hq/ovnfs/watch"
 )
 
-// Tracked reports whether every change to path p of checkout name reaches the
-// daemon, so a file protocol may let clients cache it until recalled: false
-// only for paths served live from a source folder the watcher does not cover
-// right now.
-func (r *Registry) Tracked(name, p string) bool {
-	r.mu.RLock()
-	h := r.checkouts[name]
-	r.mu.RUnlock()
-	if h == nil || h.retired.Load() {
-		return false
-	}
-	if !h.base.view.Live(p) {
-		return true
-	}
-	return r.watcher != nil && r.watcher.Covers(h.base.view.Meta().Dir)
-}
-
 // WriteCacheable reports whether p is isolated data owned by the checkout.
 // Only singly linked regular files in its writable upper qualify, whether held
 // in memory or on disk. Classification does not affect ownership: an upper
-// shadows even a live cache/local lower or a hidden path. Lower files, frozen
+// shadows even a cache/local lower or a hidden path. Lower files, frozen
 // layers and git/jj metadata never qualify. The client gate protects uppers
 // through direct operations, including flush, snapshot and reattachment.
 // This is a read-only lease-policy check, not an operation barrier. In particular
@@ -143,62 +126,19 @@ func (r *Registry) addWatchLocked(dir string) {
 	r.watched[dir] = true
 }
 
-// folderChanged records folder edits that can change a capture (see reuseFolder), and
-// maps them to the checkouts whose live paths show them and invalidates those
-// paths. A tree change invalidates that subtree of every checkout on the folder
-// (it may hold live paths below captured ones); a reported folder root means
-// the folder's events were lost, so those checkouts are invalidated whole.
+// folderChanged records folder edits that can change a capture (see
+// reuseFolder) or the cache and local roots of a cache snapshot (see
+// useCaches). No checkout serves the folder as it is now, so none is
+// invalidated.
 func (r *Registry) folderChanged(changes []watch.Change) {
-	changed := make(map[string][]string) // checkout -> changed paths
-	trees := make(map[string][]string)   // checkout -> changed subtrees
-	whole := make(map[string]bool)
 	paths := make([]string, len(changes))
 	for i, c := range changes {
 		paths[i] = c.Path
 	}
 	r.mu.RLock()
+	defer r.mu.RUnlock()
 	r.foldersChangedLocked(paths)
-	users := make(map[*baseRecord][]string)
-	for name, h := range r.checkouts {
-		if !h.retired.Load() {
-			users[h.base] = append(users[h.base], name)
-		}
-	}
-	for b, names := range users {
-		m := b.view.Meta()
-		if m.Remote != nil || m.Dir == "" {
-			continue
-		}
-		for _, c := range changes {
-			rel, ok := below(m.Dir, c.Path)
-			if !ok {
-				continue
-			}
-			for _, name := range names {
-				switch {
-				case rel == "":
-					whole[name] = true
-				case c.Tree:
-					trees[name] = append(trees[name], rel)
-				case b.view.Live(rel):
-					changed[name] = append(changed[name], rel)
-				}
-			}
-		}
-	}
-	r.mu.RUnlock()
-	for name := range whole {
-		delete(changed, name)
-		delete(trees, name)
-		r.invalidate(name, nil, []string{""})
-	}
-	for name, rels := range changed {
-		r.invalidate(name, rels, trees[name])
-		delete(trees, name)
-	}
-	for name, rels := range trees {
-		r.invalidate(name, nil, rels)
-	}
+	r.cachesChangedLocked(changes)
 }
 
 // below returns p relative to dir in slash form ("" for dir itself), or false

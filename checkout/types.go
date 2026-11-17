@@ -4,7 +4,8 @@
 // A checkout is one overlay (upper → frozen layers → base). The base is a capture
 // of the source folder classified by the checkout's rules (see package rules): only
 // source-class paths are part of a snapshot's identity; cache and local paths
-// are served copy-on-write from the folder itself; hidden paths do not exist.
+// are served copy-on-write from a snapshot of the folder's that ovnfs owns
+// (see useCaches); hidden paths do not exist.
 // A checkout of a git repository also gets a private git directory, so git works
 // inside it without writing to the user's repository.
 //
@@ -60,6 +61,16 @@ type checkoutMeta struct {
 	// submodule gitfiles, with the metadata they had then; while they keep it, they
 	// are infrastructure, not changes (see Registry.upperEmpty).
 	Copied map[string]copiedDir `json:"copied,omitempty"`
+	// Slot numbers the checkout in the export's file ids (export.Nodes), which
+	// clients keep as inode numbers, so it is persisted for ids that survive
+	// restarts. Life tells this checkout from earlier holders of the same slot,
+	// so a protocol handle of a removed checkout never resolves into a newer
+	// one. Both are assigned when the checkout is registered (addCheckoutLocked).
+	Slot uint16 `json:"slot,omitempty"`
+	Life uint32 `json:"life,omitempty"`
+	// Caches names the cache snapshot of its base (base.Caches) the checkout
+	// reads cache and local roots from; "" on remote bases.
+	Caches string `json:"caches,omitempty"`
 }
 
 // dir names the checkout's directories below uppers and git.
@@ -114,9 +125,12 @@ type Config struct {
 	// Search asks the link currently connected for key to scan blobs a remote
 	// checkout has not fetched on the machine holding them; nil makes grep in
 	// remote checkouts fetch what it reads.
-	Search  func(ctx context.Context, key string, q grep.Query, wants []base.Want) ([]grep.Outcome, error)
-	Emit    func(Event)
-	Retire  func(name string)
+	Search func(ctx context.Context, key string, q grep.Query, wants []base.Want) ([]grep.Outcome, error)
+	Emit   func(Event)
+	// Retire tells the file servers that checkout name, which held export slot
+	// (checkoutMeta.Slot), is going away, while the registry lock is held: it
+	// must not call back into the registry.
+	Retire  func(name string, slot uint16)
 	Changed func(name string, added bool)
 	// Memory keeps checkouts' small written files in memory until they spill
 	// into their uppers (see overlay.Memory); nil writes every file to disk,
@@ -125,7 +139,7 @@ type Config struct {
 	// BlobCache bounds the bytes of small store blobs served from memory; 0 disables it.
 	BlobCache int64
 	// Invalidate reports checkout paths the daemon changed behind the file
-	// protocols (pull, reattach, edits in a source folder's live paths), and
+	// protocols (pull, reattach), and
 	// trees changed anywhere at or below them ("" for the whole checkout), so
 	// the export recalls clients' caches. It is called without registry locks
 	// held.
@@ -160,6 +174,9 @@ type Registry struct {
 	intents      map[string]diskIntent
 	reserved     map[string]bool
 	nextSnapshot uint64
+	nextSlot     uint16                     // where the next slot search starts (see allocSlotLocked)
+	nextLife     uint32                     // the last Life assigned
+	bySlot       map[uint16]*checkoutRecord // registered checkouts by checkoutMeta.Slot
 	proto        string
 	port         int
 	rootTime     time.Time
@@ -189,6 +206,8 @@ type Registry struct {
 	commits      stateCommits             // durable state commits requested outside r.mu
 	writes       stateWrites              // orders state.json writes
 	prepares     chan struct{}            // a slot per checkout being prepared on a warm capture
+	cachesMu     sync.Mutex               // guards baseRecord.caches and deadCaches; taken after r.mu, never before
+	deadCaches   []deadCaches             // cachesMu: cache snapshots no checkout uses, for collectGarbage
 }
 
 // checkoutRecord holds one freeze lock for all calls against a live folder.
@@ -209,6 +228,7 @@ type checkoutRecord struct {
 	merge      sync.Mutex   // serializes apply and pull, which rewrite meta.MergeBases; taken before freeze and Registry.mu
 	git        gitCache     // stored files of the private git directory, for the next snapshot
 	wrote      atomic.Int64 // unix nanoseconds of the last change through the checkout's folder (see Session.Touch); 0 for none
+	caches     *base.Caches // the cache snapshot meta.Caches names; nil on remote bases and while prepared (see useCaches)
 }
 
 // snapRecord retains its full stack until explicitly dropped.
@@ -238,6 +258,7 @@ type baseRecord struct {
 	// start from is written in the background (or failed); nil when it was
 	// written with the capture, or the base keeps none.
 	template chan struct{}
+	caches   baseCaches // Registry.cachesMu: the base's cache snapshots in use
 }
 
 // layerRecord counts checkout, snapshot and active hash references to a layer.

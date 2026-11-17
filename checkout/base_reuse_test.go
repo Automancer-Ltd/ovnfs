@@ -121,7 +121,10 @@ func TestBaseReuseInvalidatesCapturedMetadata(t *testing.T) {
 			}
 			third := f.newCheckout(dir, "third")
 			if third.Checkout.Base != second.Checkout.Base {
-				t.Fatal("new unchanged capture did not become reusable")
+				// A recapture (third.Capture.Seconds > 0) reuses second only by its
+				// ReuseKey, which a capture with warnings does not get.
+				t.Fatalf("new unchanged capture did not become reusable: first %s, second %s (warnings %q), third %s (capture %+v, warnings %q)",
+					first.Checkout.Base, second.Checkout.Base, second.Warnings, third.Checkout.Base, third.Capture, third.Warnings)
 			}
 		})
 	}

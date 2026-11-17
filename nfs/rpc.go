@@ -180,7 +180,7 @@ func (c *conn) turnOf(rec []byte) turn {
 	d.opaque(maxAuthBytes) // credential
 	d.u32()
 	d.opaque(maxAuthBytes) // verifier
-	id, ok := d.fh(maxFH3)
+	id, _, ok := d.fh(maxFH3)
 	if d.err != nil || !ok {
 		return turn{}
 	}

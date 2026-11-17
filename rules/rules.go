@@ -126,7 +126,7 @@ func Parse(text, origin string, firstLine int) ([]Rule, error) {
 
 // builtinText is the default rule list every manifest ends with; line n is Origin "builtin:n".
 // Python environments are hidden rather than cache: their scripts and editable
-// installs name the folder by absolute path, so a live one would run the
+// installs name the folder by absolute path, so a snapshot of one would run the
 // folder's interpreter and code from inside a checkout.
 const builtinText = `hidden   .DS_Store | ._* | Thumbs.db | desktop.ini
 local    secret

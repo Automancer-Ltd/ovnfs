@@ -134,7 +134,19 @@ func (f *fixture) newCheckout(dir, name string, rules ...string) api.NewReply {
 	if err != nil {
 		f.t.Fatal(err)
 	}
+	f.awaitCaches(reply.Checkout.Name)
 	return reply
+}
+
+// awaitCaches waits until checkout's cache snapshot is complete, so the folder
+// edits a test makes next come after it.
+func (f *fixture) awaitCaches(checkout string) {
+	f.reg.mu.RLock()
+	h := f.reg.checkouts[checkout]
+	f.reg.mu.RUnlock()
+	if h != nil && h.caches != nil {
+		h.caches.Wait()
+	}
 }
 
 // ls lists every checkout and snapshot.
@@ -250,7 +262,7 @@ func TestPlainFolderClasses(t *testing.T) {
 	if c := reply.Capture; c.Cache != 1 || c.Local != 3 || c.Hidden != 1 {
 		t.Fatalf("roots: cache %d local %d hidden %d", c.Cache, c.Local, c.Hidden)
 	}
-	for p, want := range map[string]string{"src/a.txt": "a", "node_modules/x/index.js": "module", ".env": "SECRET=1", ".DS_Store": "<absent>", "data/raw.bin": "raw", "notes/drop.log": "drop"} {
+	for p, want := range map[string]string{"src/a.txt": "a", "node_modules/x/index.js": cached(t, "module"), ".env": "SECRET=1", ".DS_Store": "<absent>", "data/raw.bin": "raw", "notes/drop.log": "drop"} {
 		if got := f.read("plain", p); got != want {
 			t.Errorf("%s = %q, want %q", p, got, want)
 		}

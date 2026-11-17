@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v5"
+	"github.com/stencil-hq/ovnfs/internal/ident"
 )
 
 // lookupRead checks only the requested path and ancestor barriers while cold.
@@ -26,7 +27,7 @@ func (f *FS) lookupRead(p string) (source, os.FileInfo, error) {
 		info, err := os.Lstat(real) // only the final component needs its stored mode
 		if err == nil {
 			if q == p {
-				info, err = withMode(real, info)
+				info, err = describe(real, info, f.ids)
 				return source{upper: true}, info, err
 			}
 			if !info.IsDir() {
@@ -65,19 +66,28 @@ func (f *FS) loadIndex() error {
 	if f.index != nil {
 		return nil
 	}
-	index, err := indexLayer(f.upper, true)
+	index, err := walkLayer(f.upper, true, true, "", f.ids)
 	if err != nil {
 		return err
+	}
+	if !f.ids.table.empty() {
+		live := make(map[uint64]bool, len(index.entries))
+		for _, e := range index.entries {
+			if key, ok := hostKey(e.Info); ok {
+				live[key.inode] = true
+			}
+		}
+		if err := f.ids.table.retain(live); err != nil {
+			return err
+		}
 	}
 	index.addOrigins(f.origins)
 	f.index = index
 	f.pathIDs = make(map[string]inodeKey)
 	f.aliases = make(map[inodeKey]inodeNames)
+	f.paths = make(map[ident.ID]string, len(index.entries))
 	for p, e := range index.entries {
-		if err := f.track(p, e.Info); err != nil {
-			f.index, f.pathIDs, f.aliases = nil, nil, nil
-			return err
-		}
+		f.track(p, e.Info)
 	}
 	for h := range f.hosts {
 		if h.cold != "" {
@@ -104,7 +114,7 @@ func (f *FS) openUpperCold(p string, flag int) (billy.File, bool, error) {
 	if err != nil {
 		return nil, true, err
 	}
-	h.cold = p
+	h.cold, h.id = p, handleID(info)
 	return h, true, nil
 }
 
@@ -124,5 +134,6 @@ func (f *FS) Cool(before time.Time) {
 		return
 	}
 	f.rootInfo, f.origins = f.index.entries[""].Info, f.index.origins()
-	f.index, f.pathIDs, f.aliases = nil, nil, nil
+	f.index, f.pathIDs, f.aliases, f.paths = nil, nil, nil, nil
+	f.ids.known.reset()
 }

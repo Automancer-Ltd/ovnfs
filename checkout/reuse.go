@@ -453,7 +453,10 @@ func (r *Registry) openOnLocked(ctx context.Context, b *baseRecord, template git
 		return api.NewReply{}, r.abandonCheckout(name, h, b, err)
 	}
 	delete(r.reserved, name)
-	r.checkouts[name] = h
+	if err := r.addCheckoutLocked(name, h); err != nil {
+		r.mu.Unlock()
+		return api.NewReply{}, r.abandonCheckout(name, h, b, err)
+	}
 	r.moveRootLocked()
 	seq := r.requestCommitLocked()
 	// The capture was taken before this create, which read nothing of the folder.
@@ -475,13 +478,18 @@ func (r *Registry) openOnLocked(ctx context.Context, b *baseRecord, template git
 	return reply, nil
 }
 
-// namePrepared names prepared checkout h: it opens now, so its cache paths are
-// fenced from now, its git directories mark it as checkout name, and its
-// objects are its base's (see setWarmLocked). config is the root git
-// directory's config as prepared.
+// namePrepared names prepared checkout h: it opens now, so it gets the cache
+// snapshot a checkout opening now uses (see useCaches), its git directories
+// mark it as checkout name, and its objects are its base's (see
+// setWarmLocked). config is the root git directory's config as prepared.
 func (r *Registry) namePrepared(h *checkoutRecord, name, config string) error {
 	h.meta.Name, h.meta.Created = name, time.Now().UTC()
-	h.fs.Rebase(h.base.view.Bottom(h.meta.Created))
+	caches, err := r.useCaches(h.base)
+	if err != nil {
+		return err
+	}
+	h.setCaches(caches)
+	h.fs.Rebase(h.base.view.Bottom(h.caches))
 	if !h.meta.Git {
 		return nil
 	}
@@ -522,6 +530,7 @@ func (r *Registry) abandonCheckout(name string, h *checkoutRecord, b *baseRecord
 	if h != nil {
 		h.fs.Discard()
 		h.fs.CloseFiles()
+		r.dropCaches(h)
 		dir, b = h.meta.dir(), h.base
 	}
 	err := coded(errors.Join(cause, r.removeCheckoutFiles(dir)))
@@ -636,7 +645,7 @@ func (r *Registry) setWarmLocked(f *reuseFolder, b *baseRecord, gen, gitGen uint
 	if f.warm != nil && f.warmGitGen == gitGen && f.warmLock == hash && template.config == f.template.config && len(submodules(b.view)) == 0 {
 		kept, f.pool = f.pool, nil
 		for _, h := range kept {
-			h.fs.Rebase(b.view.Bottom(h.meta.Created))
+			h.fs.Rebase(b.view.Bottom(nil))
 			r.releaseLocked(h.base, nil)
 			r.retainLocked(b, nil)
 			h.base, h.meta.Base = b, b.view.Meta().ID
@@ -755,9 +764,9 @@ func (r *Registry) foldersChangedLocked(paths []string) {
 }
 
 // affectedBy reports whether an edit at folder path rel can make the folder differ
-// from a capture: anything but paths the warm capture serves live or leaves out,
-// and the git directory's object, log and lock files. Without a warm capture every
-// path counts. r.mu is held for reading.
+// from a capture: anything but paths below the warm capture's cache, local and
+// hidden roots, and the git directory's object, log and lock files. Without a
+// warm capture every path counts. r.mu is held for reading.
 func (f *reuseFolder) affectedBy(rel string) bool {
 	if rel == "" {
 		return true // events were lost

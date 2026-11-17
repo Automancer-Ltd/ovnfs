@@ -119,7 +119,7 @@ func Open(c Config) (*Registry, error) {
 	if err != nil {
 		return nil, coded(err)
 	}
-	r := &Registry{config: c, store: st, checkouts: make(map[string]*checkoutRecord), snapshots: make(map[string]*snapRecord), lineage: make(map[string]*snapRecord), bases: make(map[string]*baseRecord), layers: make(map[string]*layerRecord), intents: make(map[string]diskIntent), reserved: make(map[string]bool), watched: make(map[string]bool), folders: make(map[string]*reuseFolder), roots: make(map[string]string), nextSnapshot: d.NextSnapshot, proto: d.Proto, port: d.Port, rootTime: time.Now().UTC(), gcWake: make(chan struct{}, 1), noticeWake: make(chan struct{}, 1), stop: make(chan struct{})}
+	r := &Registry{config: c, store: st, checkouts: make(map[string]*checkoutRecord), snapshots: make(map[string]*snapRecord), lineage: make(map[string]*snapRecord), bases: make(map[string]*baseRecord), layers: make(map[string]*layerRecord), intents: make(map[string]diskIntent), reserved: make(map[string]bool), watched: make(map[string]bool), folders: make(map[string]*reuseFolder), roots: make(map[string]string), nextSnapshot: d.NextSnapshot, nextSlot: d.NextSlot, nextLife: d.NextLife, bySlot: make(map[uint16]*checkoutRecord), proto: d.Proto, port: d.Port, rootTime: time.Now().UTC(), gcWake: make(chan struct{}, 1), noticeWake: make(chan struct{}, 1), stop: make(chan struct{})}
 	r.commits.cond.L = &r.commits.mu
 	r.prepares = make(chan struct{}, prepareSlots)
 	r.resolving = make(map[string]chan struct{})
@@ -167,6 +167,10 @@ func Open(c Config) (*Registry, error) {
 	}
 	phase(fmt.Sprintf("%d layers", len(d.Layers)))
 	if err = r.openCheckouts(d.Checkouts); err != nil {
+		cleanup()
+		return nil, coded(err)
+	}
+	if err = r.orphanCachesLocked(); err != nil {
 		cleanup()
 		return nil, coded(err)
 	}
@@ -221,7 +225,8 @@ func Open(c Config) (*Registry, error) {
 	go r.processNotices()
 	go r.emptyTrash()
 	go r.coolCheckouts()
-	// Without folder events, live paths are simply never delegated (see Tracked).
+	// Without folder events, captures are not reused and every checkout takes
+	// its own cache snapshot (see useCaches).
 	if r.watcher, err = watch.New(r.folderChanged); err == nil {
 		r.watchWake = make(chan struct{}, 1)
 		r.workers.Add(2)
@@ -284,9 +289,10 @@ func (r *Registry) openBases(metas []base.Meta) error {
 // returns the first error in disks' order, after every open has ended.
 func (r *Registry) openCheckouts(disks []diskCheckout) error {
 	type pending struct {
-		base  *baseRecord
-		stack []*overlay.Layer
-		upper string
+		base   *baseRecord
+		stack  []*overlay.Layer
+		upper  string
+		caches *base.Caches
 	}
 	plan := make([]pending, len(disks))
 	for i, disk := range disks {
@@ -298,7 +304,11 @@ func (r *Registry) openCheckouts(disks []diskCheckout) error {
 		if err != nil {
 			return err
 		}
-		plan[i] = pending{base: b, stack: stack, upper: r.upperPath(disk.dir())}
+		caches, err := r.openCaches(b, disk.Caches)
+		if err != nil {
+			return err
+		}
+		plan[i] = pending{base: b, stack: stack, upper: r.upperPath(disk.dir()), caches: caches}
 	}
 	fss := make([]*overlay.FS, len(disks))
 	errs := make([]error, len(disks))
@@ -313,7 +323,7 @@ func (r *Registry) openCheckouts(disks []diskCheckout) error {
 						continue
 					}
 				}
-				fss[i], errs[i] = openOverlay(p.upper, p.stack, p.base.view.Bottom(disk.Created), r.config.Memory)
+				fss[i], errs[i] = openOverlay(p.upper, p.stack, p.base.view.Bottom(p.caches), r.config.Memory)
 			}
 		})
 	}
@@ -321,17 +331,133 @@ func (r *Registry) openCheckouts(disks []diskCheckout) error {
 	if err := cmp.Or(errs...); err != nil {
 		return err
 	}
+	// Checkouts keep their persisted slots; one without (written by an older
+	// build) gets a free slot once all of those are taken.
+	var unslotted []*checkoutRecord
 	for i, disk := range disks {
 		p := plan[i]
 		h := &checkoutRecord{meta: disk.checkoutMeta, base: p.base, stack: append([]string{}, disk.Stack...), upper: p.upper, fs: fss[i]}
+		h.setCaches(p.caches)
 		h.generation.Store(1)
 		if !disk.Wrote.IsZero() {
 			h.wrote.Store(disk.Wrote.UnixNano())
 		}
-		r.checkouts[disk.Name] = h
 		r.retainLocked(p.base, h.stack)
+		if h.meta.Slot == 0 {
+			unslotted = append(unslotted, h)
+			continue
+		}
+		if err := r.addCheckoutLocked(disk.Name, h); err != nil {
+			return err
+		}
+	}
+	for _, h := range unslotted {
+		if err := r.addCheckoutLocked(h.meta.Name, h); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// slotCount bounds checkoutMeta.Slot: the export packs a slot into the top 12
+// of the 53 bits of a file id. Slot 0 is the export's virtual root.
+const slotCount = 1 << 12
+
+// addCheckoutLocked registers h as checkout name. A checkout without a slot,
+// or whose slot another registered checkout holds, gets a free one and a new
+// life; it fails only when every slot is taken.
+func (r *Registry) addCheckoutLocked(name string, h *checkoutRecord) error {
+	if h.meta.Slot == 0 || r.slotHeldLocked(h.meta.Slot) {
+		slot, ok := r.allocSlotLocked()
+		if !ok {
+			return failure("unavailable", "all %d checkout slots are in use", slotCount-1)
+		}
+		r.nextLife++
+		if r.nextLife == 0 {
+			r.nextLife = 1
+		}
+		h.meta.Slot, h.meta.Life = slot, r.nextLife
+	}
+	r.checkouts[name] = h
+	r.bySlot[h.meta.Slot] = h
+	return nil
+}
+
+// slotHeldLocked reports whether a registered checkout holds slot. bySlot may
+// keep a record that a failed create or open unregistered; it holds nothing.
+func (r *Registry) slotHeldLocked(slot uint16) bool {
+	h := r.bySlot[slot]
+	return h != nil && r.checkouts[h.meta.Name] == h
+}
+
+// allocSlotLocked picks the first free slot after the last one picked, so a
+// freed slot is reused only after every other slot was: handles and inode
+// numbers of a removed checkout stay unused for as long as possible.
+func (r *Registry) allocSlotLocked() (uint16, bool) {
+	for range slotCount - 1 {
+		slot := r.nextSlot
+		if slot == 0 || slot >= slotCount {
+			slot = 1
+		}
+		r.nextSlot = slot + 1
+		if !r.slotHeldLocked(slot) {
+			return slot, true
+		}
+	}
+	return 0, false
+}
+
+// Slot returns the export slot and life of live checkout name (see
+// checkoutMeta.Slot); the export builds its file ids and handles from them.
+func (r *Registry) Slot(name string) (slot uint16, life uint32, ok bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	h := r.checkouts[name]
+	if h == nil || h.retired.Load() {
+		return 0, 0, false
+	}
+	return h.meta.Slot, h.meta.Life, true
+}
+
+// SlotOwner returns the live checkout holding slot and its life, for the
+// export to resolve a file id or handle back to a checkout.
+func (r *Registry) SlotOwner(slot uint16) (name string, life uint32, ok bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if !r.slotHeldLocked(slot) {
+		return "", 0, false
+	}
+	h := r.bySlot[slot]
+	if h.retired.Load() {
+		return "", 0, false
+	}
+	return h.meta.Name, h.meta.Life, true
+}
+
+// EnterSlot is [Registry.Enter] for the checkout holding export slot, which
+// the export uses to resolve a file id or handle. It also returns that
+// checkout's name and life, which stay current while the session is held.
+func (r *Registry) EnterSlot(slot uint16, s *Session) (name string, life uint32, err error) {
+	var h *checkoutRecord
+	r.mu.RLock()
+	if !r.closed && r.slotHeldLocked(slot) {
+		h = r.bySlot[slot]
+		name, life = h.meta.Name, h.meta.Life
+	}
+	r.mu.RUnlock()
+	if h == nil {
+		return "", 0, failure("not_found", "no checkout in slot %d", slot)
+	}
+	h.freeze.RLock()
+	if h.retired.Load() {
+		h.freeze.RUnlock()
+		return "", 0, failure("not_found", "no checkout in slot %d", slot)
+	}
+	s.FS = h.fs
+	s.Gen = h.generation.Load()
+	s.record = h
+	s.done.Store(false)
+	return name, life, nil
 }
 
 // openBase opens one persisted base with its resolved lock.
@@ -371,7 +497,7 @@ func (r *Registry) storeHashedLayersLocked() {
 		if err != nil {
 			continue
 		}
-		view, err := overlay.New("", stack, s.base.view.Bottom(time.Time{}), nil)
+		view, err := overlay.New("", stack, s.base.view.Bottom(nil), nil)
 		if err != nil {
 			continue
 		}
@@ -421,6 +547,9 @@ func validateDisk(d diskState) error {
 			return fmt.Errorf("invalid or duplicate checkout %q", h.Name)
 		}
 		seen["h:"+h.Name] = true
+		if h.Caches != "" && !cachesPattern.MatchString(h.Caches) {
+			return fmt.Errorf("invalid cache snapshot of checkout %s", h.Name)
+		}
 	}
 	for _, s := range d.Snapshots {
 		if !validSnapshotID(s.ID) || seen[s.ID] {
@@ -794,6 +923,7 @@ func (r *Registry) collectGarbage() {
 			return
 		case <-r.gcWake:
 		}
+		r.removeDeadCaches()
 		r.mu.Lock()
 		var deadLayers []*layerRecord
 		deadBases := make(map[string]*baseRecord)
