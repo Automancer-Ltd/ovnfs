@@ -25,16 +25,17 @@ func dirStat(dir os.FileInfo) (*syscall.Stat_t, bool) {
 }
 
 // matchOwner gives the new file f the owner a memory file showed, when its
-// staging directory handed out another group.
-func matchOwner(f *os.File, uid, gid uint32) error {
+// staging directory handed out another group. It returns f's metadata from
+// before; nil after a chown, which may have cleared mode bits.
+func matchOwner(f *os.File, uid, gid uint32) (os.FileInfo, error) {
 	info, err := f.Stat()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if st, ok := info.Sys().(*syscall.Stat_t); ok && (st.Uid != uid || st.Gid != gid) {
-		return f.Chown(int(uid), int(gid))
+		return nil, f.Chown(int(uid), int(gid))
 	}
-	return nil
+	return info, nil
 }
 
 // unixMode encodes a memory file's mode as stat st_mode bits.

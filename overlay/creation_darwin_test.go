@@ -8,7 +8,8 @@ import (
 )
 
 // A client must not mistake normal writes or memory writeback for replacement
-// of an open file: the birth time stays fixed while data and mtime change.
+// of an open file: the birth time stays fixed while data and mtime change,
+// and writeback keeps the access and modification times.
 func TestMemoryCreationTimeSurvivesChanges(t *testing.T) {
 	f, err := New(t.TempDir(), nil, nil, NewMemory(1<<20, 64<<10, 0))
 	must(t, err)
@@ -30,13 +31,19 @@ func TestMemoryCreationTimeSurvivesChanges(t *testing.T) {
 	}
 	_, err = h.Write([]byte(" after"))
 	must(t, err)
-	stamp := time.Unix(1234567890, 123456789)
-	must(t, f.Chtimes("archive.tmp", stamp, stamp))
+	stamp, accessed := time.Unix(1234567890, 123456789), time.Unix(1111111111, 222222222)
+	must(t, f.Chtimes("archive.tmp", accessed, stamp))
 	assertCreated("archive.tmp")
 	must(t, f.Rename("archive.tmp", "archive.rlib"))
 	assertCreated("archive.rlib")
 	must(t, f.Flush())
 	assertCreated("archive.rlib")
+	// Checked before reading, which may advance it.
+	info, err = f.Lstat("archive.rlib")
+	must(t, err)
+	if got := time.Unix(info.Sys().(*syscall.Stat_t).Atimespec.Unix()); !got.Equal(accessed) {
+		t.Fatalf("writeback changed atime from %v to %v", accessed, got)
+	}
 	if got := read(t, f, "archive.rlib"); got != "before after" {
 		t.Fatalf("renamed contents %q", got)
 	}

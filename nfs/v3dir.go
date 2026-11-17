@@ -87,10 +87,15 @@ func (s *Server) list3(d *decoder, res *encoder, plus bool) status {
 	}
 	var lastCookie uint64
 	var lastName string
+	// A continuation reports current attributes: the client keeps those of
+	// the newest reply, so a snapshot's could undo a change it saw since.
+	// The listing's are current while no change or recall came since and
+	// every change to the directory's entries reaches Recall (Cacheable).
+	refresh := plus && cookie != 0 && (s.changes.Load() != l.changes || !s.FS.Cacheable(p))
 	for i := start; fits && i < len(l.entries); i++ {
 		info := l.entries[i]
 		var childID uint64
-		if plus && cookie != 0 {
+		if refresh {
 			// Refresh before checking space: a vanished entry must not
 			// prevent a later, shorter name from fitting this page.
 			child := path.Join(p, info.Name())

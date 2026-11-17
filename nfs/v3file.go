@@ -81,6 +81,11 @@ func (s *Server) setattr3(d *decoder, res *encoder) status {
 
 // lookup3 answers LOOKUP (section 3.3.3), including "." and "..". The root
 // has no parent to look up (ACCES).
+//
+// A name found leaves out the directory's attributes, which are optional:
+// stating it as well took a second host lstat per lookup, and the client
+// revalidates its directories on its own schedule. Only a failed lookup
+// stats the directory, to tell NOTDIR from the name's own error.
 func (s *Server) lookup3(d *decoder, res *encoder) status {
 	id, gen, ok := d.fh(maxFH3)
 	name := d.str(maxPath3)
@@ -91,22 +96,23 @@ func (s *Server) lookup3(d *decoder, res *encoder) status {
 	if st != stOK {
 		return st
 	}
-	dir, err := s.FS.Lstat(p)
-	if err != nil {
-		return statusOf(err)
-	}
-	if !dir.IsDir() {
-		return stNotDir
-	}
 	var child string
 	switch name {
-	case ".":
-		child = p
-	case "..":
-		if p == "" {
-			return stAccess
+	case ".", "..":
+		dir, err := s.FS.Lstat(p)
+		if err != nil {
+			return statusOf(err)
 		}
-		child = parentOf(p)
+		if !dir.IsDir() {
+			return stNotDir
+		}
+		child = p
+		if name == ".." {
+			if p == "" {
+				return stAccess
+			}
+			child = parentOf(p)
+		}
 	default:
 		if st := checkName3(name); st != stOK {
 			return st
@@ -115,6 +121,11 @@ func (s *Server) lookup3(d *decoder, res *encoder) status {
 	}
 	info, err := s.FS.Lstat(child)
 	if err != nil {
+		if dir, derr := s.FS.Lstat(p); derr != nil {
+			return statusOf(derr)
+		} else if !dir.IsDir() {
+			return stNotDir
+		}
 		return statusOf(err)
 	}
 	fid := s.FS.IDOf(child, info)
@@ -124,24 +135,26 @@ func (s *Server) lookup3(d *decoder, res *encoder) status {
 	a := attrsOf(fid, info)
 	res.fh(fid, s.FS.Generation(fid))
 	postAttrs3(res, &a)
-	da := attrsOf(id, dir)
-	postAttrs3(res, &da)
+	res.bool(false) // dir_attributes
 	return stOK
 }
 
 // access3 answers ACCESS (section 3.3.4), granting every right asked for:
-// the backend's own permissions apply when the client acts.
+// the backend's own permissions apply when the client acts. The reply
+// leaves out the file's attributes, which are optional: the client sends
+// ACCESS for every file it opens for the first time, right after the LOOKUP
+// or READDIRPLUS that brought fresh attributes, and stating the file again
+// cost a host lstat per open.
 func (s *Server) access3(d *decoder, res *encoder) status {
 	id, gen, ok := d.fh(maxFH3)
 	mask := d.u32()
 	if d.err != nil {
 		return stInval
 	}
-	p, st := s.path3(id, gen, ok)
-	if st != stOK {
+	if _, st := s.path3(id, gen, ok); st != stOK {
 		return st
 	}
-	s.postOp3(res, id, p)
+	res.bool(false) // obj_attributes
 	res.u32(mask)
 	return stOK
 }

@@ -34,11 +34,42 @@ func (s *Server) dir3(id, gen uint64, ok bool, name string, dot status) (string,
 	return p, info, stOK
 }
 
+// dirLocks serializes the NFSv3 calls that change entries of one directory
+// (CREATE, MKDIR, SYMLINK, MKNOD, REMOVE, RMDIR, RENAME, LINK), so that the
+// pre-op attributes in each reply's wcc_data are the directory's own just
+// before that change. The macOS client keeps its name cache of a directory,
+// negative entries included, only when a change's pre-op mtime equals the one
+// it recorded; without them every create purged the directory's cached names
+// and its own name in its parent. Directories share stripes by id.
+type dirLocks struct{ mu [64]sync.Mutex }
+
+// lock holds directory id's stripe.
+func (l *dirLocks) lock(id uint64) *sync.Mutex {
+	m := &l.mu[id%uint64(len(l.mu))]
+	m.Lock()
+	return m
+}
+
+// lock2 holds the stripes of directories a and b, in stripe order; the
+// second mutex is nil when both share one.
+func (l *dirLocks) lock2(a, b uint64) (*sync.Mutex, *sync.Mutex) {
+	i, j := a%uint64(len(l.mu)), b%uint64(len(l.mu))
+	if i == j {
+		return l.lock(a), nil
+	}
+	if i > j {
+		i, j = j, i
+	}
+	l.mu[i].Lock()
+	l.mu[j].Lock()
+	return &l.mu[i], &l.mu[j]
+}
+
 // created3 appends the result of a CREATE, MKDIR, SYMLINK or MKNOD of p in
-// directory dirID, at dir: the new handle, its attributes and the
-// directory's wcc_data (without pre-op attributes, which could not be read
-// atomically with the change). IO when p's id cannot be determined.
-func (s *Server) created3(res *encoder, dirID uint64, dir, p string) status {
+// directory dirID, at dir, whose attributes were pre before the change: the
+// new handle, its attributes and the directory's wcc_data. IO when p's id
+// cannot be determined.
+func (s *Server) created3(res *encoder, dirID uint64, dir string, pre *attrs, p string) status {
 	info, err := s.FS.Lstat(p)
 	if err != nil {
 		return stIO
@@ -51,7 +82,7 @@ func (s *Server) created3(res *encoder, dirID uint64, dir, p string) status {
 	res.fh(fid, s.FS.Generation(fid))
 	a := attrsOf(fid, info)
 	postAttrs3(res, &a)
-	s.wcc3(res, nil, dirID, dir)
+	s.wcc3(res, pre, dirID, dir)
 	return stOK
 }
 
@@ -90,13 +121,15 @@ func (s *Server) create3(d *decoder, res *encoder) status {
 	if d.err != nil {
 		return stInval
 	}
-	dir, _, st := s.dir3(id, gen, ok, name, stExist)
+	defer s.v3.dirs.lock(id).Unlock()
+	dir, dinfo, st := s.dir3(id, gen, ok, name, stExist)
 	if st != stOK {
 		return st
 	}
+	pre := attrsOf(id, dinfo)
 	p := path.Join(dir, name)
 	if info, err := s.FS.Lstat(p); err == nil {
-		return s.exists3(res, id, dir, p, info, how, &sa, verf)
+		return s.exists3(res, id, dir, &pre, p, info, how, &sa, verf)
 	}
 	perm := os.FileMode(0o666)
 	if sa.setMode {
@@ -106,7 +139,7 @@ func (s *Server) create3(d *decoder, res *encoder) status {
 	if errors.Is(err, os.ErrExist) {
 		// Created meanwhile by someone else.
 		if info, err := s.FS.Lstat(p); err == nil {
-			return s.exists3(res, id, dir, p, info, how, &sa, verf)
+			return s.exists3(res, id, dir, &pre, p, info, how, &sa, verf)
 		}
 	}
 	if err != nil {
@@ -130,15 +163,15 @@ func (s *Server) create3(d *decoder, res *encoder) status {
 	if st := s.apply3(p, &sa); st != stOK {
 		return st
 	}
-	return s.created3(res, id, dir, p)
+	return s.created3(res, id, dir, &pre, p)
 }
 
-// exists3 answers a CREATE of p in directory dirID, at dir, where p exists
-// as info: EXIST for GUARDED,
+// exists3 answers a CREATE of p in directory dirID, at dir with attributes
+// pre, where p exists as info: EXIST for GUARDED,
 // for anything but a regular file, and for EXCLUSIVE but a retransmission
 // with verifier verf; else the file as it is, truncated first to a
 // requested size.
-func (s *Server) exists3(res *encoder, dirID uint64, dir, p string, info os.FileInfo, how uint32, sa *sattr3, verf [8]byte) status {
+func (s *Server) exists3(res *encoder, dirID uint64, dir string, pre *attrs, p string, info os.FileInfo, how uint32, sa *sattr3, verf [8]byte) status {
 	switch {
 	case how == createGuarded, !info.Mode().IsRegular():
 		return stExist
@@ -157,7 +190,7 @@ func (s *Server) exists3(res *encoder, dirID uint64, dir, p string, info os.File
 		}
 		res.acceptSize()
 	}
-	return s.created3(res, dirID, dir, p)
+	return s.created3(res, dirID, dir, pre, p)
 }
 
 // createVerfs remembers the verifiers of recent EXCLUSIVE creates by file
@@ -202,10 +235,12 @@ func (s *Server) mkdir3(d *decoder, res *encoder) status {
 	if d.err != nil {
 		return stInval
 	}
-	dir, _, st := s.dir3(id, gen, ok, name, stExist)
+	defer s.v3.dirs.lock(id).Unlock()
+	dir, dinfo, st := s.dir3(id, gen, ok, name, stExist)
 	if st != stOK {
 		return st
 	}
+	pre := attrsOf(id, dinfo)
 	p := path.Join(dir, name)
 	if _, err := s.FS.Lstat(p); err == nil {
 		return stExist
@@ -220,7 +255,7 @@ func (s *Server) mkdir3(d *decoder, res *encoder) status {
 	if st := s.apply3(p, &sa); st != stOK {
 		return st
 	}
-	return s.created3(res, id, dir, p)
+	return s.created3(res, id, dir, &pre, p)
 }
 
 // symlink3 answers SYMLINK (section 3.3.10). A dangling link is an existing
@@ -233,10 +268,12 @@ func (s *Server) symlink3(d *decoder, res *encoder) status {
 	if d.err != nil {
 		return stInval
 	}
-	dir, _, st := s.dir3(id, gen, ok, name, stExist)
+	defer s.v3.dirs.lock(id).Unlock()
+	dir, dinfo, st := s.dir3(id, gen, ok, name, stExist)
 	if st != stOK {
 		return st
 	}
+	pre := attrsOf(id, dinfo)
 	p := path.Join(dir, name)
 	if _, err := s.FS.Lstat(p); err == nil {
 		return stExist
@@ -247,7 +284,7 @@ func (s *Server) symlink3(d *decoder, res *encoder) status {
 	if st := s.apply3(p, &sa); st != stOK {
 		return st
 	}
-	return s.created3(res, id, dir, p)
+	return s.created3(res, id, dir, &pre, p)
 }
 
 // mknod3 creates sockets and FIFOs; device nodes remain unsupported.
@@ -272,10 +309,12 @@ func (s *Server) mknod3(d *decoder, res *encoder) status {
 	if d.err != nil {
 		return stInval
 	}
-	dir, _, st := s.dir3(id, gen, ok, name, stExist)
+	defer s.v3.dirs.lock(id).Unlock()
+	dir, dinfo, st := s.dir3(id, gen, ok, name, stExist)
 	if st != stOK {
 		return st
 	}
+	pre := attrsOf(id, dinfo)
 	if typ != typeSock && typ != typeFifo {
 		return stAccess
 	}
@@ -301,7 +340,7 @@ func (s *Server) mknod3(d *decoder, res *encoder) status {
 	if st := s.apply3(p, &sa); st != stOK {
 		return st
 	}
-	return s.created3(res, id, dir, p)
+	return s.created3(res, id, dir, &pre, p)
 }
 
 // remove3 answers REMOVE (section 3.3.12).
@@ -319,6 +358,7 @@ func (s *Server) unlink3(d *decoder, res *encoder, isDir bool) status {
 	if d.err != nil {
 		return stInval
 	}
+	defer s.v3.dirs.lock(id).Unlock()
 	dir, dinfo, st := s.dir3(id, gen, ok, name, stInval)
 	if st != stOK {
 		return st
@@ -366,6 +406,11 @@ func (s *Server) rename3(d *decoder, res *encoder) status {
 	toName := d.str(maxPath3)
 	if d.err != nil {
 		return stInval
+	}
+	first, second := s.v3.dirs.lock2(fromID, toID)
+	defer first.Unlock()
+	if second != nil {
+		defer second.Unlock()
 	}
 	fromDir, fromInfo, st := s.dir3(fromID, fromGen, fromOK, fromName, stInval)
 	if st != stOK {
@@ -418,6 +463,7 @@ func (s *Server) link3(d *decoder, res *encoder) status {
 	if st != stOK {
 		return st
 	}
+	defer s.v3.dirs.lock(dirID).Unlock()
 	dir, dinfo, st := s.dir3(dirID, dirGen, dirOK, name, stExist)
 	if st != stOK {
 		return st

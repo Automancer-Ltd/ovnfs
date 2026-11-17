@@ -54,6 +54,7 @@ type FS struct {
 	spillLogged atomic.Bool         // the first failed spill is logged, see [Memory.park]
 
 	rootInfo      os.FileInfo       // root attributes while the index is cold
+	cold          coldDirs          // upper directories cold lookups listed, see [FS.lookupRead]
 	origins       map[string]string // rename hints kept while the index is cold
 	lastAccess    atomic.Int64      // Unix nanoseconds of the last index use, see [FS.Cool]
 	memoryHandles int               // open memory handles, including unlinked files'

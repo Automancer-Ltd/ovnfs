@@ -123,6 +123,7 @@ func (s *Server) nfs4(c *call, res *encoder) acceptStat {
 	case proc4Null:
 		return rpcSuccess
 	case proc4Compound:
+		defer s.changes.Add(1)
 		return s.compound4(c, res)
 	}
 	return rpcProcUnavail

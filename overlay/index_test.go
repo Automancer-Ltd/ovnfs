@@ -122,7 +122,13 @@ func TestColdReadsMatchIndexedReads(t *testing.T) {
 	}
 	coolIndex(t, f)
 	check("cooled", f)
-	// Reopening recreates the staging directory, so it follows the cooled check.
+	// Once the kept listings reach their bound, lookups ask the host.
+	coolIndex(t, f)
+	f.cold.mu.Lock()
+	f.cold.names = coldNames
+	f.cold.mu.Unlock()
+	check("unlisted", f)
+	// Reopening recreates the staging directory, so it follows the checks of f.
 	fresh, err := New(f.upper, f.layers, f.bottom, nil)
 	must(t, err)
 	check("reopened", fresh)

@@ -414,6 +414,13 @@ Opening an upper file or mutating the overlay loads the full index. Open host
 or memory handles, pending writes and staged I/O pin the index; cooling keeps
 rename hints and leaves files and exported identities unchanged. Frozen-layer
 metadata and simultaneously used upper indexes remain outside cache budgets.
+While the index is cold, a lookup lists each upper directory it passes once
+and keeps the listing until the index loads or cools (only mutations change
+the upper, and they load the index first), so a lookup stats nothing in the
+upper unless the upper holds the name: a cold lookup of a base file took
+seven host stats along its path. A directory of more than 4,096 entries, or
+any past 65,536 kept names or 8,192 kept directories, is asked about name by
+name instead.
 
 A base's per-path state is not in memory at all: lookups, listings and
 tracked-path facts read its `capture.idx` through a read-only mapping, whose
@@ -445,11 +452,17 @@ process footprint the OS charges (`heap_live`, `heap_in_use`, `go_held`,
 
 The NFS server keeps at most 1024 listing snapshots for READDIR cookies.
 READDIR checks reply budgets before identifying or encoding an entry that
-cannot fit. Continuations still refresh metadata first, so a
-removed entry cannot block a later name that fits. Each connection reuses a
-bounded pool of request workers, started
-on demand; each worker reuses its call and reply-encoder storage, clearing
-buffer references after replying. Record markers are decoded directly from
+cannot fit. A READDIRPLUS continuation restats its entries when a change or
+recall reached the server since the listing was read, or the directory is not
+cacheable; it does so before checking space, so a removed entry cannot block a
+later name that fits. Each connection reuses a bounded pool of request workers,
+started on demand; each worker reuses its call and reply-encoder storage,
+clearing buffer references after replying. The reading goroutine answers a
+quick call itself (GETATTR, LOOKUP, ACCESS, CREATE, WRITE and the like) when
+the call waits for no earlier change to its file and no further call is
+buffered, which spares a goroutine and often a thread wakeup per call; a call
+still running after 1 ms hands reading to another goroutine. Replies finished
+together leave in one `writev`. Record markers are decoded directly from
 the buffered reader rather than a heap-allocated four-byte temporary.
 Disconnect drains accepted calls before releasing the connection.
 Its kept writable files expire when idle. NFSv4 state follows client

@@ -19,6 +19,10 @@ func memStat(i memInfo) any {
 // setCreationTime leaves the Linux creation time to the filesystem.
 func setCreationTime(string, time.Time) error { return nil }
 
+// setTimes gives a staged memory file its access and modification times,
+// leaving its creation time to the filesystem.
+func setTimes(p string, atime, mtime, _ time.Time) error { return os.Chtimes(p, atime, mtime) }
+
 // birthTime reports no creation time: Linux leaves it to the filesystem.
 func birthTime(os.FileInfo) (time.Time, bool) { return time.Time{}, false }
 

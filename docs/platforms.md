@@ -22,6 +22,12 @@ mount uses `locallocks,nobrowse,intr,rwsize=131072` by default
 ([`nfs_io_size`](configuration.md#where-the-daemon-lives) changes the size), `noatime` unless
 [`serve --atime`](configuration.md#where-the-daemon-lives), and normal
 attribute caching (the client's default timeouts are 5 to 60 s).
+Changes to a directory's entries are serialized per directory, so each reply
+carries the directory's attributes from just before the change: the macOS
+client keeps its name cache of a directory, negative entries included, only
+when they match what it last saw, and otherwise purged it after each of its
+own creates. LOOKUP and ACCESS replies leave out the attributes NFSv3 makes
+optional there (the directory's, the file's), which cost a host stat each.
 After creating or removing a checkout the daemon `statfs`es its own mount,
 making the client revalidate the export root so new checkouts show up
 immediately. The export root is read-only; cross-checkout rename returns EXDEV

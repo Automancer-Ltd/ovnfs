@@ -568,15 +568,17 @@ func (f *FS) installed(m *memFile, fds map[*memHandle]*os.File) error {
 
 // stage writes m's data, identity (persisted in ids) and metadata to the new
 // file tmp and opens a host descriptor for each handle. Descriptors open before the final chmod,
-// which may forbid their access mode.
+// which may forbid their access mode. The file is created with m's
+// permissions plus the owner's read and write, so the usual modes need no
+// chmod afterwards.
 func stage(tmp string, m *memFile, ids *idStore) (map[*memHandle]*os.File, error) {
-	out, err := hostfile.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	out, err := hostfile.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_RDWR, m.mode.Perm()|0o600)
 	if err != nil {
 		return nil, err
 	}
 	// A file shows the same owner in memory and on disk (see newOwner); the
 	// staging directory need not hand out the group the final one does.
-	err = matchOwner(out, m.uid, m.gid)
+	created, err := matchOwner(out, m.uid, m.gid)
 	if err == nil {
 		_, err = out.Write(m.data)
 	}
@@ -598,17 +600,14 @@ func stage(tmp string, m *memFile, ids *idStore) (map[*memHandle]*os.File, error
 	if err == nil {
 		err = ids.persist(tmp, m.id)
 	}
-	if err == nil {
+	if err == nil && (created == nil || created.Mode()&memModeBits != m.mode) {
 		err = os.Chmod(tmp, m.mode)
 	}
 	if err == nil {
 		err = keepMode(tmp, m.mode)
 	}
 	if err == nil {
-		err = os.Chtimes(tmp, m.atime, m.mtime)
-	}
-	if err == nil {
-		err = setCreationTime(tmp, m.created)
+		err = setTimes(tmp, m.atime, m.mtime, m.created)
 	}
 	return fds, err
 }

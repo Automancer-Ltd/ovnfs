@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // ONC RPC (RFC 5531) programs this server answers.
@@ -70,9 +71,27 @@ type call struct {
 // conn is one client connection. Replies may go out in any order: each
 // carries its call's xid.
 type conn struct {
-	srv     *Server
-	nc      net.Conn
-	wmu     sync.Mutex // serializes replies
+	srv *Server
+	nc  net.Conn
+	// Replies queue under qmu; the goroutine holding wmu writes them (send).
+	qmu    sync.Mutex
+	queued []*[]byte // reply records not yet written, pooled buffers
+	wmu    sync.Mutex
+	spare  []*[]byte   // the queue's other slice, owned by wmu's holder
+	iov    net.Buffers // the records of one write, owned by wmu's holder
+	broken bool        // a write failed; guarded by wmu
+	// With Server.Concurrency above one, calls are read by one goroutine
+	// at a time (read) and answered by it or by workers (serve).
+	r       *bufio.Reader
+	jobs    chan job
+	slots   chan struct{} // one per call being answered
+	workers atomic.Int32
+	wg      sync.WaitGroup // readers, workers and calls a reader handed over
+	inline  atomic.Uint64  // the call a reader answers itself, 0 for none (answerInline)
+	since   atomic.Int64   // when that call started, in monotonic nanoseconds (sinceStart)
+	seq     atomic.Uint64  // numbers inline calls
+	armed   atomic.Bool    // watch is set
+	watch   *time.Timer    // runs watchInline
 	v3sizes clientReportedSizes
 	// v4client is the NFSv4 client last identified on this connection, for
 	// requests that name none (an NFSv4.0 client uses its own connections).
@@ -96,85 +115,198 @@ type job struct {
 	turn turn
 }
 
+// inlineMax is how long a call the reading goroutine answers itself may
+// hold up the calls behind it before watchInline hands reading to another
+// goroutine; watchInline looks this often while such calls are answered.
+const inlineMax = time.Millisecond
+
+// start anchors sinceStart.
+var start = time.Now()
+
+// sinceStart is the monotonic time since start.
+func sinceStart() int64 { return int64(time.Since(start)) }
+
 // serve answers calls until the client disconnects or a read fails. Up to
 // Server.Concurrency calls run at once, since Linux multiplexes a mount's
 // I/O over one connection and one slow call must not stall the rest; calls
 // on one file keep their arrival order where replies show it (fileOrder).
+//
+// The reading goroutine answers a quick call (quickProc) itself when it
+// waits for no earlier change and no other call is buffered: handing it to a
+// worker costs a goroutine wakeup, often a thread wakeup, which took more
+// CPU than answering a LOOKUP or GETATTR. Should the call take longer than
+// inlineMax, another goroutine takes over reading (watchInline).
 func (c *conn) serve() {
 	defer c.nc.Close()
-	var wg sync.WaitGroup
-	defer wg.Wait()
-	limit := max(c.srv.Concurrency, 1)
-	// jobs is unbuffered: a send succeeds only when a worker is idle, so at
-	// most limit calls are in flight. Workers start lazily up to limit and
-	// exit when jobs closes, after finishing every accepted call. A call
-	// enters its file's order before it is handed over, so it only ever
-	// waits for calls already held by workers.
-	jobs := make(chan job)
-	defer close(jobs)
-	workers := 0
-	work := func(first job) {
-		defer wg.Done()
+	c.r = bufio.NewReaderSize(c.nc, 64<<10)
+	if c.srv.Concurrency <= 1 {
 		var cl call
 		var reply encoder
-		for j := first; j.req != nil; j = <-jobs {
-			j.turn.wait()
-			c.answer(*j.req, &cl, &reply)
-			j.turn.leave()
-			putBuf(j.req)
+		for {
+			req := bufs.Get().(*[]byte)
+			rec, err := readRecord(c.r, *req)
+			if err != nil {
+				putBuf(req)
+				c.readFailed(err)
+				return
+			}
+			c.answer(rec, &cl, &reply)
+			putBuf(req)
 		}
 	}
-	r := bufio.NewReaderSize(c.nc, 64<<10)
+	// jobs is unbuffered: a send succeeds only when a worker is idle.
+	// Workers start lazily up to Concurrency and exit when jobs closes,
+	// after finishing every accepted call. Each call takes a slot before
+	// it is answered, so at most Concurrency calls run at once. A call
+	// enters its file's order before it takes a slot, so it only ever waits
+	// for calls already being answered.
+	c.jobs = make(chan job)
+	c.slots = make(chan struct{}, c.srv.Concurrency)
+	c.watch = time.AfterFunc(time.Hour, c.watchInline)
+	c.watch.Stop()
+	defer c.watch.Stop()
+	c.wg.Add(1)
+	c.read()
+	c.wg.Wait()
+}
+
+// read reads calls and dispatches them until the client disconnects or a
+// read fails, then closes jobs; or until watchInline hands reading to
+// another goroutine while this one answers a call itself.
+func (c *conn) read() {
+	defer c.wg.Done()
 	var cl call
 	var reply encoder
 	for {
 		req := bufs.Get().(*[]byte)
-		rec, err := readRecord(r, *req)
+		rec, err := readRecord(c.r, *req)
 		if err != nil {
 			putBuf(req)
-			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-				c.srv.logf("nfs: read from %v: %v", c.nc.RemoteAddr(), err)
-			}
+			c.readFailed(err)
+			close(c.jobs)
 			return
 		}
 		*req = rec
-		if c.srv.Concurrency <= 1 {
-			c.answer(rec, &cl, &reply)
+		t, quick := c.turnOf(rec)
+		c.slots <- struct{}{}
+		if quick && t.after == nil && c.r.Buffered() == 0 {
+			reading := c.answerInline(rec, &cl, &reply)
+			t.leave()
 			putBuf(req)
+			<-c.slots
+			if !reading {
+				return
+			}
 			continue
 		}
-		j := job{req: req, turn: c.turnOf(rec)}
+		j := job{req: req, turn: t}
 		select {
-		case jobs <- j:
+		case c.jobs <- j:
 		default:
-			if workers < limit {
-				workers++
-				wg.Add(1)
-				go work(j)
+			if c.workers.Load() < int32(c.srv.Concurrency) {
+				c.workers.Add(1)
+				c.wg.Add(1)
+				go c.work(j)
 			} else {
-				jobs <- j
+				c.jobs <- j
 			}
 		}
 	}
 }
 
+// work answers first, then calls from jobs until it closes.
+func (c *conn) work(first job) {
+	defer c.wg.Done()
+	var cl call
+	var reply encoder
+	for j := first; j.req != nil; j = <-c.jobs {
+		j.turn.wait()
+		c.answer(*j.req, &cl, &reply)
+		j.turn.leave()
+		putBuf(j.req)
+		<-c.slots
+	}
+}
+
+// answerInline answers a call on the reading goroutine. It reports whether
+// that goroutine still reads: false when the call outlasted inlineMax and
+// watchInline started another reader. The watch is set at most once per
+// inlineMax rather than for each call: setting a timer for every call woke
+// the network poller for every call.
+func (c *conn) answerInline(rec []byte, cl *call, reply *encoder) (reading bool) {
+	seq := c.seq.Add(1)
+	c.since.Store(sinceStart())
+	c.inline.Store(seq)
+	if c.armed.CompareAndSwap(false, true) {
+		c.watch.Reset(inlineMax)
+	}
+	c.answer(rec, cl, reply)
+	return c.inline.CompareAndSwap(seq, 0)
+}
+
+// watchInline starts another reader when the reader has been answering one
+// call itself for inlineMax, so a slow call does not stall the calls behind
+// it, and looks again later while a reader answers a call itself.
+func (c *conn) watchInline() {
+	c.armed.Store(false)
+	seq := c.inline.Load()
+	if seq == 0 {
+		return // answerInline sets the watch again
+	}
+	if sinceStart()-c.since.Load() >= int64(inlineMax) && c.inline.CompareAndSwap(seq, 0) {
+		c.wg.Add(1)
+		go c.read()
+		return
+	}
+	if c.armed.CompareAndSwap(false, true) {
+		c.watch.Reset(inlineMax)
+	}
+}
+
+// readFailed logs a read error other than the client disconnecting.
+func (c *conn) readFailed(err error) {
+	if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+		c.srv.logf("nfs: read from %v: %v", c.nc.RemoteAddr(), err)
+	}
+}
+
+// quickProc marks the NFSv3 procedures the reading goroutine may answer
+// itself (serve): those that usually take microseconds. One that turns out
+// slow, such as the first WRITE copying a file up, holds up the calls behind
+// it for at most inlineMax.
+var quickProc = [...]bool{
+	v3Null:     true,
+	v3GetAttr:  true,
+	v3Lookup:   true,
+	v3Access:   true,
+	v3Readlink: true,
+	v3Write:    true,
+	v3Create:   true,
+	v3FSStat:   true,
+	v3FSInfo:   true,
+	v3PathConf: true,
+	v3Commit:   true,
+}
+
 // turnOf enters an NFSv3 call in its file's order: SETATTR and WRITE change
-// the file; GETATTR, ACCESS, READ and COMMIT report its attributes. Other
+// the file; GETATTR, READ and COMMIT report its attributes. Other
 // calls, and calls that do not decode, get the zero turn; answer rejects
-// the malformed ones.
-func (c *conn) turnOf(rec []byte) turn {
+// the malformed ones. quick reports an NFSv3 call of a quickProc.
+func (c *conn) turnOf(rec []byte) (t turn, quick bool) {
 	d := decoder{buf: rec}
 	d.u32() // xid
 	if d.u32() != msgCall || d.u32() != 2 || d.u32() != progNFS || d.u32() != 3 {
-		return turn{}
+		return turn{}, false
 	}
 	var changes bool
-	switch d.u32() {
+	proc := d.u32()
+	quick = proc < uint32(len(quickProc)) && quickProc[proc]
+	switch proc {
 	case v3SetAttr, v3Write:
 		changes = true
-	case v3GetAttr, v3Access, v3Read, v3Commit:
+	case v3GetAttr, v3Read, v3Commit:
 	default:
-		return turn{}
+		return turn{}, quick
 	}
 	d.u32()
 	d.opaque(maxAuthBytes) // credential
@@ -182,9 +314,9 @@ func (c *conn) turnOf(rec []byte) turn {
 	d.opaque(maxAuthBytes) // verifier
 	id, _, ok := d.fh(maxFH3)
 	if d.err != nil || !ok {
-		return turn{}
+		return turn{}, quick
 	}
-	return c.srv.v3.order.enter(id, changes)
+	return c.srv.v3.order.enter(id, changes), quick
 }
 
 // readRecord reads one record into buf, joining its fragments.
@@ -237,7 +369,6 @@ func (c *conn) answer(rec []byte, cl *call, e *encoder) {
 	}
 
 	rb := bufs.Get().(*[]byte)
-	defer putBuf(rb)
 	*e = encoder{
 		buf:      *rb,
 		sizes:    &c.v3sizes,
@@ -271,21 +402,79 @@ func (c *conn) answer(rec []byte, cl *call, e *encoder) {
 	}
 	e.put32(0, lastFragment|uint32(e.len()-4))
 	*rb = e.buf
-	sent := c.send(e.buf)
+	sent := c.send(rb, e.sizePending)
 	e.finishSize(sent)
 	cl.args = decoder{}
 	e.buf = nil
 }
 
-// send writes one reply record; a failed write closes the connection.
-func (c *conn) send(b []byte) bool {
-	c.wmu.Lock()
-	_, err := c.nc.Write(b)
-	c.wmu.Unlock()
-	if err != nil {
-		c.nc.Close()
+// send queues one reply record, taking over its pooled buffer, and writes
+// the queue unless another goroutine is writing, which then writes this
+// record too: replies finished together go out in one writev. A failed write
+// closes the connection. With wait, send blocks until the record is written
+// and reports whether it was; otherwise it reports true once queued.
+func (c *conn) send(rec *[]byte, wait bool) bool {
+	c.qmu.Lock()
+	c.queued = append(c.queued, rec)
+	c.qmu.Unlock()
+	sent := true
+	for {
+		if wait {
+			c.wmu.Lock()
+		} else if !c.wmu.TryLock() {
+			// The holder looks at the queue again after unlocking.
+			return sent
+		}
+		c.flush()
+		if wait {
+			sent, wait = !c.broken, false
+		}
+		c.wmu.Unlock()
+		c.qmu.Lock()
+		empty := len(c.queued) == 0
+		c.qmu.Unlock()
+		if empty {
+			return sent
+		}
 	}
-	return err == nil
+}
+
+// flush writes the queued records until the queue is empty, returning their
+// buffers to the pool. The caller holds wmu.
+func (c *conn) flush() {
+	for {
+		c.qmu.Lock()
+		q := c.queued
+		c.queued = c.spare
+		c.qmu.Unlock()
+		if len(q) == 0 {
+			c.spare = q
+			return
+		}
+		if !c.broken {
+			var err error
+			if len(q) == 1 {
+				_, err = c.nc.Write(*q[0])
+			} else {
+				for _, b := range q {
+					c.iov = append(c.iov, *b)
+				}
+				iov := c.iov
+				_, err = iov.WriteTo(c.nc)
+				clear(c.iov)
+				c.iov = c.iov[:0]
+			}
+			if err != nil {
+				c.broken = true
+				c.nc.Close()
+			}
+		}
+		for _, b := range q {
+			putBuf(b)
+		}
+		clear(q)
+		c.spare = q[:0]
+	}
 }
 
 // dispatch answers a call, appending the result body to res, and returns the

@@ -22,6 +22,9 @@ type listing struct {
 	verf    uint64
 	first   uint64
 	entries []os.FileInfo
+	// changes is Server.changes from before the directory was read: while
+	// it is unchanged, the entries' attributes are as current as when read.
+	changes uint64
 }
 
 // after returns the index of the first entry after cookie; false for a
@@ -68,6 +71,7 @@ func (s *Server) list(id uint64, p string, cookie, verf uint64) (*listing, statu
 // drops entries whose cookie is not past the one it asked for, and ends the
 // listing at BAD_COOKIE.
 func (s *Server) relist(id uint64, p string, cookie, verf uint64) (*listing, status) {
+	changes := s.changes.Load()
 	infos, err := s.FS.ReadDir(p)
 	if err != nil {
 		return nil, statusOf(err)
@@ -82,18 +86,19 @@ func (s *Server) relist(id uint64, p string, cookie, verf uint64) (*listing, sta
 		infos = infos[i:]
 	}
 	first := cookie + 1
-	l := &listing{dir: id, verf: verifier(id, first, infos), first: first, entries: infos}
+	l := &listing{dir: id, verf: verifier(id, first, infos), first: first, entries: infos, changes: changes}
 	s.dirs.put(l)
 	return l, stOK
 }
 
 // read lists directory id, at path p, sorted by name and numbered from first.
 func (s *Server) read(id uint64, p string, first uint64) (*listing, status) {
+	changes := s.changes.Load()
 	infos, err := s.FS.ReadDir(p)
 	if err != nil {
 		return nil, statusOf(err)
 	}
-	return &listing{dir: id, verf: verifier(id, first, infos), first: first, entries: infos}, stOK
+	return &listing{dir: id, verf: verifier(id, first, infos), first: first, entries: infos, changes: changes}, stOK
 }
 
 // verifier is a cookie verifier for a directory's entry names and their

@@ -29,6 +29,28 @@ func setCreationTime(p string, t time.Time) error {
 	return unix.Setattrlist(p, &attrs, data[:], unix.FSOPT_NOFOLLOW)
 }
 
+// setTimes gives a staged memory file its creation, modification and access
+// times in one setattrlist(2), where os.Chtimes and setCreationTime took a
+// path lookup and a call each. A zero time leaves that time alone, as
+// os.Chtimes does.
+func setTimes(p string, atime, mtime, created time.Time) error {
+	if atime.IsZero() || mtime.IsZero() || created.IsZero() {
+		if err := os.Chtimes(p, atime, mtime); err != nil {
+			return err
+		}
+		return setCreationTime(p, created)
+	}
+	// The buffer holds the attributes in bitmap order: creation,
+	// modification, access, each a struct timespec.
+	var data [48]byte
+	for i, t := range [...]time.Time{created, mtime, atime} {
+		binary.NativeEndian.PutUint64(data[16*i:], uint64(t.Unix()))
+		binary.NativeEndian.PutUint64(data[16*i+8:], uint64(t.Nanosecond()))
+	}
+	attrs := unix.Attrlist{Bitmapcount: unix.ATTR_BIT_MAP_COUNT, Commonattr: unix.ATTR_CMN_CRTIME | unix.ATTR_CMN_MODTIME | unix.ATTR_CMN_ACCTIME}
+	return unix.Setattrlist(p, &attrs, data[:], unix.FSOPT_NOFOLLOW)
+}
+
 // birthTime returns the creation time host metadata records, which a stored
 // layer entry's copy-up restores.
 func birthTime(info os.FileInfo) (time.Time, bool) {

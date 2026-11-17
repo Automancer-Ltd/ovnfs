@@ -311,6 +311,57 @@ func TestV3ReaddirChangesMidListing(t *testing.T) {
 	}
 }
 
+// TestV3ReaddirPlusContinuationAfterRecall checks that READDIRPLUS
+// continuations of a cacheable directory report an entry changed behind the
+// server once the change was recalled, and one changed by a WRITE.
+func TestV3ReaddirPlusContinuationAfterRecall(t *testing.T) {
+	fs := newTestFS(t)
+	fs.cacheable = func(string) bool { return true }
+	files := dirFixture(t, fs, 30)
+	s := &Server{FS: fs}
+	call := direct(s)
+	dir := fs.FileID("d")
+
+	pageFrom := func(first dirPage3, name string) *wireAttr {
+		t.Helper()
+		cookie := first.entries[len(first.entries)-1].cookie
+		for {
+			pg := readdir3(t, call, true, dir, cookie, first.verf, 4096, 600)
+			if pg.st != stOK {
+				t.Fatalf("continuation: %d", pg.st)
+			}
+			for _, e := range pg.entries {
+				if e.name == name {
+					return e.attrs
+				}
+			}
+			if pg.eof {
+				t.Fatalf("%s not listed", name)
+			}
+			cookie = pg.entries[len(pg.entries)-1].cookie
+		}
+	}
+	last := files[len(files)-1]
+	first := readdir3(t, call, true, dir, 0, 0, 4096, 600)
+	if first.eof {
+		t.Fatal("the first page holds every entry")
+	}
+	fs.write(t, path.Join("d", last), "grown behind the server")
+	s.Recall(fs.FileID(path.Join("d", last)))
+	if a := pageFrom(first, last); a == nil || a.size != uint64(len("grown behind the server")) {
+		t.Fatalf("after a recall: %+v", a)
+	}
+
+	first = readdir3(t, call, true, dir, 0, 0, 4096, 600)
+	id := fs.FileID(path.Join("d", last))
+	if stat, d := call(v3Write, writeArgs(id, 0, []byte("rewritten by the client, longer"))); stat != rpcSuccess || status(d.u32()) != stOK {
+		t.Fatal("WRITE failed")
+	}
+	if a := pageFrom(first, last); a == nil || a.size != uint64(len("rewritten by the client, longer")) {
+		t.Fatalf("after a WRITE: %+v", a)
+	}
+}
+
 // TestV3ReaddirEvictedTwice checks that a continuation of a changed
 // directory whose snapshot was evicted resumes after the last name its page
 // returned, numbered after its cookie, so a reader that loses its snapshot

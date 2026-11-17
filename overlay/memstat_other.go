@@ -18,11 +18,15 @@ func memStat(memInfo) any { return nil }
 // newOwner has no numeric owners to report on this platform.
 func newOwner(os.FileInfo) (uid, gid uint32) { return 0, 0 }
 
-// matchOwner leaves ownership to the platform.
-func matchOwner(*os.File, uint32, uint32) error { return nil }
+// matchOwner leaves ownership to the platform and reports no metadata.
+func matchOwner(*os.File, uint32, uint32) (os.FileInfo, error) { return nil, nil }
 
 // birthTime reports no creation time to restore: the platform keeps its own.
 func birthTime(os.FileInfo) (time.Time, bool) { return time.Time{}, false }
 
 // setCreationTime leaves creation times to the platform.
 func setCreationTime(string, time.Time) error { return nil }
+
+// setTimes gives a staged memory file its access and modification times,
+// leaving its creation time to the platform.
+func setTimes(p string, atime, mtime, _ time.Time) error { return os.Chtimes(p, atime, mtime) }

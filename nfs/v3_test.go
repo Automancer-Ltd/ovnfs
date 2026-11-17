@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"os"
 	"slices"
@@ -148,7 +149,8 @@ func TestV3HandlesAndNames(t *testing.T) {
 	}
 }
 
-// TestV3Lookup checks LOOKUP of names, "." and "..", and the reply layout.
+// TestV3Lookup checks LOOKUP of names, "." and "..", and the reply layout:
+// the found file's attributes, without the directory's.
 func TestV3Lookup(t *testing.T) {
 	fs := newTestFS(t)
 	if err := os.Mkdir(fs.host("d"), 0o755); err != nil {
@@ -158,35 +160,41 @@ func TestV3Lookup(t *testing.T) {
 	c := v3server(t, fs)
 	dir := fs.FileID("d")
 
-	lookup := func(dirID uint64, name string) (status, uint64, wireAttr, wireAttr) {
+	lookup := func(dirID uint64, name string) (status, uint64, wireAttr) {
 		t.Helper()
 		st, d := c.v3call(v3Lookup, func(e *encoder) { dirop(e, dirID, name) })
 		if st != stOK {
-			return st, 0, wireAttr{}, wireAttr{}
+			return st, 0, wireAttr{}
 		}
 		id, _, ok := d.fh(maxFH3)
 		obj, ok1 := postOpOf(t, d)
-		da, ok2 := postOpOf(t, d)
-		if !ok || !ok1 || !ok2 || d.err != nil || len(d.buf) != 0 {
+		_, dirAttrs := postOpOf(t, d)
+		if !ok || !ok1 || dirAttrs || d.err != nil || len(d.buf) != 0 {
 			t.Fatalf("LOOKUP %q: malformed reply", name)
 		}
-		return st, id, obj, da
+		return st, id, obj
 	}
-	st, id, obj, da := lookup(dir, "f")
-	if st != stOK || id != fs.FileID("d/f") || obj.fileid != id || obj.size != 5 || obj.typ != uint32(typeReg) || da.fileid != dir {
-		t.Errorf("LOOKUP f: %d id %d attrs %+v dir %+v", st, id, obj, da)
+	st, id, obj := lookup(dir, "f")
+	if st != stOK || id != fs.FileID("d/f") || obj.fileid != id || obj.size != 5 || obj.typ != uint32(typeReg) {
+		t.Errorf("LOOKUP f: %d id %d attrs %+v", st, id, obj)
 	}
-	if st, id, _, _ := lookup(dir, "."); st != stOK || id != dir {
+	if st, id, _ := lookup(dir, "."); st != stOK || id != dir {
 		t.Errorf("LOOKUP .: %d id %d", st, id)
 	}
-	if st, id, obj, _ := lookup(dir, ".."); st != stOK || id != 1 || obj.typ != uint32(typeDir) {
+	if st, id, obj := lookup(dir, ".."); st != stOK || id != 1 || obj.typ != uint32(typeDir) {
 		t.Errorf("LOOKUP ..: %d id %d", st, id)
 	}
-	if st, _, _, _ := lookup(1, ".."); st != stAccess {
+	if st, _, _ := lookup(1, ".."); st != stAccess {
 		t.Errorf("LOOKUP .. at the root: %d, want ACCES", st)
 	}
-	if st, _, _, _ := lookup(fs.FileID("d/f"), "x"); st != stNotDir {
+	if st, _, _ := lookup(fs.FileID("d/f"), "x"); st != stNotDir {
 		t.Errorf("LOOKUP in a file: %d, want NOTDIR", st)
+	}
+	if st, _, _ := lookup(fs.FileID("d/f"), "."); st != stNotDir {
+		t.Errorf("LOOKUP . of a file: %d, want NOTDIR", st)
+	}
+	if st, _, _ := lookup(dir, "missing"); st != stNoEnt {
+		t.Errorf("LOOKUP of a missing name: %d, want NOENT", st)
 	}
 }
 
@@ -225,7 +233,7 @@ func TestV3SizeRegressionRetiresHandle(t *testing.T) {
 		}
 		got, gen, ok := d.fh(maxFH3)
 		a, attrs := postOpOf(t, d)
-		if _, dirAttrs := postOpOf(t, d); !ok || !attrs || !dirAttrs || d.err != nil || len(d.buf) != 0 {
+		if _, dirAttrs := postOpOf(t, d); !ok || !attrs || dirAttrs || d.err != nil || len(d.buf) != 0 {
 			t.Fatal("LOOKUP: malformed reply")
 		}
 		if got != id || a.fileid != id {
@@ -621,13 +629,52 @@ func (c *rpcClient) create3(name string, how uint32, args func(*encoder)) (statu
 	if a, aok := postOpOf(c.t, d); !ok || !aok || a.fileid != id {
 		c.t.Fatal("CREATE: handle and attributes disagree")
 	}
-	if d.bool() { // no pre-op attributes for the directory
-		c.t.Fatal("CREATE: unexpected pre-op attributes")
+	if !d.bool() {
+		c.t.Fatal("CREATE: no pre-op attributes for the directory")
 	}
+	d.fixed(24)
 	if _, ok := postOpOf(c.t, d); !ok || d.err != nil || len(d.buf) != 0 {
 		c.t.Fatal("CREATE: malformed directory wcc_data")
 	}
 	return st, id
+}
+
+// TestV3CreateChainsDirectoryAttributes checks that the directory wcc_data
+// of each CREATE starts from the attributes the previous change left: the
+// macOS client keeps its name cache of the directory only then.
+func TestV3CreateChainsDirectoryAttributes(t *testing.T) {
+	fs := newTestFS(t)
+	if err := os.Mkdir(fs.host("d"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := v3server(t, fs)
+	dir := fs.FileID("d")
+	st, d := c.v3call(v3GetAttr, func(e *encoder) { e.fh(dir, 0) })
+	if st != stOK {
+		t.Fatalf("GETATTR: %d", st)
+	}
+	a := fattr3Of(d)
+	last := sizeTime{a.size, a.mtime}
+	for i := range 4 {
+		name := fmt.Sprintf("f%d", i)
+		st, d := c.v3call(v3Create, func(e *encoder) {
+			dirop(e, dir, name)
+			e.u32(createUnchecked)
+			noSattr(e)
+		})
+		if st != stOK || !d.bool() {
+			t.Fatalf("CREATE %s: %d", name, st)
+		}
+		d.fh(maxFH3)
+		if _, ok := postOpOf(t, d); !ok {
+			t.Fatalf("CREATE %s: no attributes", name)
+		}
+		pre, post := wccOf(t, d)
+		if pre != last {
+			t.Fatalf("CREATE %s: pre-op %+v, want the directory's %+v", name, pre, last)
+		}
+		last = post
+	}
 }
 
 // TestV3CreateModes checks UNCHECKED, GUARDED and EXCLUSIVE CREATE.
@@ -888,7 +935,7 @@ func TestV3FSInfoStatPathconf(t *testing.T) {
 	}
 
 	st, d = c.v3call(v3Access, func(e *encoder) { e.fh(1, 0); e.u32(0x3f) })
-	if _, ok := postOpOf(t, d); st != stOK || !ok || d.u32() != 0x3f || len(d.buf) != 0 {
+	if _, ok := postOpOf(t, d); st != stOK || ok || d.u32() != 0x3f || len(d.buf) != 0 {
 		t.Errorf("ACCESS: %d", st)
 	}
 }

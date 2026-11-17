@@ -22,6 +22,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -48,7 +49,11 @@ type Server struct {
 	once sync.Once
 	// verf is this instance's write verifier: it changes when the server
 	// restarts, telling clients to resend unstable writes.
-	verf    [8]byte
+	verf [8]byte
+	// changes counts the changes that may have made a listing's attributes
+	// stale: each NFSv3 change once it is done, each NFSv4 COMPOUND and each
+	// recall (see listing.changes).
+	changes atomic.Uint64
 	dirs    dirCache
 	resumes resumeCache
 	v3      v3State
@@ -94,12 +99,18 @@ func (s *Server) start() {
 // changes. Changes through this server recall conflicting delegations
 // themselves; the embedder calls Recall for every other change to a file
 // Backend.Cacheable admits. It does not block.
-func (s *Server) Recall(id uint64) { s.v4.recall(id) }
+func (s *Server) Recall(id uint64) {
+	s.changes.Add(1)
+	s.v4.recall(id)
+}
 
 // RecallRange is Recall of every file id in [first, last], for the
 // embedder's changes that reach many files at once, such as every file of a
 // checkout (a checkout's ids share one range). It does not block.
-func (s *Server) RecallRange(first, last uint64) { s.v4.recallRange(first, last) }
+func (s *Server) RecallRange(first, last uint64) {
+	s.changes.Add(1)
+	s.v4.recallRange(first, last)
+}
 
 // logf logs through Logf, if set.
 func (s *Server) logf(format string, args ...any) {

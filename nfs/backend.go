@@ -42,7 +42,10 @@ type Backend interface {
 	// It returns false when id is stale or names the export root.
 	RetireHandle(id uint64) bool
 	// Cacheable permits NFSv4 read delegations on p. It must return true only
-	// when every change to p made outside this server reaches Server.Recall.
+	// when every change to p made outside this server reaches Server.Recall
+	// or Server.RecallRange; for a directory, every change to its entries
+	// too, so READDIRPLUS can page through a listing without stating each
+	// entry again.
 	Cacheable(p string) bool
 	// Statfs reports the capacity FSSTAT and the NFSv4 space attributes show.
 	Statfs() (smb.Statfs, error)
