@@ -407,10 +407,7 @@ func (x *v4compound) putfh() status {
 	if !ok {
 		return stBadHandle
 	}
-	if id == 0 {
-		return stStale
-	}
-	p, live := x.s.FS.Path(id, gen)
+	p, gen, live := x.s.resolve(id, gen)
 	if !live {
 		return stStale
 	}

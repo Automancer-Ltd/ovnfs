@@ -108,11 +108,15 @@ func TestV3HandlesAndNames(t *testing.T) {
 		t.Errorf("unknown id: %d, want STALE", st)
 	}
 	// A client upgraded across the handle change still holds id-only
-	// handles: STALE makes it look the name up again.
-	if st, _ := c.v3call(v3GetAttr, func(e *encoder) { e.opaque(binary.BigEndian.AppendUint64(nil, 1)) }); st != stStale {
+	// handles: STALE makes it look the name up again, from the root, whose
+	// legacy handle stays valid so a kept mount keeps working.
+	f := fs.FileID("f")
+	if st, _ := c.v3call(v3GetAttr, func(e *encoder) { e.opaque(binary.BigEndian.AppendUint64(nil, f)) }); st != stStale {
 		t.Errorf("legacy 8-byte handle: %d, want STALE", st)
 	}
-	f := fs.FileID("f")
+	if st, _ := c.v3call(v3GetAttr, func(e *encoder) { e.opaque(binary.BigEndian.AppendUint64(nil, fs.FileID(""))) }); st != stOK {
+		t.Errorf("legacy root handle: %d, want OK", st)
+	}
 	if st, _ := c.v3call(v3GetAttr, func(e *encoder) { e.fh(f, 0) }); st != stOK {
 		t.Errorf("current handle: %d", st)
 	}

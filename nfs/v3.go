@@ -122,20 +122,36 @@ func (s *Server) nfs3(c *call, res *encoder) acceptStat {
 }
 
 // path3 resolves a decoded file handle: BADHANDLE for one no server can have
-// issued, STALE for a legacy handle or one whose file is gone or whose
-// generation is no longer current.
+// issued, STALE for one resolve refuses.
 func (s *Server) path3(id, gen uint64, ok bool) (string, status) {
 	if !ok {
 		return "", stBadHandle
 	}
-	if id == 0 {
-		return "", stStale
-	}
-	p, live := s.FS.Path(id, gen)
+	p, _, live := s.resolve(id, gen)
 	if !live {
 		return "", stStale
 	}
 	return p, stOK
+}
+
+// resolve finds the current path of the handle id with generation gen, and
+// the generation its current handles carry: false when its file is gone,
+// its generation is no longer current, or it is a legacy handle of anything
+// but the export root. The root's legacy handle stays valid so a mount kept
+// across the handle-format upgrade keeps working: everything below it is
+// looked up again.
+func (s *Server) resolve(id, gen uint64) (string, uint64, bool) {
+	if id == 0 {
+		return "", 0, false
+	}
+	if gen == legacyGen {
+		if id != s.FS.FileID("") {
+			return "", 0, false
+		}
+		gen = s.FS.Generation(id)
+	}
+	p, live := s.FS.Path(id, gen)
+	return p, gen, live
 }
 
 // checkName3 vets a file name a client sends. Empty names and names with a

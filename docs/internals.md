@@ -265,7 +265,8 @@ resolves into a later checkout in the same slot) and how often the server
 retired the id's handles. A client caching a larger size than the file has
 gets its handle retired, so it drops its cached pages, while the file keeps
 its fileid; a restart forgets these retirements. Handles of earlier builds
-(8 bytes) are stale.
+(8 bytes) are stale, except the export root's, so a mount kept across the
+upgrade keeps working and looks everything below the root up again.
 
 Builds that kept a node id table left `STATE/nodes.log*` behind; the daemon
 deletes those files in the background when it starts.

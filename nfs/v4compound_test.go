@@ -129,6 +129,9 @@ func TestV4FileHandles(t *testing.T) {
 	if s := c.run(func(e *encoder) { e.u32(op4PutFH); e.opaque(binary.BigEndian.AppendUint64(nil, id)) }).status; s != stStale {
 		t.Fatalf("legacy 8-byte handle: status %d, want STALE", s)
 	}
+	if s := c.run(func(e *encoder) { e.u32(op4PutFH); e.opaque(binary.BigEndian.AppendUint64(nil, fs.FileID(""))) }).status; s != stOK {
+		t.Fatalf("legacy root handle: status %d, want OK", s)
+	}
 	if s := c.run(func(e *encoder) { e.u32(op4PutFH); e.fh(id, 1) }).status; s != stStale {
 		t.Fatalf("wrong generation: status %d, want STALE", s)
 	}

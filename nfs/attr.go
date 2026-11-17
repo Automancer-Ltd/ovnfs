@@ -146,18 +146,24 @@ const fhSize = 16
 
 // legacyFHSize is the length of the id-only handles earlier servers issued.
 // Clients still holding one after an upgrade get STALE, which makes them
-// look the name up again, rather than BADHANDLE, which they treat as fatal.
+// look the name up again, rather than BADHANDLE, which they treat as fatal;
+// the export root's still resolves (Server.resolve), since a mount kept
+// across the upgrade reaches everything else through it.
 const legacyFHSize = 8
+
+// legacyGen is the generation a legacy handle decodes to; no current handle
+// carries it.
+const legacyGen = ^uint64(0)
 
 // handleOf decodes a file handle; ok is false for one no server can have
 // issued (NFS3ERR_BADHANDLE, NFS4ERR_BADHANDLE). A legacy handle decodes to
-// id 0, which names no file, so resolving it answers STALE.
+// its id with legacyGen.
 func handleOf(fh []byte) (id, gen uint64, ok bool) {
 	switch len(fh) {
 	case fhSize:
 		return binary.BigEndian.Uint64(fh), binary.BigEndian.Uint64(fh[8:]), true
 	case legacyFHSize:
-		return 0, 0, true
+		return binary.BigEndian.Uint64(fh), legacyGen, true
 	}
 	return 0, 0, false
 }
