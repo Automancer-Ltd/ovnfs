@@ -242,17 +242,19 @@ func TestBaseIdentities(t *testing.T) {
 			t.Errorf("locate %v = %q, %v; want %q", id, got, ok, p)
 		}
 	}
-	info, err := view.Lstat("node_modules/pkg/index.js")
-	if err != nil {
-		t.Fatal(err)
-	}
-	id, ok := ident.Of(info)
-	if !ok || id.Space() != ident.State {
-		t.Fatalf("snapshot file identity = %v, %v; want State", id, ok)
-	}
-	if runtime.GOOS == "darwin" {
-		if got, ok := view.Locate(id); !ok || got != "node_modules/pkg/index.js" {
-			t.Errorf("locate snapshot file = %q, %v", got, ok)
+	if sharesBlocks(t, dir) { // else the cache root starts empty
+		info, err := view.Lstat("node_modules/pkg/index.js")
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, ok := ident.Of(info)
+		if !ok || id.Space() != ident.State {
+			t.Fatalf("snapshot file identity = %v, %v; want State", id, ok)
+		}
+		if runtime.GOOS == "darwin" {
+			if got, ok := view.Locate(id); !ok || got != "node_modules/pkg/index.js" {
+				t.Errorf("locate snapshot file = %q, %v", got, ok)
+			}
 		}
 	}
 	hidden, _ := ident.New(ident.Capture, uint64(b.index.nodes))

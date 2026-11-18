@@ -373,8 +373,8 @@ func (b *Base) Bottom(c *Caches) overlay.Bottom {
 }
 
 // Close commits pending pin metadata, stops object readers and the
-// group-commit timer, and closes the cache snapshots' open trees, after which
-// their paths read as absent. The capture index stays mapped until the base is
+// group-commit timer, and closes the cache snapshots' open trees, each once
+// its take has ended, after which their paths read as absent. The capture index stays mapped until the base is
 // unreachable, so a lookup racing Close (or Remove) reads the capture as it
 // was, never unmapped memory.
 func (b *Base) Close() error {
@@ -386,6 +386,9 @@ func (b *Base) Close() error {
 		}
 		b.objectsMu.Unlock()
 		for _, c := range b.served() {
+			// A snapshot being taken still writes its tree, below the
+			// base's storage: it ends before its files close.
+			c.Wait()
 			c.files.close()
 		}
 		b.closeErr = errors.Join(errs...)
@@ -398,10 +401,6 @@ func (b *Base) Close() error {
 // file cannot be deleted (Windows), the directory goes once the capture index
 // is unmapped.
 func (b *Base) Remove() error {
-	// Snapshots being taken still write below the base's storage.
-	for _, c := range b.served() {
-		c.Wait()
-	}
 	err := b.Close()
 	dir := b.config.StateDir
 	b.index.m.orphan.Store(&dir)

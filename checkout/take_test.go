@@ -88,9 +88,13 @@ func TestTakeWorkingSubtree(t *testing.T) {
 	if _, err := f.reg.New(ctx, api.NewArgs{Dir: dir, Name: "working", Rev: "HEAD", Take: []string{".:dir"}}); err != nil {
 		t.Fatal(err)
 	}
+	cached := "ignored cache\n"
+	if !sharesBlocks(t) {
+		cached = "<absent>" // the cache root starts empty
+	}
 	for p, want := range map[string]string{
 		"dir/changed.txt": "working edit\n", "dir/new.txt": "untracked\n", "dir/deleted.txt": "<absent>",
-		"tracked.txt": "original\n", "node_modules/kept/artifact": "ignored cache\n",
+		"tracked.txt": "original\n", "node_modules/kept/artifact": cached,
 	} {
 		if got := f.read("working", p); got != want {
 			t.Errorf("%s = %q, want %q", p, got, want)
@@ -116,7 +120,11 @@ func TestTakeRevisionDoesNotApplyTakenContent(t *testing.T) {
 	if _, err := f.reg.New(ctx, api.NewArgs{Dir: dir, Name: "selected", Take: []string{rev + ":tracked.txt"}}); err != nil {
 		t.Fatal(err)
 	}
-	for p, want := range map[string]string{"tracked.txt": "historical selection\n", "other.txt": "outside dirty\n", "build/artifact": "ignored artifact\n"} {
+	artifact := "ignored artifact\n"
+	if !sharesBlocks(t) {
+		artifact = "<absent>" // the cache root starts empty
+	}
+	for p, want := range map[string]string{"tracked.txt": "historical selection\n", "other.txt": "outside dirty\n", "build/artifact": artifact} {
 		if got := f.read("selected", p); got != want {
 			t.Fatalf("%s = %q, want %q", p, got, want)
 		}
