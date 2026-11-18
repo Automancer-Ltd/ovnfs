@@ -328,6 +328,38 @@ func TestAttributesRejectedQueries(t *testing.T) {
 	}
 }
 
+// TestAttributesSourcePrecedence reads AttributeOptions.Source's attributes
+// unless GIT_ATTR_SOURCE or an attr.tree naming a tree overrides it, as they
+// override a checkout's own.
+func TestAttributesSourcePrecedence(t *testing.T) {
+	r := attrRepo(t)
+	testWrite(t, filepath.Join(r.Top, ".gitattributes"), "*.c foo=first\n")
+	testGit(t, r.Top, "add", "--all")
+	testGit(t, r.Top, "commit", "-qm", "first")
+	first := testGit(t, r.Top, "rev-parse", "HEAD")
+	testWrite(t, filepath.Join(r.Top, ".gitattributes"), "*.c foo=second\n")
+	testGit(t, r.Top, "commit", "-qam", "second")
+	testWrite(t, filepath.Join(r.Top, ".gitattributes"), "*.c foo=worktree\n")
+	check := func(want string) {
+		t.Helper()
+		a, err := r.Attributes([]string{"foo"}, AttributeOptions{Source: first})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if values, err := a.Check("a.c"); err != nil || values[0] != want {
+			t.Fatalf("foo = %v, %v; want %s", values, err, want)
+		}
+	}
+	check("first")
+	testGit(t, r.Top, "config", "attr.tree", "no-such-ref")
+	check("first")
+	testGit(t, r.Top, "config", "attr.tree", "HEAD")
+	check("second")
+	testGit(t, r.Top, "config", "--unset", "attr.tree")
+	t.Setenv("GIT_ATTR_SOURCE", "HEAD")
+	check("second")
+}
+
 // TestAttributesTreeSource reads .gitattributes from the tree attr.tree or
 // GIT_ATTR_SOURCE names instead of the work tree, as git does; an attr.tree
 // naming no tree is ignored, a bad GIT_ATTR_SOURCE is an error.

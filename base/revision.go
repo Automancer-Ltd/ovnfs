@@ -184,8 +184,9 @@ func reviseCapture(ctx context.Context, c Config, res *source.Result, revision *
 // presents for every file it serves with exactly REV's blob and mode (an LFS
 // pointer's object, which git's clean filter stores as that blob), so git's
 // first refresh trusts those files instead of reading each one. It runs on the
-// final capture: a path taken with other content, a gitlink, and any other path
-// the view does not serve as REV's keep zero stat data, which git reads.
+// final capture: a path taken with other content, a gitlink, an LFS pointer
+// git's clean filter would rewrite, and any other path the view does not serve
+// as REV's keep zero stat data, which git reads.
 func seedRevisionIndex(ctx context.Context, c Config, res source.Result, revision *git.Revision, fork time.Time) error {
 	stat := make(map[string]git.IndexStat, len(revision.Entries))
 	for _, e := range revision.Entries {
@@ -193,6 +194,9 @@ func seedRevisionIndex(ctx context.Context, c Config, res source.Result, revisio
 			continue
 		}
 		info := res.Info[e.Path]
+		if res.LFS[e.Path] && info.Mtime.IsZero() {
+			continue // a noncanonical pointer, presented without lfsMtime (treeFiles)
+		}
 		stat[e.Path] = git.IndexStat{Size: info.Size, Mtime: presentedMtime(info, fork)}
 	}
 	return revision.WriteIndex(ctx, filepath.Join(c.StateDir, revisionIndex), stat)

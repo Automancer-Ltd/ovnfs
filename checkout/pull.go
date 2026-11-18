@@ -170,7 +170,7 @@ func (r *Registry) mergePull(ctx context.Context, h *checkoutRecord, args api.Pu
 		}
 		seen[c.Path] = true
 		base, theirs := against[c.Path], pulled.Files[c.Path]
-		o, reason, data, err := mergeOverlay(h.fs, c.Path, base, theirs, pulled.Data[theirs.ID], blob, s)
+		o, reason, data, err := mergeOverlay(h, c.Path, base, theirs, pulled.Data[theirs.ID], blob, s)
 		if err != nil {
 			return api.PullReply{}, placed, coded(fmt.Errorf("%s: %w", c.Path, err))
 		}
@@ -199,7 +199,8 @@ func (r *Registry) mergePull(ctx context.Context, h *checkoutRecord, args api.Pu
 // as is a path a file or directory of the checkout stands in the way of. It
 // writes nothing: the caller places out for an applied, merged or marked
 // path. blob reads the content of base.
-func mergeOverlay(fs *overlay.FS, p string, base, theirs store.File, data []byte, blob func(store.File) ([]byte, error), s sides) (o outcome, reason string, out []byte, err error) {
+func mergeOverlay(h *checkoutRecord, p string, base, theirs store.File, data []byte, blob func(store.File) ([]byte, error), s sides) (o outcome, reason string, out []byte, err error) {
+	fs := h.fs
 	// A parent file or symlink must not redirect an incoming path outside the checkout.
 	d := ""
 	parts := strings.Split(p, "/")
@@ -217,11 +218,18 @@ func mergeOverlay(fs *overlay.FS, p string, base, theirs store.File, data []byte
 	if err != nil {
 		return 0, "", nil, err
 	}
+	if clean := lfsCleanData(h.base.view, p, ours, current); clean == base {
+		ours = clean // the checkout still shows the object of the base's LFS pointer
+	}
 	switch {
 	case isDir:
 		return conflict, "is a directory " + s.ours, nil, nil
 	case ours == theirs:
 		return skipped, "", nil, nil
+	case ours == base && ours.ID == theirs.ID:
+		// Only the mode changed: keep the bytes the checkout shows, an LFS
+		// object where the other side holds its pointer.
+		return applied, "", current, nil
 	case ours == base:
 		return applied, "", data, nil
 	}
@@ -230,10 +238,15 @@ func mergeOverlay(fs *overlay.FS, p string, base, theirs store.File, data []byte
 		return conflict, why, nil, nil
 	}
 	var baseData []byte
-	if base.ID != "" {
-		if baseData, err = blob(base); err != nil {
-			return 0, "", nil, err
-		}
+	switch {
+	case h.base.view.LFSLeaf(p, base.ID):
+		// A remote side knows the pointer; the merge starts from its object.
+		baseData, err = h.base.view.Content(p, base.ID)
+	case base.ID != "":
+		baseData, err = blob(base)
+	}
+	if err != nil {
+		return 0, "", nil, err
 	}
 	out, o, reason = mergeText(s.labels, current, baseData, data, why)
 	return o, reason, out, nil

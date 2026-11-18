@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+
+	"github.com/stencil-hq/ovnfs/git/internal/proc"
 )
 
 // gitProgram returns the git executable on PATH, if any. Fetches prefer it to
@@ -58,6 +60,7 @@ func (r *Repo) runGit(ctx context.Context, program string, o gitRun, args ...str
 	cmd := exec.CommandContext(ctx, program, append([]string{"-C", r.dir(), "-c", "core.hooksPath=/dev/null"}, args...)...)
 	cmd.Env = append(gitEnv(), o.env...)
 	cmd.Stdin, cmd.Stdout = o.in, o.out
+	proc.Prepare(cmd)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {

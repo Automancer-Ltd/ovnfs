@@ -175,11 +175,11 @@ func TestRevisionServesLFSObjects(t *testing.T) {
 		return fmt.Sprintf("version https://git-lfs.github.com/spec/v1\noid sha256:%x\nsize %d\n", sha256.Sum256([]byte(object)), len(object))
 	}
 	const local, fetched = "object in the LFS storage\n", "object git lfs smudge fetched\n"
-	short := strings.Repeat("promised ", 100)
 	writeTestFile(t, filepath.Join(dir, ".gitattributes"), "*.bin filter=lfs -text\n")
 	for p, content := range map[string]string{
-		"local.bin": pointer(local), "fetched.bin": pointer(fetched), "short.bin": pointer(short),
+		"local.bin": pointer(local), "fetched.bin": pointer(fetched), "wrong.bin": pointer("right object"),
 		"taken.bin": pointer(local), "notes.txt": pointer(local),
+		"legacy.bin": strings.Replace(pointer(local), "git-lfs.github.com", "hawser.github.com", 1),
 	} {
 		writeTestFile(t, filepath.Join(dir, p), content)
 	}
@@ -187,14 +187,17 @@ func TestRevisionServesLFSObjects(t *testing.T) {
 	runGit(t, dir, "add", "--all")
 	runGit(t, dir, "commit", "-qm", "lfs")
 	runGit(t, dir, "config", "filter.lfs.process", "git-lfs filter-process")
+	// A dirty .gitattributes decides nothing: REV's and the index's apply.
+	writeTestFile(t, filepath.Join(dir, ".gitattributes"), "")
 	sum := fmt.Sprintf("%x", sha256.Sum256([]byte(local)))
 	writeTestFile(t, filepath.Join(dir, ".git", "lfs", "objects", sum[:2], sum[2:4], sum), local)
+	// A stand-in git-lfs: git finds it in its exec path before PATH.
 	smudgeScript := filepath.Join(t.TempDir(), "git-lfs")
-	writeTestFile(t, smudgeScript, "#!/bin/sh\ncat >/dev/null\ncase \"$3\" in\nfetched.bin) printf '%s' '"+fetched+"' ;;\n*) printf short ;;\nesac\n")
+	writeTestFile(t, smudgeScript, "#!/bin/sh\ncat >/dev/null\ncase \"$3\" in\nfetched.bin) printf '%s' '"+fetched+"' ;;\n*) printf 'wrong object' ;;\nesac\n")
 	if err := os.Chmod(smudgeScript, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", filepath.Dir(smudgeScript)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GIT_EXEC_PATH", filepath.Dir(smudgeScript))
 	revision, err := repo.ResolveRevision(ctx, "HEAD")
 	if err != nil {
 		t.Fatal(err)
@@ -221,6 +224,11 @@ func TestRevisionServesLFSObjects(t *testing.T) {
 			t.Errorf("%s = %q (%d bytes listed), want %q", p, got, info.Size(), want)
 		}
 	}
+	// git-lfs rewrites a legacy pointer when cleaning: git must read it, so
+	// the index holds no stat data for it.
+	if info, err := b.Bottom(nil).Lstat("legacy.bin"); err != nil || info.Size() != int64(len(local)) || !info.ModTime().Equal(b.Meta().ForkTime) {
+		t.Errorf("legacy.bin = %v, %v; want its object at the fork time", info, err)
+	}
 	if leaf, _ := b.Leaf("local.bin"); string(leaf.ID) != runGit(t, dir, "rev-parse", "HEAD:local.bin") {
 		t.Errorf("tree holds %s for local.bin, not the pointer git stores", leaf.ID)
 	}
@@ -236,6 +244,9 @@ func TestRevisionServesLFSObjects(t *testing.T) {
 		if e.Path == "local.bin" && (int64(e.Size) != info.Size() || !e.Mtime.Equal(info.ModTime())) {
 			t.Errorf("index seeds local.bin with %d bytes at %s, the view shows %d at %s", e.Size, e.Mtime, info.Size(), info.ModTime())
 		}
+		if e.Path == "legacy.bin" && (e.Size != 0 || !e.Mtime.Equal(time.Unix(0, 0))) {
+			t.Errorf("index seeds legacy.bin with %d bytes at %s, want no stat data", e.Size, e.Mtime)
+		}
 	}
 
 	if runtime.GOOS == "windows" {
@@ -244,9 +255,11 @@ func TestRevisionServesLFSObjects(t *testing.T) {
 	if got := readBase(t, b, "fetched.bin"); got != fetched {
 		t.Errorf("fetched.bin = %q, want %q from git lfs smudge", got, fetched)
 	}
-	_, err = b.Bottom(nil).Open("short.bin")
-	if !errors.Is(err, syscall.EIO) || len(faults) != 1 || !strings.Contains(faults[0], "short.bin") {
-		t.Errorf("an object shorter than its pointer opened with %v, faults %q; want EIO and one fault", err, faults)
+	// Output of the promised size that is not the object (as git-lfs writes
+	// the pointer back for a failed download) is no object.
+	_, err = b.Bottom(nil).Open("wrong.bin")
+	if !errors.Is(err, syscall.EIO) || len(faults) != 1 || !strings.Contains(faults[0], "wrong.bin") {
+		t.Errorf("other content than the object opened with %v, faults %q; want EIO and one fault", err, faults)
 	}
 	// A produced object is kept: git lfs is not asked again.
 	writeTestFile(t, smudgeScript, "#!/bin/sh\nexit 1\n")

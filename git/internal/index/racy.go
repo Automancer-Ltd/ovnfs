@@ -46,7 +46,7 @@ func modifiedInPlace(opts WriteOptions, e *Entry) bool {
 	switch {
 	case symlink && info.Mode()&fs.ModeSymlink == 0, !symlink && !info.Mode().IsRegular():
 		return false
-	case uint32(info.Size()) != e.Stat.Size, uint32(info.ModTime().Unix()) != e.Stat.MTime.Sec:
+	case StatSize(info.Size()) != e.Stat.Size, uint32(info.ModTime().Unix()) != e.Stat.MTime.Sec:
 		return false
 	}
 	if st, ok := platformStat(name); ok {

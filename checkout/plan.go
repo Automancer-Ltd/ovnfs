@@ -132,13 +132,24 @@ func (r *Registry) Plan(ctx context.Context, args api.PlanArgs) (api.PlanReply, 
 			return api.PlanReply{}, coded(err)
 		}
 		view := h.base.view
+		// Sized as an attach offers them: a path still holding the base's
+		// leaf as the base does (an LFS leaf as its pointer), others as the
+		// layer or the stored blob holding them.
 		info := func(p string) source.Info {
+			f := now.files[p]
+			if leaf, ok := view.Leaf(p); ok && f == leaf {
+				info, _, _ := offeredInfo(view, p)
+				return info
+			}
 			if l, ok := now.layers[p]; ok {
 				if e, ok := l.Get(p); ok && e.Info != nil {
 					return source.Info{Mtime: e.Info.ModTime(), Size: e.Info.Size()}
 				}
 			}
-			info, _ := view.Info(p)
+			if size, err := view.Store().Size(f.ID); err == nil {
+				return source.Info{Size: size}
+			}
+			info, _, _ := offeredInfo(view, p)
 			return info
 		}
 		in.Root, in.Files, in.Info, in.Roots, in.Domains, in.Lock = view.Meta().Dir, now.files, info, view.Roots(), view.Domains(), h.base.lock

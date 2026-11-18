@@ -130,13 +130,21 @@ reading them; other files, and any shown with an mtime within the second the
 index was written, are read.
 
 Files Git LFS tracks show the objects their pointers name, as `git checkout`
-writes them, when the repository's `lfs` filter smudges (not after `git lfs
-install --skip-smudge` or with `GIT_LFS_SKIP_SMUDGE`). Listing them reads no
-object: each is opened from the repository's LFS storage on first read, or
-produced by `git lfs smudge`, which downloads a missing object into that
-storage and fails the read (EIO, with a notice) when it cannot. They show the
-mtime one second before the checkout opened, so `git status` trusts them
-unread. Trees, `diff` and the private index keep the pointers git stores.
+writes them: where REV's attributes (or `GIT_ATTR_SOURCE`'s and `attr.tree`'s)
+set `filter=lfs`, the repository's `lfs` filter runs git-lfs without `--skip`
+(not after `git lfs install --skip-smudge`), `GIT_LFS_SKIP_SMUDGE` is not set
+in the daemon's environment, and `lfs.fetchinclude` and `lfs.fetchexclude`
+(from git's configuration, else the folder's `.lfsconfig`, else the index's or
+`HEAD`'s, as git-lfs reads them) allow the path.
+Listing them reads no object: each is opened from the repository's LFS
+storage on first read, or produced by `git lfs smudge`, which downloads a
+missing object into that storage; output that is not the object fails the
+read (EIO, with a notice). They show the mtime one second before the
+checkout opened, so `git status` trusts them unread. Trees, `diff` and the
+private index keep the pointers git stores, and content that is a pointer's
+object compares as that pointer, as git's clean filter stores it: rewriting
+an object unchanged is no change, and `apply` sees the folder's copy of it
+as unchanged.
 
 ## Taking paths: `--take`
 
@@ -150,7 +158,8 @@ ordinary or `--rev` behavior. `--take` cannot be combined with `--from SNAP`.
 
 Taken content becomes part of the base: the initial diff is empty, snapshots
 and forks retain it, and apply never writes the selection back to the folder.
-Content stays lazy, Git LFS objects included (as with `--rev`), and the
+Content stays lazy, Git LFS objects included (as with `--rev`; a take from
+the index reads the index's attributes first), and the
 private git index is unchanged: it still comes from REV with `--rev`, or from
 the folder otherwise. Git therefore shows taken
 content as working-tree changes relative to that index. For example:

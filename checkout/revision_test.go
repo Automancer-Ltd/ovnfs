@@ -2,6 +2,8 @@ package checkout
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -134,6 +136,93 @@ func TestNewRevisionDirtyFolder(t *testing.T) {
 	}
 	f.open()
 	assertDiff("other.txt")
+}
+
+// TestRevisionLFSObjectsCompareAsPointers compares content with a revision's
+// LFS files as git's clean filter does: an object rewritten unchanged is no
+// change, and a folder holding the object still counts as unchanged, so apply
+// can delete it. Apply works with objects, never pointers: a mode change keeps
+// the object, and a text merge starts from it.
+func TestRevisionLFSObjectsCompareAsPointers(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("GIT_LFS_SKIP_SMUDGE", "")
+	f := newFixture(t)
+	const image, text = "golden image\n", "one\ntwo\nthree\nfour\n"
+	pointers := map[string]string{}
+	for _, object := range []string{image, text} {
+		sum := fmt.Sprintf("%x", sha256.Sum256([]byte(object)))
+		pointers[object] = fmt.Sprintf("version https://git-lfs.github.com/spec/v1\noid sha256:%s\nsize %d\n", sum, len(object))
+	}
+	objects := map[string]string{"a.png": image, "b.png": image, "c.png": image, "notes.txt": text}
+	files := map[string]string{".gitattributes": "*.png filter=lfs -text\n*.txt filter=lfs -text\n"}
+	for p, object := range objects {
+		files[p] = pointers[object]
+	}
+	dir := folder(t, files)
+	gitRun(t, dir, "init", "-q", "-b", "main")
+	gitRun(t, dir, "add", "--all")
+	gitRun(t, dir, "commit", "-qm", "lfs")
+	gitRun(t, dir, "config", "filter.lfs.process", "git-lfs filter-process")
+	for _, object := range []string{image, text} {
+		sum := fmt.Sprintf("%x", sha256.Sum256([]byte(object)))
+		write(t, filepath.Join(dir, ".git", "lfs", "objects", sum[:2], sum[2:4], sum), object)
+	}
+	for p, object := range objects {
+		write(t, filepath.Join(dir, p), object) // as git's checkout leaves the folder
+	}
+	// The capture stores this untracked copy, so the store holds the pointer blob too.
+	write(t, filepath.Join(dir, "pointer.txt"), pointers[image])
+	if _, err := f.reg.New(ctx, api.NewArgs{Dir: dir, Name: "lfs", Rev: "HEAD"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.read("lfs", "a.png"); got != image {
+		t.Fatalf("a.png = %q, want its object", got)
+	}
+	f.put("lfs", "a.png", image)
+	f.remove("lfs", "b.png")
+	diff, err := f.reg.Diff(ctx, api.DiffArgs{Checkout: "lfs"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diff.Changes) != 1 || diff.Changes[0].Path != "b.png" {
+		t.Fatalf("diff = %+v, want only the deleted b.png", diff.Changes)
+	}
+	var s Session
+	if err := f.reg.Enter("lfs", &s); err != nil {
+		t.Fatal(err)
+	}
+	err = s.FS.Chmod("c.png", 0o755)
+	s.Done()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.put("lfs", "notes.txt", "one\ntwo\nthree\nfour, edited in the checkout\n")
+	write(t, filepath.Join(dir, "notes.txt"), "one, edited in the folder\ntwo\nthree\nfour\n")
+	applied, err := f.reg.Apply(ctx, api.ApplyArgs{Checkout: "lfs"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(applied.Conflicts) != 0 || len(applied.Merged) != 1 {
+		t.Fatalf("apply = %+v, want notes.txt merged and no conflict", applied)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "b.png")); !os.IsNotExist(err) {
+		t.Fatalf("b.png in the folder: %v, want deleted", err)
+	}
+	for p, want := range map[string]string{"c.png": image, "notes.txt": "one, edited in the folder\ntwo\nthree\nfour, edited in the checkout\n"} {
+		if got, err := os.ReadFile(filepath.Join(dir, p)); err != nil || string(got) != want {
+			t.Errorf("folder %s = %q, %v; want %q", p, got, err, want)
+		}
+	}
+	// An edit applied, then undone in the checkout, brings the object back.
+	for _, content := range []string{"edited image\n", image} {
+		f.put("lfs", "a.png", content)
+		if _, err := f.reg.Apply(ctx, api.ApplyArgs{Checkout: "lfs"}); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := os.ReadFile(filepath.Join(dir, "a.png")); err != nil || string(got) != content {
+			t.Fatalf("folder a.png = %q, %v; want %q", got, err, content)
+		}
+	}
 }
 
 // TestEditKeepsExecutableMode snapshots an edited executable from a revision as

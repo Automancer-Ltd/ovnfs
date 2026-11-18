@@ -290,6 +290,8 @@ type Attributes struct {
 	// fromTree holds the .gitattributes files of the tree GIT_ATTR_SOURCE or
 	// attr.tree names, by slash path; nil reads the work tree.
 	fromTree map[string][]byte
+	// checkout reads the index's .gitattributes before the work tree's.
+	checkout bool
 	// indexed lists the index's stage-0 .gitattributes blobs, the work tree's
 	// fallback: a captured snapshot's, else the live index loaded once on first need.
 	indexOnce sync.Once
@@ -303,9 +305,13 @@ type AttributeOptions struct {
 	// work-tree files; nil reads the repository's live index on first need.
 	Index *Index
 	// Source names a tree-ish whose .gitattributes files replace the work
-	// tree's and the index's, as GIT_ATTR_SOURCE does, which it overrides:
+	// tree's and the index's unless GIT_ATTR_SOURCE or attr.tree names one:
 	// the attributes git checks out a revision's files with.
 	Source string
+	// Checkout reads each .gitattributes from the index first and the work
+	// tree only where the index has none, as git does when it checks files
+	// out of the index.
+	Checkout bool
 }
 
 // Attributes prepares queries for names with r's attribute files and
@@ -361,6 +367,7 @@ func (r *Repo) Attributes(names []string, opts AttributeOptions) (*Attributes, e
 		a.indexed = opts.Index.attrFiles
 		a.indexOnce.Do(func() {})
 	}
+	a.checkout = opts.Checkout
 	if err := a.useTreeSource(cfg, opts.Source); err != nil {
 		return nil, err
 	}
@@ -420,25 +427,32 @@ func readHostAttributes(name string) []byte {
 }
 
 // useTreeSource makes a read .gitattributes files from a tree instead of the
-// work tree when source, else GIT_ATTR_SOURCE or attr.tree, names one, as git
-// does: a source or GIT_ATTR_SOURCE that names no tree is an error, an
+// work tree when GIT_ATTR_SOURCE, attr.tree or else source names one, as git
+// does: a GIT_ATTR_SOURCE or source that names no tree is an error, an
 // attr.tree that names none is ignored (git 2.56 reads the work tree then,
 // whatever config/attr.adoc says). The tree's files are read once, here.
 func (a *Attributes) useTreeSource(cfg *config.Config, source string) error {
-	spec, fromEnv := source, source != ""
-	if !fromEnv {
-		spec, fromEnv = os.LookupEnv("GIT_ATTR_SOURCE")
+	if spec, ok := os.LookupEnv("GIT_ATTR_SOURCE"); ok {
+		return a.readTree(spec, true)
 	}
-	if !fromEnv {
-		var ok bool
-		if spec, ok = cfg.Get("attr.tree"); !ok {
-			return nil
+	if spec, ok := cfg.Get("attr.tree"); ok {
+		if err := a.readTree(spec, false); err != nil || a.fromTree != nil {
+			return err
 		}
 	}
+	if source != "" {
+		return a.readTree(source, true)
+	}
+	return nil
+}
+
+// readTree reads the .gitattributes files of the tree spec names into
+// a.fromTree; a spec naming no tree is an error when strict, else ignored.
+func (a *Attributes) readTree(spec string, strict bool) error {
 	return a.repo.sessionObjects(func(s *rev.Source, objects *repo.Objects) error {
 		root, err := rev.Resolve(s, spec+"^{tree}", rev.Options{})
 		if err != nil {
-			if fromEnv {
+			if strict {
 				return fmt.Errorf("bad attribute source %q: %w", spec, err)
 			}
 			return nil
@@ -463,11 +477,17 @@ func (a *Attributes) useTreeSource(cfg *config.Config, source string) error {
 
 // treeAttributes reads dir's .gitattributes. From the work tree, a symbolic link
 // is not followed and a directory in its place counts as an empty file; any
-// other file git cannot open falls back to the index.
+// other file git cannot open falls back to the index, which a.checkout
+// consults first.
 func (a *Attributes) treeAttributes(dir string) ([]byte, error) {
 	name := path.Join(dir, ".gitattributes")
 	if a.fromTree != nil {
 		return a.fromTree[name], nil
+	}
+	if a.checkout {
+		if data, found, err := a.indexAttributes(name); found || err != nil {
+			return data, err
+		}
 	}
 	full := filepath.Join(a.repo.Top, filepath.FromSlash(name))
 	info, err := os.Lstat(full)
@@ -479,13 +499,15 @@ func (a *Attributes) treeAttributes(dir string) ([]byte, error) {
 			return data, nil
 		}
 	}
-	return a.indexAttributes(name)
+	data, _, err := a.indexAttributes(name)
+	return data, err
 }
 
-// indexAttributes reads the stage-0 regular file name from the index, nil when
-// the index has none. The index's .gitattributes entries are listed on first
-// need; a blob is read only for a directory whose work-tree file is unusable.
-func (a *Attributes) indexAttributes(name string) ([]byte, error) {
+// indexAttributes reads the stage-0 regular file name from the index; found is
+// false when the index has none. The index's .gitattributes entries are listed
+// on first need; a blob is read only for a directory whose work-tree file is
+// unusable, or for a checkout.
+func (a *Attributes) indexAttributes(name string) (data []byte, found bool, err error) {
 	a.indexOnce.Do(func() {
 		idx, err := index.Read(a.repo.IndexPath(), a.repo.repo.Format, index.ReadOptions{})
 		if errors.Is(err, os.ErrNotExist) {
@@ -504,18 +526,18 @@ func (a *Attributes) indexAttributes(name string) ([]byte, error) {
 	})
 	id, ok := a.indexed[name]
 	if a.indexErr != nil || !ok {
-		return nil, a.indexErr
+		return nil, false, a.indexErr
 	}
 	objects, err := a.repo.repo.OpenObjects()
 	if err != nil {
-		return nil, err
+		return nil, true, err
 	}
 	defer objects.Close()
-	_, data, err := objects.Read(id)
+	_, data, err = objects.Read(id)
 	if errors.Is(err, os.ErrNotExist) || len(data) >= attrMaxFile {
-		return nil, nil
+		return nil, true, nil
 	}
-	return data, err
+	return data, true, err
 }
 
 // dirRules returns the rules of dir's .gitattributes, reading it once.

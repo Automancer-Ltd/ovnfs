@@ -136,8 +136,8 @@ func (r *Registry) pullFolder(ctx context.Context, h *checkoutRecord, args api.P
 		case theirs == base:
 			// The folder holds what an apply left there: nothing new to merge.
 		default:
-			blob := func(f store.File) ([]byte, error) { return h.base.view.Blob(c.Path, f.ID) }
-			if o, reason, out, err = mergeOverlay(h.fs, c.Path, base, theirs, incoming, blob, s); err != nil {
+			blob := func(f store.File) ([]byte, error) { return h.base.view.Content(c.Path, f.ID) }
+			if o, reason, out, err = mergeOverlay(h, c.Path, base, theirs, incoming, blob, s); err != nil {
 				return fail(err)
 			}
 		}

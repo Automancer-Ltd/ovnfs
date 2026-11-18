@@ -367,6 +367,14 @@ func (t *fold) hash(l *overlay.Layer, p string, e overlay.Entry, prev store.File
 			id = store.OID(blob)
 			return nil
 		}
+		// A copy-up that still is the base's LFS leaf, the object of its
+		// pointer with its mode, is that leaf, as git's clean filter would
+		// store it. Anything else keeps its own bytes, which a mode change
+		// or an apply must place, not the pointer's.
+		if leaf, ok := t.base.view.Leaf(p); ok && lfsCleanHost(t.base.view, p, store.File{Mode: mode}, host) == leaf {
+			id = leaf.ID
+			return nil
+		}
 		var err error
 		var like store.OID
 		if prev.Mode == store.ModeFile || prev.Mode == store.ModeExec {

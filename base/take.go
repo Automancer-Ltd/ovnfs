@@ -152,6 +152,8 @@ func takeCapture(ctx context.Context, c Config, set rules.Set, res *source.Resul
 			} else {
 				if index == nil {
 					var entries []git.TreeEntry
+					// Git checks files out of the index under the index's own attributes.
+					attrs := git.AttributeOptions{Checkout: true}
 					for _, repo := range work.Repos {
 						if repo.Path == "" && repo.Index != "" {
 							var err error
@@ -159,9 +161,14 @@ func takeCapture(ctx context.Context, c Config, set rules.Set, res *source.Resul
 							if err != nil {
 								return err
 							}
+							captured, err := root.ReadIndex(repo.Index)
+							if err != nil {
+								return err
+							}
+							attrs.Index = &captured
 						}
 					}
-					files, err := treeFiles(entries, work, root, git.AttributeOptions{}, fork)
+					files, err := treeFiles(entries, work, root, attrs, fork)
 					if err != nil {
 						return err
 					}
@@ -271,8 +278,11 @@ type gitFiles struct {
 }
 
 // treeFiles describes checking out entries of repo, whose lfs filter reads
-// the attributes attrs selects. An LFS pointer presents its object's size and
-// lfsMtime; a file the work tree holds unchanged keeps its stat data; other
+// the attributes attrs selects. An LFS pointer presents its object's size and,
+// when git's clean filter gives it back unchanged, lfsMtime: git trusts that
+// object unread. One whose pointer git-lfs would rewrite shows the fork time
+// and is never seeded (seedRevisionIndex), so git reads it and reports the
+// rewrite. A file the work tree holds unchanged keeps its stat data; other
 // content presents its blob's size.
 func treeFiles(entries []git.TreeEntry, work source.Result, repo *git.Repo, attrs git.AttributeOptions, fork time.Time) (gitFiles, error) {
 	lfs, err := newLFSFinder(repo, attrs)
@@ -287,12 +297,15 @@ func treeFiles(entries []git.TreeEntry, work source.Result, repo *git.Repo, attr
 			f = store.File{Mode: store.ModeDir, ID: store.EmptyTree}
 		}
 		t.files[e.Path] = f
-		size, pointer, err := lfs.object(e)
+		pointer, canonical, isPointer, err := lfs.object(e)
 		switch {
 		case err != nil:
 			return gitFiles{}, err
-		case pointer:
-			t.info[e.Path] = source.Info{Size: size, Mtime: lfsMtime(fork)}
+		case isPointer:
+			t.info[e.Path] = source.Info{Size: pointer.Size}
+			if canonical {
+				t.info[e.Path] = source.Info{Size: pointer.Size, Mtime: lfsMtime(fork)}
+			}
 			t.lfs[e.Path] = true
 		case work.Files[e.Path] == f:
 			t.info[e.Path] = work.Info[e.Path]

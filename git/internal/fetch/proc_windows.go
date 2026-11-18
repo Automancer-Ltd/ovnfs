@@ -4,13 +4,9 @@ package fetch
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
-
-// setProcessGroup keeps exec's default cancellation, killing the child.
-func setProcessGroup(cmd *exec.Cmd) {}
 
 // findExecutable reports dir/name, trying the PATHEXT extensions when name
 // has none, if it is a file.

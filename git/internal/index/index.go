@@ -43,6 +43,16 @@ type Stat struct {
 	Dev, Ino, UID, GID, Size uint32
 }
 
+// StatSize is the Size git records for a file of size bytes: the low 32 bits,
+// except that a nonzero multiple of 4 GiB becomes 2^31 rather than 0, which
+// would read as racily clean (statinfo.c munge_st_size).
+func StatSize(size int64) uint32 {
+	if s := uint32(size); s != 0 || size == 0 {
+		return s
+	}
+	return 0x80000000
+}
+
 // Entry is one index entry: a staged path at a merge stage.
 type Entry struct {
 	Path  string // slash-separated; a sparse directory ends in '/'

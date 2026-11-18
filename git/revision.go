@@ -83,7 +83,7 @@ func (v *Revision) WriteIndex(ctx context.Context, name string, stat map[string]
 		e := &idx.Entries[i]
 		if s, ok := stat[e.Path]; ok {
 			mtime := index.Time{Sec: uint32(s.Mtime.Unix()), Nsec: uint32(s.Mtime.Nanosecond())}
-			e.Stat = index.Stat{MTime: mtime, Size: uint32(s.Size)}
+			e.Stat = index.Stat{MTime: mtime, Size: index.StatSize(s.Size)}
 		}
 	}
 	// A fresh index is its own racy-git reference: a file presented with an

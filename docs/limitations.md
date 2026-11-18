@@ -14,9 +14,13 @@
   objects; pruning those objects can make it unreadable.
 - Files from git (`--rev`, `--take` from the index or a revision) go through
   only Git LFS's checkout conversion. One git would write with CRLF line
-  endings, an expanded `ident`, a `working-tree-encoding` or another filter
-  driver's smudge shows its blob as git stores it. An attached copy of such a
-  checkout shows LFS pointers, not objects.
+  endings, an expanded `ident`, a `working-tree-encoding`, another filter
+  driver's smudge, or LFS pointer extensions shows its blob as git stores it.
+  An attached copy of such a checkout shows LFS pointers, not objects. A
+  rename or metadata change that copies up an LFS file whose object is not in
+  the repository's LFS storage waits for its download while holding the
+  checkout's lock, as remote checkouts wait for content. On Windows a
+  `git lfs smudge` that times out may keep downloading after the read failed.
 - ovnfs reads git repositories with its own implementation, not a git
   installation. It reads the system configuration and attributes from
   `GIT_CONFIG_SYSTEM` or `/etc/gitconfig` and `/etc/gitattributes` (none on

@@ -95,6 +95,9 @@ type Base struct {
 	closeOnce  sync.Once
 	closeErr   error
 	remote     *remoteState
+	// lfsLocks serialize producing LFS objects, striped by object id, so
+	// concurrent first opens of one object run one git lfs smudge.
+	lfsLocks [16]sync.Mutex
 }
 
 // Create marks the fork time and captures o.Root (with c.Store and the base's

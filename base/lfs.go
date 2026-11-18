@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -22,7 +24,8 @@ import (
 // leaf, so trees, diffs and the revision index see what git stores, and records
 // the object's size and lfsMtime. The first open reads the object from the
 // repository's LFS storage, else from lfsDir, where `git lfs smudge` puts one
-// the storage lacks.
+// the storage lacks. Comparisons of work-tree content with such a leaf go
+// through LFSClean.
 
 // lfsDir, in a base's state directory, holds the LFS objects git lfs smudge
 // produced for it.
@@ -42,6 +45,7 @@ func lfsMtime(fork time.Time) time.Time { return fork.Truncate(time.Second).Add(
 // checkout replaces by their objects. A nil finder, for a repository whose
 // checkout leaves pointers in place, recognizes none.
 type lfsFinder struct {
+	filter  *git.LFSFilter
 	attrs   *git.Attributes
 	objects *git.Objects
 }
@@ -49,7 +53,8 @@ type lfsFinder struct {
 // newLFSFinder reads repo's lfs filter configuration and, with opts, the
 // attributes of the files' source.
 func newLFSFinder(repo *git.Repo, opts git.AttributeOptions) (*lfsFinder, error) {
-	if on, err := repo.LFSCheckout(); err != nil || !on {
+	filter, err := repo.LFSFilter()
+	if err != nil || filter == nil {
 		return nil, err
 	}
 	attrs, err := repo.Attributes([]string{"filter"}, opts)
@@ -60,29 +65,30 @@ func newLFSFinder(repo *git.Repo, opts git.AttributeOptions) (*lfsFinder, error)
 	if err != nil {
 		return nil, err
 	}
-	return &lfsFinder{attrs: attrs, objects: objects}, nil
+	return &lfsFinder{filter: filter, attrs: attrs, objects: objects}, nil
 }
 
-// object returns the size of the object git's checkout writes for e; false
-// when it writes e's blob. A blob missing locally (a partial clone) counts as
-// content: it is read, and fails, only when opened.
-func (l *lfsFinder) object(e git.TreeEntry) (int64, bool, error) {
-	if l == nil || e.Type != "blob" || e.Mode == store.ModeSymlink || e.Size >= git.LFSPointerLimit {
-		return 0, false, nil
+// object returns the object git's checkout writes for e, and whether e's blob
+// is that pointer's canonical encoding, which git's clean filter gives back;
+// false when checkout writes e's blob. A blob missing locally (a partial
+// clone) counts as content: it is read, and fails, only when opened.
+func (l *lfsFinder) object(e git.TreeEntry) (pointer git.LFSPointer, canonical, ok bool, err error) {
+	if l == nil || e.Type != "blob" || e.Mode == store.ModeSymlink || e.Size >= git.LFSPointerLimit || !l.filter.Smudges(e.Path) {
+		return pointer, false, false, nil
 	}
 	values, err := l.attrs.Check(e.Path)
 	if err != nil || values[0] != "lfs" {
-		return 0, false, err
+		return pointer, false, false, err
 	}
 	data, err := l.objects.Blob(e.OID)
 	if errors.Is(err, os.ErrNotExist) {
-		return 0, false, nil
+		return pointer, false, false, nil
 	}
 	if err != nil {
-		return 0, false, err
+		return pointer, false, false, err
 	}
-	pointer, ok := git.ParseLFSPointer(data)
-	return pointer.Size, ok, nil
+	pointer, ok = git.ParseLFSPointer(data)
+	return pointer, ok && string(data) == pointer.String(), ok, nil
 }
 
 // Close releases the object reader.
@@ -93,38 +99,114 @@ func (l *lfsFinder) Close() {
 }
 
 // LFS reports whether the view serves the leaf at p, a Git LFS pointer, as the
-// object it names; Info then has the object's size, not the pointer's.
+// object it names.
 func (b *Base) LFS(p string) bool {
 	n, ok := b.index.lookup(overlay.Clean(p))
 	return ok && b.index.lfs(n)
 }
 
+// LFSPointer returns the pointer blob of the leaf at p when it is a Git LFS
+// pointer the view serves as the object it names (whose size Info reports);
+// false for any other path.
+func (b *Base) LFSPointer(p string) ([]byte, bool, error) {
+	p = overlay.Clean(p)
+	n, ok := b.index.lookup(p)
+	if !ok || !b.index.lfs(n) {
+		return nil, false, nil
+	}
+	data, err := b.Blob(p, b.index.oid(n))
+	return data, err == nil, err
+}
+
+// LFSLeaf reports whether id is the LFS pointer the view serves at p as the
+// object it names: content whose work-tree bytes Content, not the store or
+// Blob, supplies.
+func (b *Base) LFSLeaf(p string, id store.OID) bool {
+	n, ok := b.index.lookup(overlay.Clean(p))
+	return ok && b.index.lfs(n) && b.index.oid(n) == id
+}
+
+// Content returns the work-tree bytes of the leaf id at p: the object the
+// view serves when id is the LFS pointer it holds there (LFSLeaf), else the
+// blob (Blob), which is the stored form a patch, an attach or a merge base
+// record needs instead.
+func (b *Base) Content(p string, id store.OID) ([]byte, error) {
+	p = overlay.Clean(p)
+	if !b.LFSLeaf(p, id) {
+		return b.Blob(p, id)
+	}
+	c, err := b.lfsFile(p, id)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	return io.ReadAll(c)
+}
+
+// LFSClean returns the pointer blob id of the LFS leaf at p when content of
+// size bytes, which open reads, is the object it names: content git's clean
+// filter stores as that very pointer, and so unchanged. False for any other
+// content or path.
+func (b *Base) LFSClean(p string, size int64, open func() (io.ReadCloser, error)) (store.OID, bool, error) {
+	p = overlay.Clean(p)
+	n, ok := b.index.lookup(p)
+	if !ok || !b.index.lfs(n) {
+		return "", false, nil
+	}
+	id := b.index.oid(n)
+	data, err := b.Blob(p, id)
+	if err != nil {
+		return "", false, err
+	}
+	pointer, ok := git.ParseLFSPointer(data)
+	if !ok || pointer.Size != size {
+		return "", false, nil
+	}
+	r, err := open()
+	if err != nil {
+		return "", false, err
+	}
+	defer r.Close()
+	same, err := pointer.Names(r)
+	return id, same, err
+}
+
 // lfsFile serves the object the pointer blob id at p names: from the root
 // repository's LFS storage, else from lfsDir, which git lfs smudge fills on
-// first need. An object git lfs cannot produce is reported as a fault and
-// reads as EIO.
+// first need, one object at a time. An object git lfs cannot produce is
+// reported as a fault and reads as EIO.
 func (b *Base) lfsFile(p string, id store.OID) (overlay.Content, error) {
 	data, err := b.Blob(p, id)
 	if err != nil {
 		return nil, err
 	}
 	pointer, ok := git.ParseLFSPointer(data)
+	if !ok {
+		return nil, fmt.Errorf("%s: blob %s is no Git LFS pointer", p, id)
+	}
 	repo := b.domains.Repo("")
-	if !ok || repo == nil {
-		return nil, fmt.Errorf("the LFS object of %s (%s) is no longer available", p, id)
-	}
-	if name, err := repo.LFSObject(pointer.OID); err == nil {
-		if f, ok := openSized(name, pointer.Size); ok {
-			return f, nil
+	cached := filepath.Join(b.config.StateDir, lfsDir, pointer.OID)
+	open := func() (*os.File, bool) {
+		if f, ok := lfsStored(repo, pointer); ok {
+			return f, true
 		}
+		return openSized(cached, pointer.Size)
 	}
-	name := filepath.Join(b.config.StateDir, lfsDir, pointer.OID)
-	if f, ok := openSized(name, pointer.Size); ok {
+	if f, ok := open(); ok {
 		return f, nil
 	}
-	err = smudge(repo, p, data, pointer.Size, name)
-	// A concurrent open may have produced the object even if this one failed.
-	if f, ok := openSized(name, pointer.Size); ok {
+	if repo == nil {
+		return nil, fmt.Errorf("the LFS object of %s (%s) is no longer available", p, id)
+	}
+	stripe, _ := strconv.ParseUint(pointer.OID[:2], 16, 8)
+	mu := &b.lfsLocks[stripe%uint64(len(b.lfsLocks))]
+	mu.Lock()
+	defer mu.Unlock()
+	if f, ok := open(); ok {
+		return f, nil // another open produced it meanwhile
+	}
+	err = smudge(repo, p, data, pointer, cached)
+	if f, ok := open(); ok {
 		return f, nil
 	}
 	if err == nil {
@@ -136,9 +218,23 @@ func (b *Base) lfsFile(p string, id store.OID) (overlay.Content, error) {
 	return nil, &fs.PathError{Op: "smudge", Path: p, Err: syscall.EIO}
 }
 
-// smudge has git lfs smudge write the object pointer names for p to name,
-// which appears only complete and with the size the pointer promises.
-func smudge(repo *git.Repo, p string, pointer []byte, size int64, name string) error {
+// lfsStored opens the object pointer names in repo's LFS storage, if it holds
+// it whole.
+func lfsStored(repo *git.Repo, pointer git.LFSPointer) (*os.File, bool) {
+	if repo == nil {
+		return nil, false
+	}
+	name, err := repo.LFSObject(pointer.OID)
+	if err != nil {
+		return nil, false
+	}
+	return openSized(name, pointer.Size)
+}
+
+// smudge has git lfs smudge produce the object pointer (blob data) names for
+// p. git-lfs keeps a downloaded object in the repository's storage; only where
+// that did not happen is the verified output kept, at name.
+func smudge(repo *git.Repo, p string, data []byte, pointer git.LFSPointer, name string) error {
 	if err := os.MkdirAll(filepath.Dir(name), 0o700); err != nil {
 		return err
 	}
@@ -149,11 +245,16 @@ func smudge(repo *git.Repo, p string, pointer []byte, size int64, name string) e
 	defer os.Remove(tmp.Name())
 	ctx, cancel := context.WithTimeout(context.Background(), lfsTimeout)
 	defer cancel()
-	err = repo.SmudgeLFS(ctx, p, pointer, tmp)
+	err = repo.SmudgeLFS(ctx, p, data, tmp)
 	if err == nil {
-		var info os.FileInfo
-		if info, err = tmp.Stat(); err == nil && info.Size() != size {
-			err = fmt.Errorf("git lfs smudge wrote %d bytes, not the %d its pointer names", info.Size(), size)
+		_, err = tmp.Seek(0, io.SeekStart)
+	}
+	if err == nil {
+		// git-lfs may write the pointer back instead (skipped or failed
+		// downloads), which can even have the object's size.
+		var same bool
+		if same, err = pointer.Names(tmp); err == nil && !same {
+			err = errors.New("git lfs smudge wrote other content than the object its pointer names")
 		}
 	}
 	if closeErr := tmp.Close(); err == nil {
@@ -161,6 +262,9 @@ func smudge(repo *git.Repo, p string, pointer []byte, size int64, name string) e
 	}
 	if err != nil {
 		return err
+	}
+	if f, ok := lfsStored(repo, pointer); ok {
+		return f.Close()
 	}
 	return os.Rename(tmp.Name(), name)
 }

@@ -713,7 +713,7 @@ func (r *Registry) holdsPullMarkers(h *checkoutRecord, bases folderBases, p stri
 	if _, pending := bases.markedHere[p]; !pending || !regular(theirs) {
 		return false, nil
 	}
-	data, err := h.base.view.Blob(p, theirs.ID)
+	data, err := h.base.view.Content(p, theirs.ID)
 	return hasMarkers(data), err
 }
 
@@ -731,6 +731,9 @@ func (r *Registry) applyOne(ctx context.Context, h *checkoutRecord, root, p stri
 	if ours == theirs {
 		return skipped, "", nil
 	}
+	if clean := lfsCleanHost(h.base.view, p, ours, dst); clean == base {
+		ours = clean // the folder still holds the object of the base's LFS pointer
+	}
 	if ours == base {
 		if dry {
 			return applied, "", nil
@@ -747,11 +750,11 @@ func (r *Registry) applyOne(ctx context.Context, h *checkoutRecord, root, p stri
 	}
 	var baseData []byte
 	if base.ID != "" {
-		if baseData, err = h.base.view.Blob(p, base.ID); err != nil {
+		if baseData, err = h.base.view.Content(p, base.ID); err != nil {
 			return 0, "", err
 		}
 	}
-	theirData, err := h.base.view.Blob(p, theirs.ID)
+	theirData, err := h.base.view.Content(p, theirs.ID)
 	if err != nil {
 		return 0, "", err
 	}
@@ -820,10 +823,12 @@ func (r *Registry) place(h *checkoutRecord, dst, p string, f store.File) error {
 				return err
 			}
 			return os.Symlink(string(target), tmp)
-		case st.Has(f.ID):
+		case st.Has(f.ID) && !h.base.view.LFSLeaf(p, f.ID):
 			return st.CloneBlob(f.ID, tmp, modeOf(f))
 		default:
-			data, err := h.base.view.Blob(p, f.ID)
+			// An LFS leaf's work-tree bytes are its object, even where the
+			// store holds the pointer blob too.
+			data, err := h.base.view.Content(p, f.ID)
 			if err != nil {
 				return err
 			}
