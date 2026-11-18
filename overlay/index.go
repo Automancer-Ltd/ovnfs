@@ -199,6 +199,9 @@ func (f *FS) loadIndex() error {
 	if !f.ids.table.empty() {
 		live := make(map[uint64]bool, len(index.entries))
 		for _, e := range index.entries {
+			if e.Info == nil {
+				continue // a whiteout names no file
+			}
 			if key, ok := hostKey(e.Info); ok {
 				live[key.inode] = true
 			}

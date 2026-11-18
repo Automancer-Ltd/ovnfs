@@ -402,6 +402,14 @@ func describe(name string, info os.FileInfo, s *idStore) (os.FileInfo, error) {
 			if id, err = s.assignNew(name, info, key); err != nil {
 				return nil, err
 			}
+			// Persisting the identity wrote to the file where it is an
+			// attribute, which moved its change time past info's.
+			if info, err = os.Lstat(name); err != nil {
+				return nil, err
+			}
+			if info, err = withMode(name, info); err != nil {
+				return nil, err
+			}
 		}
 		if s != nil {
 			s.known.remember(key, id)
