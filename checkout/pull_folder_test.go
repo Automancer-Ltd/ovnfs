@@ -208,7 +208,9 @@ func TestPullFolderSaysWhatItLeavesToGit(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(pull.Warnings) != 1 || !strings.Contains(pull.Warnings[0], want) || !strings.Contains(pull.Warnings[0], dir) {
+		// The folder is named as the capture resolved it, which is no
+		// substring of a short Windows spelling of the same path.
+		if len(pull.Warnings) != 1 || !strings.Contains(pull.Warnings[0], want) || !strings.Contains(pull.Warnings[0], filepath.Base(dir)) {
 			t.Errorf("pull %s warned %q, want one naming %s and %q", name, pull.Warnings, dir, want)
 		}
 	}

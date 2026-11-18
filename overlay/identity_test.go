@@ -222,8 +222,20 @@ func TestLegacyManifestIdentities(t *testing.T) {
 	must(t, err)
 	m, err := l.manifest(nil, "")
 	must(t, err)
+	// A version 1 manifest named a hard-link group by its first entry.
 	m.Version = 1
+	first, linked := map[uint64]int{}, map[uint64]bool{}
+	for i, e := range m.Entries {
+		if _, seen := first[e.ID]; seen {
+			linked[e.ID] = true
+		} else {
+			first[e.ID] = i
+		}
+	}
 	for i := range m.Entries {
+		if id := m.Entries[i].ID; linked[id] {
+			m.Entries[i].Link = first[id] + 1
+		}
 		m.Entries[i].ID = 0
 	}
 	data, err := encodeManifest(m)
