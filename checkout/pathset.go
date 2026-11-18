@@ -41,6 +41,21 @@ func (s *pathSet) node(p string, create bool) *pathNode {
 	}
 }
 
+// covers reports whether p, or a path above it, is a member.
+func (s *pathSet) covers(p string) bool {
+	n := &s.root
+	for rest := p; ; {
+		name, tail, more := strings.Cut(rest, "/")
+		if n = n.kids[name]; n == nil {
+			return false
+		}
+		if n.in || !more {
+			return n.in
+		}
+		rest = tail
+	}
+}
+
 // add makes p a member.
 func (s *pathSet) add(p string) { s.node(p, true).in = true }
 

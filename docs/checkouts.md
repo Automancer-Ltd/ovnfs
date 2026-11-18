@@ -280,13 +280,27 @@ result limits, narrower patterns or grep's column limit to reduce the reply.
 
 ## Diff and apply
 
-`diff CHECKOUT [SNAP] [-p]` compares the checkout now with its base capture (or
-a snapshot); `--binary` prints the patch as `git diff --binary` does, with git
-headers, full blob ids, modes and binary content, so `git apply` takes it whole,
-also with `--cached`. Like git, it shows each side as git would store it: under
-`core.autocrlf` or `text`/`eol` attributes, CRLF text becomes LF, and a change of
-line endings only is no change. A changed path git would store through a filter
-driver, `ident` or a `working-tree-encoding` is refused (code `unsupported`).
+`diff CHECKOUT [SNAP]` compares the checkout now with its base capture (or a
+snapshot) and lists the changed source paths, one `STATUS<TAB>PATH` per line.
+`--stat` adds each path's added and deleted lines as a third column
+(`+3 -1`, or `binary`) and totals them on stderr.
+
+`-p` prints a git-format patch instead of the list, and nothing else, so it
+pipes into `git apply` or a file: `diff --git` headers, the modes of added,
+deleted and re-moded files, and text hunks. It carries no blob ids and only
+names a binary file, which `git apply` then refuses. `--binary` prints the
+patch as `git diff --binary` does, with full blob ids and binary content, so
+`git apply` takes it whole, also with `--cached`. Like git, it shows each side
+as git would store it: under `core.autocrlf` or `text`/`eol` attributes, CRLF
+text becomes LF, and a change of line endings only is no change. A changed path
+git would store through a filter driver, `ident` or a `working-tree-encoding`
+is refused (code `unsupported`).
+
+`diff CHECKOUT [SNAP] -- PATH ...` keeps the list, the counts or the patch to
+those files and folders. Paths count from the checkout's root wherever the
+command runs, unlike git's; when they match no change while others exist, diff
+says so on stderr.
+
 `apply CHECKOUT` snapshots the checkout temporarily and merges each changed
 source path into the folder against the base; it releases the snapshot after a
 successful, conflict-free apply and retains it on errors or conflicts. A path

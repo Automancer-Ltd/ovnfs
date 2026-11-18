@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -126,7 +127,10 @@ func (r *Registry) Diff(ctx context.Context, args api.DiffArgs) (api.DiffReply, 
 	if reply.From == "" {
 		reply.From = "base"
 	}
-	if args.Patch || args.Binary {
+	if reply.Changes, reply.Left, err = underPaths(reply.Changes, args.Paths); err != nil {
+		return api.DiffReply{}, err
+	}
+	if args.Patch || args.Binary || args.Stat {
 		var eol *eolConverter
 		if args.Binary {
 			paths := make([]string, len(reply.Changes))
@@ -149,30 +153,61 @@ func (r *Registry) Diff(ctx context.Context, args api.DiffArgs) (api.DiffReply, 
 			if err != nil {
 				return api.DiffReply{}, coded(err)
 			}
-			if !args.Binary {
-				unified(&patch, c.Path, old, cur)
-				kept = append(kept, c)
-				continue
+			a, b := from[c.Path], now.files[c.Path]
+			if args.Binary {
+				// A git patch shows what git stores: a change of line endings that
+				// git normalizes away is no change.
+				if a, old, err = eol.blob(c.Path, a, old); err != nil {
+					return api.DiffReply{}, coded(err)
+				}
+				if b, cur, err = eol.blob(c.Path, b, cur); err != nil {
+					return api.DiffReply{}, coded(err)
+				}
+				if a == b {
+					continue
+				}
 			}
-			// A git patch shows what git stores: a change of line endings that git
-			// normalizes away is no change.
-			a, old, err := eol.blob(c.Path, from[c.Path], old)
-			if err != nil {
-				return api.DiffReply{}, coded(err)
+			stat := api.DiffStat{Path: c.Path}
+			if args.Patch || args.Binary {
+				stat.Added, stat.Deleted, stat.Binary = gitPatch(&patch, c.Path, a, b, old, cur, args.Binary)
+			} else if stat.Binary = binaryContent(old, cur); !stat.Binary {
+				stat.Added, stat.Deleted = countEdits(lineDiff(splitLines(old), splitLines(cur)))
 			}
-			b, cur, err := eol.blob(c.Path, now.files[c.Path], cur)
-			if err != nil {
-				return api.DiffReply{}, coded(err)
+			if args.Stat {
+				reply.Stat = append(reply.Stat, stat)
 			}
-			if a == b {
-				continue
-			}
-			gitPatch(&patch, c.Path, a, b, old, cur)
 			kept = append(kept, c)
 		}
 		reply.Changes, reply.Patch, reply.Binary = kept, patch.String(), args.Binary
 	}
 	return reply, nil
+}
+
+// underPaths keeps the changes at or below one of paths, each relative to the
+// checkout's root, and counts the others; no path keeps them all, as does the
+// root itself.
+func underPaths(changes []api.Change, paths []string) (kept []api.Change, left int, err error) {
+	var only pathSet
+	for _, p := range paths {
+		clean := path.Clean(p)
+		if clean == "." {
+			return changes, 0, nil
+		}
+		if path.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, "../") {
+			return nil, 0, failure("invalid", "path %s is not relative to the checkout's root", p)
+		}
+		only.add(clean)
+	}
+	if len(paths) == 0 {
+		return changes, 0, nil
+	}
+	kept = changes[:0]
+	for _, c := range changes {
+		if only.covers(c.Path) {
+			kept = append(kept, c)
+		}
+	}
+	return kept, len(changes) - len(kept), nil
 }
 
 // compare returns changed blob paths in order; empty-directory leaves are not changes.
@@ -226,21 +261,23 @@ func (r *Registry) content(h *checkoutRecord, p string, f store.File, layer *ove
 	return h.base.view.Blob(p, f.ID)
 }
 
-// unified appends one path's `diff -u` output, nothing when the contents are
-// equal, or a one-line note for binary content. A nil side is absent (/dev/null).
-func unified(w *strings.Builder, p string, old, cur []byte) {
-	if bytes.IndexByte(head(old), 0) >= 0 || bytes.IndexByte(head(cur), 0) >= 0 {
-		fmt.Fprintf(w, "Binary files a/%s and b/%s differ\n", p, p)
-		return
+// binaryContent reports whether either side of a change is binary, as git
+// tells: a NUL byte near its start.
+func binaryContent(old, cur []byte) bool {
+	return bytes.IndexByte(head(old), 0) >= 0 || bytes.IndexByte(head(cur), 0) >= 0
+}
+
+// countEdits returns how many lines a line diff script inserts and deletes.
+func countEdits(script []byte) (added, deleted int) {
+	for _, op := range script {
+		switch op {
+		case opInsert:
+			added++
+		case opDelete:
+			deleted++
+		}
 	}
-	labelA, labelB := "a/"+p, "b/"+p
-	if old == nil {
-		labelA = "/dev/null"
-	}
-	if cur == nil {
-		labelB = "/dev/null"
-	}
-	unifiedHunks(w, labelA, labelB, old, cur)
+	return added, deleted
 }
 
 // diffContext is the number of unchanged lines around each change, as diff -u.

@@ -16,9 +16,10 @@ var Ops = []string{"status", "ls", "new", "fork", "snap", "diff", "grep", "glob"
 // "rm.sticky_snapshots" and "prune.sticky_snapshots",
 // "stop.keep_mount" (StopArgs.KeepMount),
 // "pull.folder" (a pull of a checkout without attachments merges its folder),
-// "apply.atomic" (ApplyArgs.Atomic), and "rm.keep_commits" (RmArgs.KeepCommits).
+// "apply.atomic" (ApplyArgs.Atomic), "rm.keep_commits" (RmArgs.KeepCommits),
+// "diff.paths" (DiffArgs.Paths) and "diff.stat" (DiffArgs.Stat).
 var Features = []string{"new.base", "diff.binary", "ls.select", "rm.sticky_snapshots", "prune.sticky_snapshots", "stop.keep_mount",
-	"pull.folder", "apply.atomic", "rm.keep_commits"}
+	"pull.folder", "apply.atomic", "rm.keep_commits", "diff.paths", "diff.stat"}
 
 // Checkout is an isolated, copy-on-write copy of a source folder that an agent works in.
 type Checkout struct {
@@ -172,16 +173,23 @@ type SnapReply struct {
 	Snapshot Snapshot `json:"snapshot"`
 }
 
-// DiffArgs compares a checkout's current state with a snapshot (default: its base).
-// Binary makes Patch the patch git diff --binary writes, which git apply takes
-// whole: git headers, full blob ids, modes and binary content, each side as git's
-// end-of-line conversion stores it; a path under a filter, ident or encoding is
-// refused with code "unsupported".
+// DiffArgs compares a checkout's current state with a snapshot (default: its
+// base: the capture it opened on, with the folder's files as of its last pull
+// in place of the paths that pull brought in).
+// Patch asks for a git-format patch of text hunks, without blob ids, that names
+// binary files instead of carrying them. Binary makes Patch the patch git diff
+// --binary writes, which git apply takes whole: full blob ids, modes and binary
+// content, each side as git's end-of-line conversion stores it; a path under a
+// filter, ident or encoding is refused with code "unsupported".
 type DiffArgs struct {
 	Checkout string `json:"checkout"`
-	From     string `json:"from,omitempty"` // snapshot id; default: the checkout's base capture
+	From     string `json:"from,omitempty"` // snapshot id; default: the checkout's base
 	Patch    bool   `json:"patch,omitempty"`
 	Binary   bool   `json:"binary,omitempty"`
+	// Paths keeps only these paths and what lies below them; each is relative
+	// to the checkout's root. Empty keeps every path.
+	Paths []string `json:"paths,omitempty"`
+	Stat  bool     `json:"stat,omitempty"` // count each path's added and deleted lines
 }
 
 // Change is one source-class path that differs; Status is A, M, D or T (type change).
@@ -190,13 +198,26 @@ type Change struct {
 	Status string `json:"status"`
 }
 
-// DiffReply lists changed source paths; Patch is a unified diff when requested,
-// a git patch when Binary says so (a daemon that knows DiffArgs.Binary sets it).
+// DiffStat counts the lines one changed path gained and lost; Binary content
+// has no lines to count.
+type DiffStat struct {
+	Path    string `json:"path"`
+	Added   int    `json:"added"`
+	Deleted int    `json:"deleted"`
+	Binary  bool   `json:"binary,omitempty"`
+}
+
+// DiffReply lists changed source paths; Patch is a git-format patch when
+// requested, the one git diff --binary writes when Binary says so (a daemon
+// that knows DiffArgs.Binary sets it); Stat has one entry per change when
+// DiffArgs.Stat asked for it. Left counts the changes DiffArgs.Paths left out.
 type DiffReply struct {
-	From    string   `json:"from"` // snapshot id or "base"
-	Changes []Change `json:"changes"`
-	Patch   string   `json:"patch,omitempty"`
-	Binary  bool     `json:"binary,omitempty"`
+	From    string     `json:"from"` // snapshot id or "base"
+	Changes []Change   `json:"changes"`
+	Patch   string     `json:"patch,omitempty"`
+	Binary  bool       `json:"binary,omitempty"`
+	Stat    []DiffStat `json:"stat,omitempty"`
+	Left    int        `json:"left,omitempty"`
 }
 
 // ApplyArgs merges a checkout's source changes back into the folder it came from.

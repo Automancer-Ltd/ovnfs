@@ -9,15 +9,22 @@ import (
 	"github.com/stencil-hq/ovnfs/store"
 )
 
-// gitPatch appends one path's change as git diff --binary writes it, so that git
-// apply takes the whole patch: git headers with full blob ids and modes, text
-// hunks, and binary content as base85 literals. A zero side is absent. A change
-// between a symlink and a file is a deletion and an addition.
-func gitPatch(w *strings.Builder, p string, a, b store.File, old, cur []byte) {
+// gitPatch appends one path's change in git's patch format: a diff --git
+// header, the modes of a file added, deleted or changing mode, and text hunks.
+// It returns the lines those hunks add and delete, or that the content is
+// binary. A zero side is absent. A change between a symlink and a file is a
+// deletion and an addition.
+//
+// With full set the patch is the one git diff --binary writes, which git
+// apply takes whole: a and b carry git blob ids for the index lines, and
+// binary content travels as base85 literals. Without it no blob id is
+// written and a binary file is only named, as git diff does, so git apply
+// refuses that file instead of skipping it.
+func gitPatch(w *strings.Builder, p string, a, b store.File, old, cur []byte, full bool) (added, deleted int, binary bool) {
 	if a.ID != "" && b.ID != "" && (a.Mode == store.ModeSymlink) != (b.Mode == store.ModeSymlink) {
-		gitPatch(w, p, a, store.File{}, old, nil)
-		gitPatch(w, p, store.File{}, b, nil, cur)
-		return
+		_, deleted, gone := gitPatch(w, p, a, store.File{}, old, nil, full)
+		added, _, binary = gitPatch(w, p, store.File{}, b, nil, cur, full)
+		return added, deleted, binary || gone
 	}
 	fmt.Fprintf(w, "diff --git %s %s\n", quotePath("a/"+p), quotePath("b/"+p))
 	oldID, newID := zeroOID, zeroOID
@@ -27,38 +34,50 @@ func gitPatch(w *strings.Builder, p string, a, b store.File, old, cur []byte) {
 	if b.ID != "" {
 		newID = string(b.ID)
 	}
+	index := func(mode string) {
+		if full {
+			fmt.Fprintf(w, "index %s..%s%s\n", oldID, newID, mode)
+		}
+	}
 	labelA, labelB := quotePath("a/"+p), quotePath("b/"+p)
 	switch {
 	case a.ID == "":
-		fmt.Fprintf(w, "new file mode %06o\nindex %s..%s\n", b.Mode, oldID, newID)
+		fmt.Fprintf(w, "new file mode %06o\n", b.Mode)
+		index("")
 		labelA = "/dev/null"
 	case b.ID == "":
-		fmt.Fprintf(w, "deleted file mode %06o\nindex %s..%s\n", a.Mode, oldID, newID)
+		fmt.Fprintf(w, "deleted file mode %06o\n", a.Mode)
+		index("")
 		labelB = "/dev/null"
 	case a.Mode != b.Mode:
 		fmt.Fprintf(w, "old mode %06o\nnew mode %06o\n", a.Mode, b.Mode)
 		if a.ID == b.ID {
-			return
+			return 0, 0, false
 		}
-		fmt.Fprintf(w, "index %s..%s\n", oldID, newID)
+		index("")
 	default:
-		fmt.Fprintf(w, "index %s..%s %06o\n", oldID, newID, a.Mode)
+		index(fmt.Sprintf(" %06o", a.Mode))
 	}
-	if bytes.IndexByte(head(old), 0) >= 0 || bytes.IndexByte(head(cur), 0) >= 0 {
-		w.WriteString("GIT binary patch\n")
-		binaryLiteral(w, cur)
-		binaryLiteral(w, old)
-		return
+	if binaryContent(old, cur) {
+		if full {
+			w.WriteString("GIT binary patch\n")
+			binaryLiteral(w, cur)
+			binaryLiteral(w, old)
+		} else {
+			fmt.Fprintf(w, "Binary files %s and %s differ\n", labelA, labelB)
+		}
+		return 0, 0, true
 	}
-	unifiedHunks(w, labelA, labelB, old, cur)
+	added, deleted = unifiedHunks(w, labelA, labelB, old, cur)
+	return added, deleted, false
 }
 
 // zeroOID stands for an absent side in an index line.
 const zeroOID = "0000000000000000000000000000000000000000"
 
 // unifiedHunks appends the ---/+++ header and hunks turning old into cur, nothing
-// when they are equal.
-func unifiedHunks(w *strings.Builder, labelA, labelB string, old, cur []byte) {
+// when they are equal, and returns the lines they add and delete.
+func unifiedHunks(w *strings.Builder, labelA, labelB string, old, cur []byte) (added, deleted int) {
 	a, b := splitLines(old), splitLines(cur)
 	script := lineDiff(a, b)
 	header := false
@@ -93,6 +112,7 @@ func unifiedHunks(w *strings.Builder, labelA, labelB string, old, cur []byte) {
 		writeHunk(w, script, start, end, a, b)
 		i = end
 	}
+	return countEdits(script)
 }
 
 // binaryLiteral appends a git binary patch hunk holding data whole: "literal",

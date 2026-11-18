@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alecthomas/kong"
+
 	"github.com/stencil-hq/ovnfs/admin"
 	"github.com/stencil-hq/ovnfs/api"
 )
@@ -406,28 +408,86 @@ func (cmd *snapCmd) Run(c *cli) error {
 	return nil
 }
 
-// diffCmd prints a checkout's changed source paths and, on request, the patch.
+// diffCmd prints a checkout's changed source paths, or their line counts, or
+// the patch alone, so that it pipes into git apply.
 type diffCmd struct {
-	Checkout string `arg:"" name:"CHECKOUT" help:"checkout to diff" completion-predictor:"checkout"`
-	Snapshot string `arg:"" optional:"" name:"SNAP" help:"snapshot to compare against (default: the base)" completion-predictor:"snapshot"`
-	Patch    bool   `name:"patch" short:"p" help:"print a unified diff"`
-	Binary   bool   `name:"binary" help:"print the patch as git diff --binary does, for git apply"`
+	Checkout string   `arg:"" name:"CHECKOUT" help:"checkout to diff" completion-predictor:"checkout"`
+	Snapshot string   `arg:"" optional:"" name:"SNAP" help:"snapshot to compare against (default: the base)" completion-predictor:"snapshot"`
+	Paths    []string `arg:"" optional:"" name:"-- PATH" help:"after --: only these files and folders, relative to the checkout's root"`
+	Patch    bool     `name:"patch" short:"p" help:"print a git-format patch instead of the list (binary files are named, not carried)"`
+	Binary   bool     `name:"binary" help:"print the patch as git diff --binary does, which git apply takes whole"`
+	Stat     bool     `name:"stat" help:"list each path with the lines it adds and deletes"`
+}
+
+// AfterApply sorts the positional arguments around a bare --, which kong
+// reads through: before it CHECKOUT and SNAP, after it the paths.
+func (cmd *diffCmd) AfterApply(ctx *kong.Context) error {
+	args := ctx.Args[1:]
+	separator := slices.Index(args, "--")
+	if separator < 0 {
+		if len(cmd.Paths) != 0 {
+			return errors.New("diff takes paths after --: ovnfs diff CHECKOUT [SNAP] -- PATH ...")
+		}
+		return nil
+	}
+	paths := args[separator+1:]
+	before := slices.DeleteFunc(append([]string{cmd.Checkout, cmd.Snapshot}, cmd.Paths...), func(s string) bool { return s == "" })
+	before = before[:len(before)-len(paths)]
+	if len(before) == 0 || len(before) > 2 {
+		return errors.New("diff takes CHECKOUT [SNAP] before --")
+	}
+	cmd.Checkout, cmd.Snapshot, cmd.Paths = before[0], "", nil
+	if len(before) == 2 {
+		cmd.Snapshot = before[1]
+	}
+	for _, p := range paths {
+		cmd.Paths = append(cmd.Paths, filepath.ToSlash(p))
+	}
+	return nil
 }
 
 func (cmd *diffCmd) Run(c *cli) error {
-	a := api.DiffArgs{Checkout: cmd.Checkout, From: cmd.Snapshot, Patch: cmd.Patch, Binary: cmd.Binary}
+	a := api.DiffArgs{Checkout: cmd.Checkout, From: cmd.Snapshot, Patch: cmd.Patch, Binary: cmd.Binary, Stat: cmd.Stat, Paths: cmd.Paths}
 	r, err := call[api.DiffReply](c, "diff", a)
-	if err != nil || c.json {
-		return err
+	if err != nil {
+		// A second argument that is no snapshot was probably meant as a path.
+		if e, ok := errors.AsType[*admin.RemoteError](err); ok && e.Code == "not_found" && strings.HasSuffix(e.Message, "snapshot "+a.From) && len(a.Paths) == 0 {
+			return fmt.Errorf("%w; paths go after --: ovnfs diff %s -- %s", err, a.Checkout, a.From)
+		}
+		return c.predates(c.predates(err, len(a.Paths) != 0, "diff.paths", "diff -- PATH"), a.Stat, "diff.stat", "diff --stat")
 	}
-	for _, ch := range r.Changes {
-		fmt.Fprintf(stdout, "%s\t%s\n", mark(stdout, ch.Status), ch.Path)
+	if c.json {
+		return nil
+	}
+	patch := a.Patch || a.Binary
+	for i, ch := range r.Changes {
+		switch {
+		case a.Stat && r.Stat[i].Binary:
+			fmt.Fprintf(stdout, "%s\t%s\t%s\n", mark(stdout, ch.Status), ch.Path, paint(stdout, styleDim, "binary"))
+		case a.Stat:
+			fmt.Fprintf(stdout, "%s\t%s\t%s %s\n", mark(stdout, ch.Status), ch.Path,
+				paint(stdout, styleGreen, fmt.Sprintf("+%d", r.Stat[i].Added)), paint(stdout, styleRed, fmt.Sprintf("-%d", r.Stat[i].Deleted)))
+		case !patch:
+			fmt.Fprintf(stdout, "%s\t%s\n", mark(stdout, ch.Status), ch.Path)
+		}
 	}
 	if r.Patch != "" {
 		colorPatch(stdout, r.Patch)
 		if !strings.HasSuffix(r.Patch, "\n") {
 			fmt.Fprintln(stdout)
 		}
+	}
+	if a.Stat {
+		added, deleted := 0, 0
+		for _, s := range r.Stat {
+			added, deleted = added+s.Added, deleted+s.Deleted
+		}
+		fmt.Fprintf(stderr, "%s changed, +%d -%d\n", plural(len(r.Changes), "path", "paths"), added, deleted)
+	}
+	if len(r.Changes) == 0 && r.Left != 0 {
+		// Paths count from the root, not from the working directory as git's do.
+		fmt.Fprintf(stderr, "no change under %s, counted from the root of %s; %s elsewhere\n",
+			strings.Join(a.Paths, ", "), a.Checkout, plural(r.Left, "path changed", "paths changed"))
 	}
 	return nil
 }
