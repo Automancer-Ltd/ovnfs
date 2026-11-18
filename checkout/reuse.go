@@ -371,9 +371,12 @@ func pending(ch chan struct{}) bool {
 // newOnBase opens checkout name (or one derived from the captured folder) on
 // capture id as it was taken: no layers, and the private git directory checkouts
 // opened on it then started from. A capture of a repository that kept none (see
-// writeTemplate) is refused.
+// writeTemplate) is refused. The name of a live checkout stands for its capture.
 func (r *Registry) newOnBase(ctx context.Context, id, name string) (api.NewReply, error) {
 	r.mu.Lock()
+	if h := r.checkouts[id]; r.bases[id] == nil && h != nil && !h.retired.Load() {
+		id = h.meta.Base
+	}
 	b := r.bases[id]
 	if b != nil && pending(b.template) {
 		// Its template is being written; checkouts on it start from that.
@@ -388,7 +391,7 @@ func (r *Registry) newOnBase(ctx context.Context, id, name string) (api.NewReply
 	}
 	if b == nil || r.closed {
 		r.mu.Unlock()
-		return api.NewReply{}, failure("not_found", "no capture %s", id)
+		return api.NewReply{}, failure("not_found", "no capture or checkout %s", id)
 	}
 	var template gitTemplate
 	if b.view.Domains().Repo("") != nil {

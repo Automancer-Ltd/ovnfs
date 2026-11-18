@@ -17,9 +17,10 @@ var Ops = []string{"status", "ls", "new", "fork", "snap", "diff", "grep", "glob"
 // "stop.keep_mount" (StopArgs.KeepMount),
 // "pull.folder" (a pull of a checkout without attachments merges its folder),
 // "apply.atomic" (ApplyArgs.Atomic), "rm.keep_commits" (RmArgs.KeepCommits),
-// "diff.paths" (DiffArgs.Paths) and "diff.stat" (DiffArgs.Stat).
+// "diff.paths" (DiffArgs.Paths), "diff.stat" (DiffArgs.Stat), and
+// "new.base_checkout" (NewArgs.Base takes a checkout's name).
 var Features = []string{"new.base", "diff.binary", "ls.select", "rm.sticky_snapshots", "prune.sticky_snapshots", "stop.keep_mount",
-	"pull.folder", "apply.atomic", "rm.keep_commits", "diff.paths", "diff.stat"}
+	"pull.folder", "apply.atomic", "rm.keep_commits", "diff.paths", "diff.stat", "new.base_checkout"}
 
 // Checkout is an isolated, copy-on-write copy of a source folder that an agent works in.
 type Checkout struct {
@@ -113,11 +114,13 @@ type LsReply struct {
 
 // NewArgs opens a checkout from a folder (any folder, repo or not), from a snapshot,
 // or on an existing capture (Checkout.Base) as it was taken: its files and the git
-// state checkouts opened on it started from, whatever the folder holds now.
+// state checkouts opened on it started from, whatever the folder holds now. Base
+// also takes the name of a live checkout and means that checkout's capture: an
+// untouched twin of it.
 type NewArgs struct {
 	Dir      string   `json:"dir,omitempty"`      // absolute; exactly one of Dir, Snapshot and Base
 	Snapshot string   `json:"snapshot,omitempty"` // snapshot id
-	Base     string   `json:"base,omitempty"`     // capture id; a capture of a linked work tree may keep no git state to start from
+	Base     string   `json:"base,omitempty"`     // capture id or checkout name; a capture of a linked work tree may keep no git state to start from
 	Rev      string   `json:"rev,omitempty"`      // commit or local branch; folder only
 	Take     []string `json:"take,omitempty"`     // "SRC:PATH" overrides of the starting tree; SRC is "." (folder), "" (index) or a revision
 	Name     string   `json:"name,omitempty"`     // default: derived from the folder name

@@ -290,7 +290,7 @@ type newCmd struct {
 	Dir      string   `arg:"" optional:"" name:"DIR" help:"folder to open the checkout on (default .)"`
 	Name     string   `name:"name" help:"checkout name (default: the folder's name)"`
 	Snapshot string   `name:"from" help:"open on this snapshot instead of a folder" completion-predictor:"snapshot"`
-	Base     string   `name:"base" help:"open on this capture (a checkout's base) as it was taken, instead of a folder"`
+	Base     string   `name:"base" help:"open on what this checkout (or capture id) started from, untouched: a baseline to compare it with" completion-predictor:"checkout"`
 	Rev      string   `name:"rev" help:"start at this git commit or local branch; keep ignored files"`
 	Take     []string `name:"take" sep:"none" help:"replace source path from working tree (.), index (empty), or revision (repeatable)"`
 	Rules    []string `name:"rule" sep:"none" help:"extra rule line (repeatable)"`
@@ -300,7 +300,7 @@ func (cmd *newCmd) Run(c *cli) error {
 	a := api.NewArgs{Name: cmd.Name, Snapshot: cmd.Snapshot, Base: cmd.Base, Rev: cmd.Rev, Take: cmd.Take, Rules: cmd.Rules}
 	switch {
 	case a.Snapshot != "" && a.Base != "":
-		return errors.New("new: give either --from SNAP or --base CAPTURE, not both")
+		return errors.New("new: give either --from SNAP or --base CHECKOUT, not both")
 	case a.Snapshot != "" || a.Base != "":
 		if a.Rev != "" {
 			return errors.New("new: --rev needs a folder")
@@ -309,7 +309,7 @@ func (cmd *newCmd) Run(c *cli) error {
 			return errors.New("new: --take needs a folder")
 		}
 		if cmd.Dir != "" {
-			return errors.New("new: give either DIR, --from SNAP or --base CAPTURE")
+			return errors.New("new: give either DIR, --from SNAP or --base CHECKOUT")
 		}
 	default:
 		dir, err := filepath.Abs(orDefault(cmd.Dir, "."))

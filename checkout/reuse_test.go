@@ -212,6 +212,11 @@ func TestNewOnCaptureStartsAsCaptured(t *testing.T) {
 	if got := gitRun(t, f.t.TempDir(), "--git-dir", f.gitdir("twin"), "cat-file", "-t", "HEAD^{tree}"); got != "tree" {
 		t.Fatalf("twin cannot read its objects: %q", got)
 	}
+	// The first checkout's name stands for its capture.
+	named, err := f.reg.New(ctx, api.NewArgs{Base: "first", Name: "baseline"})
+	if err != nil || named.Checkout.Base != first.Base || f.read("baseline", "a.txt") != "one" {
+		t.Fatalf("a checkout on first's capture, by name = %+v, %v", named.Checkout, err)
+	}
 	if _, err := f.reg.New(ctx, api.NewArgs{Base: "b_missing"}); err == nil {
 		t.Fatal("a checkout on an unknown capture opened")
 	}

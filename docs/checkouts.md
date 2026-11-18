@@ -96,7 +96,7 @@ updates. Like any jj command in the
 folder, this snapshots the folder's working copy first, and it writes the full
 tree into that directory: about 0.8 s for 5,000 files on a Mac. Every new
 checkout gets a fresh workspace: `new`, `run`, `fork`, `new --from SNAP` and
-`new --base CAPTURE`. Removing the checkout (`rm`, `prune`, the end of `run`)
+`new --base CHECKOUT`. Removing the checkout (`rm`, `prune`, the end of `run`)
 runs `jj workspace forget` for it; a repository that is gone has nothing to
 forget.
 
@@ -174,9 +174,10 @@ file. The metadata of a small snapshot (about 15 changed files) lives in the
 registry state instead of a manifest file of its own. `fork`
 snapshots a checkout and opens a second one on that snapshot; parent and child
 diverge. `new --from SNAP` opens a checkout on any snapshot, and
-`new --base CAPTURE` on a live checkout's base (`ls --json` shows it) as it was
-captured, with the git state that checkout started from, however the folder and
-the checkout have changed since. `rm` removes a checkout and its snapshots
+`new --base CHECKOUT` on what a live checkout started from (its capture, which
+`--base` also takes by the id `ls --json` shows), with the git state that
+checkout started from, however the folder and the checkout have changed since:
+an untouched baseline to build or test beside it. `rm` removes a checkout and its snapshots
 unless another checkout or snapshot uses them. `rm --sticky-snapshots` keeps
 them; `drop` releases one explicitly. Nothing replaces the content of a live
 folder: rollback means a new checkout from a snapshot.
