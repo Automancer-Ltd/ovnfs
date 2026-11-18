@@ -1,12 +1,15 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -27,8 +30,8 @@ var globalFlags = []struct {
 	value string // placeholder, "" for a switch
 	usage string
 }{
-	{"state", "DIR", "daemon state, env OVNFS_STATE, state in ~/.o2/ovnfs.yml (default " + defaultState + ")"},
-	{"mount", "DIR", "checkout mount (a free drive letter on Windows), env OVNFS_MOUNT, mount in ~/.o2/ovnfs.yml (default " + defaultMount + ")"},
+	{"state", "DIR", "daemon state, env OVNFS_STATE, state in ~/.o2/ovnfs.yml"},
+	{"mount", "DIR", "checkout mount (a free drive letter on Windows), env OVNFS_MOUNT, mount in ~/.o2/ovnfs.yml"},
 	{"json", "", "print the raw reply JSON"},
 	{"color", "WHEN", "colour the output: auto on a terminal, always or never (NO_COLOR is honored)"},
 }
@@ -106,19 +109,19 @@ func needsValue(name string) bool {
 // it. The group of a command is its help section, printed in this order.
 type verbs struct {
 	Ls          lsCmd                     `cmd:"" group:"checkouts" help:"list checkouts (of DIR: . or a path with /), or one checkout's snapshots"`
-	New         newCmd                    `cmd:"" group:"checkouts" help:"open a checkout on a folder (default .), git revision, or snapshot"`
+	New         newCmd                    `cmd:"" group:"checkouts" help:"open a checkout on a folder (default .) as it is now, on a git revision, or on a snapshot; prints its path"`
 	Run         runCmd                    `cmd:"" group:"checkouts" help:"run a command in a disposable checkout"`
 	Fork        forkCmd                   `cmd:"" group:"checkouts" help:"snapshot a checkout and open a second checkout on it"`
 	Snap        snapCmd                   `cmd:"" group:"checkouts" help:"freeze a checkout's changes into a snapshot"`
-	Diff        diffCmd                   `cmd:"" group:"checkouts" help:"list source changes since a snapshot (default: the base)"`
-	Apply       applyCmd                  `cmd:"" group:"checkouts" help:"merge a checkout's source changes back into its folder"`
+	Diff        diffCmd                   `cmd:"" group:"checkouts" help:"list source changes since a snapshot (default: the base), count their lines or print the patch"`
+	Apply       applyCmd                  `cmd:"" group:"checkouts" help:"merge a checkout's source changes back into its folder, as uncommitted edits"`
 	Land        landCmd                   `cmd:"" group:"checkouts" help:"put a checkout's commits on the branch checked out in its folder, with their files"`
 	Pull        pullCmd                   `cmd:"" group:"checkouts" help:"merge the folder's newer files into a checkout, to resolve conflicts there (--from HOST: an attached machine's changes)"`
 	Grep        grepCmd                   `cmd:"" group:"inspect" help:"search contents in the daemon, bypassing the checkout mount"`
 	Glob        globCmd                   `cmd:"" group:"inspect" help:"list matching paths in the daemon, bypassing the checkout mount"`
 	Explain     explainCmd                `cmd:"" group:"inspect" help:"show which class a path gets and which rule decided"`
 	Plan        planCmd                   `cmd:"" group:"inspect" help:"show what a launch elsewhere would transfer, rebuild and leave"`
-	Rm          rmCmd                     `cmd:"" group:"clean up" help:"remove a checkout and its unused snapshots"`
+	Rm          rmCmd                     `cmd:"" group:"clean up" help:"remove a checkout and its unused snapshots, with whatever was not applied or landed"`
 	Prune       pruneCmd                  `cmd:"" group:"clean up" help:"remove matching checkouts and unused snapshots"`
 	Drop        dropCmd                   `cmd:"" group:"clean up" help:"release a snapshot"`
 	Attach      attachCmd                 `cmd:"" group:"other machines" help:"make a checkout appear on another machine over ssh; content moves on first read"`
@@ -167,7 +170,7 @@ func newCLIParser(c *cli, args []string, commands *verbs) (*kong.Kong, error) {
 		kong.Writers(stdout, stderr),
 		kong.Bind(c),
 		kong.ConfigureHelp(kong.HelpOptions{FlagsLast: true}),
-		kong.Help(colorHelp),
+		kong.Help(c.colorHelp),
 	)
 }
 
@@ -258,9 +261,39 @@ func (c *cli) completeCall(op string, args any) (json.RawMessage, bool) {
 	return reply, err == nil
 }
 
-// colorHelp prints kong's help in the CLI's palette, then the options and verbs
-// kong's grammar does not hold, then kong's closing hint.
-func colorHelp(options kong.HelpOptions, ctx *kong.Context) error {
+// guideRows are the root help's walk through a checkout's life: what an agent
+// that never used ovnfs needs to open one, bring its work back and remove it,
+// then, after a blank row, the facts that are not a step. %s is the path of
+// the checkout named fix.
+var guideRows = [][2]string{
+	{`P=$(ovnfs new --name fix)`, "open a checkout of . as it is now, uncommitted and untracked files included; prints its path, %s"},
+	{`cd "$P"`, "edit, build and commit there: the folder sees none of it"},
+	{"ovnfs diff fix", "list its changes; --stat counts lines, -p prints a patch, -- PATH ... narrows"},
+	{"ovnfs apply fix", "merge them into the folder as uncommitted edits; --dry-run previews, --atomic writes all or nothing"},
+	{"ovnfs land fix", "or put its commits on the folder's branch, with their files"},
+	{"ovnfs pull fix", "on a conflict: merge the folder's newer files into the checkout, resolve there, then apply or land"},
+	{"ovnfs rm fix", "remove it; what was not applied or landed is gone (commits nothing else keeps need --force)"},
+	{"ovnfs run --rev HEAD -- CMD", "run CMD in a disposable checkout of a commit, without the folder's uncommitted edits"},
+	{},
+	{"new --rev REV", "starts tracked files at a commit or branch instead; ignored build output stays"},
+	{"new --base fix", "opens an untouched twin of what fix started from, as a baseline"},
+	{"stdout", "carries only the result (new's path, snap's id), printed last; --json prints the whole reply"},
+	{"git refs", "in a checkout are a copy from when it opened: git fetch FOLDER BRANCH there brings newer commits"},
+	{"git commits", "stay in the checkout until land, apply --branch NAME, or git fetch ovnfs/fix in the folder"},
+	{"names", "are unique across folders: one checkout per task, and remove only the ones you opened"},
+}
+
+// guide renders the root help's Typical use section.
+func (c *cli) guide() string {
+	rows := slices.Clone(guideRows)
+	rows[0][1] = fmt.Sprintf(rows[0][1], filepath.Join(cmp.Or(c.mount, defaultMount), "fix"))
+	return paint(stdout, styleAccent.Bold(true), "Typical use") + "\n" + twoColumns(rows)
+}
+
+// colorHelp prints kong's help in the CLI's palette, the root help with the
+// guide ahead of its verbs, then the options kong's grammar does not hold,
+// then kong's closing hint.
+func (c *cli) colorHelp(options kong.HelpOptions, ctx *kong.Context) error {
 	var plain strings.Builder
 	saved := ctx.Stdout
 	ctx.Stdout = &plain
@@ -275,25 +308,43 @@ func colorHelp(options kong.HelpOptions, ctx *kong.Context) error {
 		text, hint = text[:i+1], paint(stdout, styleDim, text[i+1:])
 	}
 	out := colorizeHelp(text)
-	out += "\n" + paint(stdout, styleAccent.Bold(true), "Global flags") + "\n" + twoColumns(globalRows())
+	if ctx.Selected() == nil {
+		// The first group title follows the description.
+		if head, groups, found := strings.Cut(text, "\ncheckouts\n"); found {
+			out = colorizeHelp(head+"\n") + c.guide() + "\n" + colorizeHelp("checkouts\n"+groups)
+		}
+	}
+	out += "\n" + paint(stdout, styleAccent.Bold(true), "Global flags") + "\n" + twoColumns(c.globalRows())
 	_, err = io.WriteString(stdout, out+hint)
 	return err
 }
 
-// globalRows is the Global flags table: each option, named with its placeholder.
-func globalRows() [][2]string {
+// globalRows is the Global flags table: each option, named with its
+// placeholder; the folders say where they point now when that is not the
+// default.
+func (c *cli) globalRows() [][2]string {
+	dirs := map[string][2]string{"state": {c.state, defaultState}, "mount": {c.mount, defaultMount}}
 	out := make([][2]string, len(globalFlags))
 	for i, g := range globalFlags {
 		name := "--" + g.name
 		if g.value != "" {
 			name += " " + g.value
 		}
-		out[i] = [2]string{name, g.usage}
+		usage := g.usage
+		if dir, ok := dirs[g.name]; ok {
+			if dir[0] != "" && dir[0] != dir[1] {
+				usage += " (now " + dir[0] + ", default " + dir[1] + ")"
+			} else {
+				usage += " (default " + dir[1] + ")"
+			}
+		}
+		out[i] = [2]string{name, usage}
 	}
 	return out
 }
 
-// twoColumns renders a left-column accent table, padded to its widest cell.
+// twoColumns renders a left-column accent table, padded to its widest cell; an
+// empty row is a blank line.
 func twoColumns(table [][2]string) string {
 	width := 0
 	for _, row := range table {
@@ -301,6 +352,10 @@ func twoColumns(table [][2]string) string {
 	}
 	var b strings.Builder
 	for _, row := range table {
+		if row == ([2]string{}) {
+			b.WriteByte('\n')
+			continue
+		}
 		fmt.Fprintf(&b, "  %s%s%s\n", paint(stdout, styleAccent, row[0]), strings.Repeat(" ", width-len(row[0])+2), row[1])
 	}
 	return b.String()

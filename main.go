@@ -87,11 +87,11 @@ func run(args []string) error {
 	if err := c.setColor(); err != nil {
 		return err
 	}
-	if len(args) == 0 {
-		return printHelp(c, nil)
-	}
-	if args[0] == "help" {
-		return printHelp(c, args[1:])
+	if len(args) == 0 || args[0] == "help" {
+		// Help names the folders in use; a configuration that does not parse
+		// leaves it the defaults.
+		_ = c.resolveDirs()
+		return printHelp(c, args[min(1, len(args)):])
 	}
 	// version and mesh read no configuration, so they run where none parses;
 	// config reads it itself, so a broken file can still be fixed with it.

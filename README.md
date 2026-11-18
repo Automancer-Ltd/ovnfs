@@ -54,9 +54,12 @@ cd "$(ovnfs new)"              # starts the daemon, prints the checkout's path
 git status                     # same status as ~/src/app; nothing is written there
 # ...let the agent work...
 ovnfs diff app -p              # what changed
-ovnfs apply app                # merge it back into ~/src/app
+ovnfs apply app                # merge it back into ~/src/app as uncommitted edits
+ovnfs land app                 # or: put its commits on ~/src/app's branch, files included
 cd ~/src/app && ovnfs rm app   # remove the checkout and its unused snapshots
 ```
+
+`ovnfs help` walks through the same steps with what each one prints.
 
 More, from `~/src/app`:
 
