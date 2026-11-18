@@ -139,23 +139,26 @@ func (s *Server) lookup3(d *decoder, res *encoder) status {
 	return stOK
 }
 
-// access3 answers ACCESS (section 3.3.4), granting every right asked for:
-// the backend's own permissions apply when the client acts. The reply
-// leaves out the file's attributes, which are optional: the client sends
-// ACCESS for every file it opens for the first time, right after the LOOKUP
-// or READDIRPLUS that brought fresh attributes, and stating the file again
-// cost a host lstat per open.
+// access3 answers ACCESS (section 3.3.4) with the rights the file's mode
+// permits (accessOf). The reply still leaves out the optional attributes:
+// the client typically already has them from the LOOKUP or READDIRPLUS
+// that preceded the call.
 func (s *Server) access3(d *decoder, res *encoder) status {
 	id, gen, ok := d.fh(maxFH3)
 	mask := d.u32()
 	if d.err != nil {
 		return stInval
 	}
-	if _, st := s.path3(id, gen, ok); st != stOK {
+	p, st := s.path3(id, gen, ok)
+	if st != stOK {
 		return st
 	}
+	info, err := s.FS.Lstat(p)
+	if err != nil {
+		return statusOf(err)
+	}
 	res.bool(false) // obj_attributes
-	res.u32(mask)
+	res.u32(accessOf(info.Mode(), mask))
 	return stOK
 }
 

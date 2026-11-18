@@ -904,7 +904,8 @@ func TestV3RemoveRmdir(t *testing.T) {
 
 // TestV3FSInfoStatPathconf checks the file system procedures' layouts.
 func TestV3FSInfoStatPathconf(t *testing.T) {
-	c := v3server(t, newTestFS(t))
+	fs := newTestFS(t)
+	c := v3server(t, fs)
 	root := func(e *encoder) { e.fh(1, 0) }
 
 	st, d := c.v3call(v3FSStat, root)
@@ -938,10 +939,73 @@ func TestV3FSInfoStatPathconf(t *testing.T) {
 		t.Errorf("PATHCONF %v", pc)
 	}
 
+	rootInfo, err := os.Lstat(fs.host(""))
+	if err != nil {
+		t.Fatal(err)
+	}
 	st, d = c.v3call(v3Access, func(e *encoder) { e.fh(1, 0); e.u32(0x3f) })
-	if _, ok := postOpOf(t, d); st != stOK || ok || d.u32() != 0x3f || len(d.buf) != 0 {
+	if _, ok := postOpOf(t, d); st != stOK || ok || d.u32() != accessOf(rootInfo.Mode(), 0x3f) || len(d.buf) != 0 {
 		t.Errorf("ACCESS: %d", st)
 	}
+}
+
+// TestAccessOf checks ACCESS bits against a file's mode, including a 0644
+// file which must not be reported executable (#77).
+func TestAccessOf(t *testing.T) {
+	cases := []struct {
+		mode os.FileMode
+		want uint32
+		have uint32
+	}{
+		{0o644, access4All, access4Read | access4Modify | access4Extend},
+		{0o444, access4All, access4Read},
+		{0o755, access4All, access4Read | access4Modify | access4Extend | access4Execute},
+		{os.ModeDir | 0o755, access4All, access4All},
+		{os.ModeDir | 0o555, access4All, access4Read | access4Lookup | access4Execute},
+		{os.ModeDir | 0o700, access4All, access4All},
+		{0o644, access4Execute, 0},
+		{0o644, access4Read, access4Read},
+		{0o111, access4All, access4Execute},
+	}
+	for _, tc := range cases {
+		if got := accessOf(tc.mode, tc.want); got != tc.have {
+			t.Errorf("accessOf(%#o, %#x) = %#x, want %#x", tc.mode, tc.want, got, tc.have)
+		}
+	}
+}
+
+// TestV3AccessFollowsMode checks ACCESS on a 0644 file grants read and write
+// but not execute, and a chmod that removes write drops modify and extend.
+func TestV3AccessFollowsMode(t *testing.T) {
+	fs := newTestFS(t)
+	if err := os.WriteFile(fs.host("runme.sh"), []byte("#!/bin/sh\necho hi\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fid := fs.FileID("runme.sh")
+	c := v3server(t, fs)
+
+	check := func(perm os.FileMode) {
+		t.Helper()
+		if err := os.Chmod(fs.host("runme.sh"), perm); err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Lstat(fs.host("runme.sh"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, d := c.v3call(v3Access, func(e *encoder) { e.fh(fid, 0); e.u32(access4All) })
+		if _, ok := postOpOf(t, d); st != stOK || ok {
+			t.Fatalf("ACCESS after chmod %#o: status %d attrs=%v", perm, st, ok)
+		}
+		got := d.u32()
+		want := accessOf(info.Mode(), access4All)
+		if got != want || len(d.buf) != 0 {
+			t.Errorf("ACCESS after chmod %#o: got %#x, want %#x", perm, got, want)
+		}
+	}
+	check(0o644)
+	check(0o444)
+	check(0o755)
 }
 
 // slowFS blocks Lstat of "slow" until released.
