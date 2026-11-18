@@ -520,7 +520,10 @@ func (cmd *applyCmd) Run(c *cli) error {
 	if err != nil {
 		return c.predates(err, a.Atomic, "apply.atomic", "apply --atomic")
 	}
-	advice := mergeAdvice{resolve: fmt.Sprintf("resolve them, then run `%s` again", paint(stderr, styleAccent, "ovnfs apply "+a.Checkout))}
+	advice := mergeAdvice{
+		resolve: fmt.Sprintf("resolve them, then run `%s` again", paint(stderr, styleAccent, "ovnfs apply "+a.Checkout)),
+		nothing: fmt.Sprintf("nothing to apply: %s holds every change of %s already", r.Source, a.Checkout),
+	}
 	if r.Pullable {
 		advice.instead = fmt.Sprintf("`%s` merges the folder into the checkout instead, to resolve them there", paint(stderr, styleAccent, "ovnfs pull "+a.Checkout))
 	}
@@ -607,17 +610,21 @@ func (cmd *pullCmd) Run(c *cli) error {
 	if a.From != "" {
 		again += " --from " + a.From
 	}
-	advice := mergeAdvice{resolve: fmt.Sprintf("resolve them, then run `%s` again", paint(stderr, styleAccent, again))}
+	advice := mergeAdvice{
+		resolve: fmt.Sprintf("resolve them, then run `%s` again", paint(stderr, styleAccent, again)),
+		nothing: "nothing to pull: " + a.Checkout + " is up to date",
+	}
 	if r.Folder != "" {
 		advice.resolve = fmt.Sprintf("resolve them in %s, then `%s`", r.Source, paint(stderr, styleAccent, "ovnfs apply "+a.Checkout))
 	}
 	return printMerge(c, r.ApplyReply, a.DryRun, advice)
 }
 
-// mergeAdvice words what to do about the conflicts of an apply or a pull.
+// mergeAdvice words the outcomes of an apply or a pull that need a sentence.
 type mergeAdvice struct {
 	resolve string // once conflict markers were written
 	instead string // when a dry run found that they would be; "" for nothing to offer
+	nothing string // when no path changed or conflicted, so that silence is not the answer
 }
 
 // printMerge prints apply and pull outcomes and fails when conflicts remain,
@@ -630,6 +637,8 @@ func printMerge(c *cli, r api.ApplyReply, dryRun bool, advice mergeAdvice) error
 		printMerged(r, r.Branch != "")
 		if r.Branch != "" {
 			fmt.Fprintf(stdout, "%s %s %s %s\n", paint(stdout, styleDim, "branch"), paint(stdout, styleAccent, r.Branch), paint(stdout, styleDim, "at"), paint(stdout, styleDim, abbrev(r.Commit, 12)))
+		} else if len(r.Applied)+len(r.Merged)+len(r.Conflicts) == 0 {
+			fmt.Fprintln(stderr, paint(stderr, styleDim, advice.nothing))
 		}
 	}
 	if len(r.Conflicts) == 0 {
