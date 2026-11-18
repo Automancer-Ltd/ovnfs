@@ -181,6 +181,15 @@ unless another checkout or snapshot uses them. `rm --sticky-snapshots` keeps
 them; `drop` releases one explicitly. Nothing replaces the content of a live
 folder: rollback means a new checkout from a snapshot.
 
+`rm` discards whatever the checkout holds that was not applied, without
+asking, and prints `removed NAME`. The one thing it refuses to discard is a
+commit made in the checkout that nothing else keeps: no ref of the folder's
+repository reaches it (as after `land`, `apply --branch` or a merge of the
+checkout's [git remote](#git-remotes)), and the checkout did not push it. The
+message counts those commits and names the newest; `rm --force` removes the
+checkout anyway. `prune`, the end of `run` and the socket API's `rm` without
+`keep_commits` do not check.
+
 `new` (and `run`) on a checkout's own folder forks that checkout: capturing it
 would make the daemon serve the new checkout by reading through its own mount,
 which can deadlock the mount. `new` refuses the mount itself, a folder below a

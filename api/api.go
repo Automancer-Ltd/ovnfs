@@ -16,9 +16,9 @@ var Ops = []string{"status", "ls", "new", "fork", "snap", "diff", "grep", "glob"
 // "rm.sticky_snapshots" and "prune.sticky_snapshots",
 // "stop.keep_mount" (StopArgs.KeepMount),
 // "pull.folder" (a pull of a checkout without attachments merges its folder),
-// and "apply.atomic" (ApplyArgs.Atomic).
+// "apply.atomic" (ApplyArgs.Atomic), and "rm.keep_commits" (RmArgs.KeepCommits).
 var Features = []string{"new.base", "diff.binary", "ls.select", "rm.sticky_snapshots", "prune.sticky_snapshots", "stop.keep_mount",
-	"pull.folder", "apply.atomic"}
+	"pull.folder", "apply.atomic", "rm.keep_commits"}
 
 // Checkout is an isolated, copy-on-write copy of a source folder that an agent works in.
 type Checkout struct {
@@ -263,10 +263,15 @@ type LandReply struct {
 	Left int    `json:"left,omitempty"`
 }
 
-// RmArgs removes a checkout and its unused snapshots unless StickySnapshots is set.
+// RmArgs removes a checkout and its unused snapshots unless StickySnapshots is
+// set. KeepCommits refuses, with code "conflict", a checkout whose HEAD or
+// branches hold commits made in it that nothing else keeps: no ref of its
+// folder's repository reaches them, as after a land or an apply to a branch,
+// and the checkout pushed them to no remote. The removal would lose them.
 type RmArgs struct {
 	Checkout        string `json:"checkout"`
 	StickySnapshots bool   `json:"sticky_snapshots,omitempty"`
+	KeepCommits     bool   `json:"keep_commits,omitempty"`
 }
 
 // PruneArgs removes the checkouts Select picks and their unused snapshots unless

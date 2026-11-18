@@ -323,6 +323,21 @@ func (db *DB) Contains(id ID) bool {
 	return db.lookupOnce(id, func(*pack, int64) error { return nil }, statLoose) == nil
 }
 
+// ContainsOwn is Contains for the database's own store alone: whether the
+// repository itself holds id, rather than an alternate it borrows from.
+func (db *DB) ContainsOwn(id ID) bool {
+	if db.closed.Load() || id.format != db.format {
+		return false
+	}
+	own := db.dirs[0]
+	for _, p := range *own.packs.Load() {
+		if tryPack(p, id, func(*pack, int64) error { return nil }) == nil {
+			return true
+		}
+	}
+	return statLoose(loosePath(own.path, id)) == nil
+}
+
 // Header returns the kind and size of object id without reconstructing it.
 // A missing object is an error matching os.ErrNotExist.
 func (db *DB) Header(id ID) (Kind, int64, error) {

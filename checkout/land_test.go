@@ -215,6 +215,40 @@ func TestLandWithMarkersResolvesInTheFolder(t *testing.T) {
 	}
 }
 
+// TestRmKeepsUnsharedCommits checks that a removal asked to keep commits
+// refuses a checkout holding ones its folder's repository lacks, on a detached
+// HEAD too, naming how many and the newest, and removes it once they are
+// there; without the request the checkout goes, as a disposable one must.
+func TestRmKeepsUnsharedCommits(t *testing.T) {
+	f := newLandFixture(t, "HEAD")
+	ctx := context.Background()
+	f.commit("first", map[string]string{"a.txt": "A\n"})
+	gitRun(t, f.work, "--git-dir", f.gitdir("work"), "--work-tree", f.work, "checkout", "-q", "--detach")
+	f.commit("second, detached", map[string]string{"b.txt": "B\n"})
+
+	err := f.reg.Rm(ctx, api.RmArgs{Checkout: "work", KeepCommits: true})
+	if coded, ok := errors.AsType[*Error](err); !ok || coded.Code != "conflict" || !strings.Contains(coded.Message, "2 commits") || !strings.Contains(coded.Message, `"second, detached"`) {
+		t.Fatalf("rm of a checkout with commits of its own = %v, want a conflict naming 2 commits and the newest", err)
+	}
+	if len(f.ls().Checkouts) != 1 {
+		t.Fatal("the refused removal removed the checkout")
+	}
+	if _, err := f.reg.Apply(ctx, api.ApplyArgs{Checkout: "work", Branch: "kept"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.reg.Rm(ctx, api.RmArgs{Checkout: "work", KeepCommits: true}); err != nil {
+		t.Fatalf("rm once the folder has the commits: %v", err)
+	}
+
+	if _, err := f.reg.New(ctx, api.NewArgs{Dir: f.dir, Name: "work", Rev: "HEAD"}); err != nil {
+		t.Fatal(err)
+	}
+	f.commit("thrown away", map[string]string{"c.txt": "C\n"})
+	if err := f.reg.Rm(ctx, api.RmArgs{Checkout: "work"}); err != nil {
+		t.Fatalf("rm without the request: %v", err)
+	}
+}
+
 // TestLandCommitsWhatTheFolderHolds lands commits made in a checkout of a
 // dirty folder that pick some of its uncommitted work: the folder's files are
 // what was committed already, so only the branch moves, and git reports what

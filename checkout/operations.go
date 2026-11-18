@@ -1357,8 +1357,41 @@ func (r *Registry) freezeLocked(ctx context.Context, h *checkoutRecord, label st
 // in between leaves files no checkout names, which reopening removes. The name
 // stays reserved until they are gone.
 func (r *Registry) Rm(ctx context.Context, args api.RmArgs) error {
+	if args.KeepCommits {
+		if err := r.keepCommits(ctx, args.Checkout); err != nil {
+			return err
+		}
+	}
 	_, err := r.remove(ctx, args.Checkout, time.Time{}, args.StickySnapshots)
 	return err
+}
+
+// keepCommits refuses to remove a checkout holding commits made in it that
+// nothing else keeps (git.Repo.Unshared): the removal would lose them. A
+// commit made after the check is not seen.
+func (r *Registry) keepCommits(ctx context.Context, name string) error {
+	h, err := r.lookupCheckout(name)
+	if err != nil {
+		return err
+	}
+	repo := localRepo(h.base)
+	if !h.meta.Git || repo == nil {
+		return nil
+	}
+	held, err := repo.Unshared(ctx, name, r.gitdirPath(h.meta.dir()))
+	if err != nil {
+		return coded(fmt.Errorf("checking checkout %s for commits only it keeps: %w", name, err))
+	}
+	if held.Commits == 0 {
+		return nil
+	}
+	dir := h.base.view.Meta().Dir
+	what, them := fmt.Sprintf("1 commit that no branch of %s reaches, %.12s %q", dir, held.Tip, held.Subject), "it"
+	if held.Commits > 1 {
+		what, them = fmt.Sprintf("%d commits that no branch of %s reaches, the newest %.12s %q", held.Commits, dir, held.Tip, held.Subject), "them"
+	}
+	return failure("conflict", "checkout %s holds %s: `ovnfs land %s` or `ovnfs apply %s --branch NAME` puts %s there, and `ovnfs rm %s --force` discards %s",
+		name, what, name, name, them, name, them)
 }
 
 // remove is Rm, except that with picked set it keeps a checkout whose Touched is

@@ -627,15 +627,30 @@ func (c *cli) predates(err error, applies bool, name, what string) error {
 	return fmt.Errorf("%w\nthe running daemon predates %s: `ovnfs restart` starts this version", err, what)
 }
 
-// rmCmd removes a checkout.
+// rmCmd removes a checkout and says so, unless that would destroy commits.
 type rmCmd struct {
 	Checkout        string `arg:"" name:"CHECKOUT" help:"checkout to remove" completion-predictor:"checkout"`
+	Force           bool   `name:"force" short:"f" help:"remove even a checkout holding commits its folder's repository lacks"`
 	StickySnapshots bool   `name:"sticky-snapshots" help:"retain snapshots of the removed checkout"`
 }
 
 func (cmd *rmCmd) Run(c *cli) error {
-	_, err := call[json.RawMessage](c, "rm", api.RmArgs{Checkout: cmd.Checkout, StickySnapshots: cmd.StickySnapshots})
-	return err
+	a := api.RmArgs{Checkout: cmd.Checkout, StickySnapshots: cmd.StickySnapshots}
+	client, err := c.client()
+	if err != nil {
+		return err
+	}
+	// A daemon that predates the check refuses the field itself.
+	a.KeepCommits = !cmd.Force && slices.Contains(client.Welcome().Features, "rm.keep_commits")
+	if _, err := call[json.RawMessage](c, "rm", a); err != nil || c.json {
+		return err
+	}
+	line := paint(stderr, styleGreen, "removed") + " " + paint(stderr, styleAccent, a.Checkout)
+	if a.StickySnapshots {
+		line += "; snapshots retained"
+	}
+	fmt.Fprintln(stderr, line)
+	return nil
 }
 
 // attachCmd offers a folder or checkout to another machine and prints where it appeared.
