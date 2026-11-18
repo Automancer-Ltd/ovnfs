@@ -93,6 +93,9 @@ func run(args []string) error {
 		_ = c.resolveDirs()
 		return printHelp(c, args[min(1, len(args)):])
 	}
+	if args[0] == "--version" {
+		args[0] = "version"
+	}
 	// version and mesh read no configuration, so they run where none parses;
 	// config reads it itself, so a broken file can still be fixed with it.
 	if verb := args[0]; verb != "version" && verb != "mesh" && verb != "config" {

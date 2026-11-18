@@ -40,7 +40,7 @@ go install github.com/stencil-hq/ovnfs@latest
 `go build -o bin/ovnfs .` builds a clone. ovnfs reads and writes git
 repositories itself, so it needs no git installation (fetches use git when it
 is on the PATH); on Linux it needs
-`fusermount3` (the `fuse3` package). `ovnfs version` prints the build;
+`fusermount3` (the `fuse3` package). `ovnfs version` (or `--version`) prints the build;
 `ovnfs update` replaces it with the latest, through `go install` when that
 built it, and `ovnfs restart` then moves the daemon onto it.
 [GitHub releases](https://github.com/stencil-hq/ovnfs/releases) carry the same
