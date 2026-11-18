@@ -109,8 +109,12 @@ func TestGlobTypeOptional(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, err = parser.Parse(tt.args)
-		if (err == nil) != tt.ok || tt.ok && v.Glob.Type != tt.typ {
-			t.Errorf("%q: type %q, %v", tt.args, v.Glob.Type, err)
+		typ := ""
+		if v.Glob.Type != nil {
+			typ = *v.Glob.Type
+		}
+		if (err == nil) != tt.ok || tt.ok && typ != tt.typ {
+			t.Errorf("%q: type %q, %v", tt.args, typ, err)
 		}
 	}
 }
