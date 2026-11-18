@@ -91,6 +91,30 @@ func TestGlobalOptionsBeforeCommand(t *testing.T) {
 	}
 }
 
+// TestGlobTypeOptional parses glob without --type as every type, and still
+// refuses a type that is not one (#87).
+func TestGlobTypeOptional(t *testing.T) {
+	for _, tt := range []struct {
+		args []string
+		typ  string
+		ok   bool
+	}{
+		{args: []string{"glob", "*.go"}, ok: true},
+		{args: []string{"glob", "*.go", "--type", "dir"}, typ: "dir", ok: true},
+		{args: []string{"glob", "*.go", "--type", "socket"}},
+	} {
+		var v verbs
+		parser, err := newCLIParser(&cli{}, tt.args, &v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = parser.Parse(tt.args)
+		if (err == nil) != tt.ok || tt.ok && v.Glob.Type != tt.typ {
+			t.Errorf("%q: type %q, %v", tt.args, v.Glob.Type, err)
+		}
+	}
+}
+
 // TestResolveTarget checks DIR-versus-CHECKOUT detection and that dirs come back absolute.
 func TestResolveTarget(t *testing.T) {
 	tmp := t.TempDir()
