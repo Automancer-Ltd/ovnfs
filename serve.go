@@ -221,6 +221,7 @@ func (cmd *serveCmd) Run(c *cli) (err error) {
 	var e *export.Export
 	// Folder events may invalidate before the export exists; they are dropped then.
 	var exported atomic.Pointer[export.Export]
+	var router atomic.Pointer[export.Router] // the daemon's own view of export paths
 	// The system client's connections, from listenAndMount on; nil for in-process mounts.
 	var files atomic.Pointer[fileListener]
 	var smbServer atomic.Pointer[smb.Server]
@@ -252,6 +253,9 @@ func (cmd *serveCmd) Run(c *cli) (err error) {
 			if x := exported.Load(); x != nil {
 				x.Invalidate(name, paths, trees)
 			}
+			if l, rt := files.Load(), router.Load(); l != nil && rt != nil && proto == "nfs" {
+				l.serving(func() { refreshPaths(mount, name, paths, trees, rt.Lstat) })
+			}
 		},
 		Changed: func(name string, added bool) {
 			if s := smbServer.Load(); s != nil {
@@ -277,7 +281,9 @@ func (cmd *serveCmd) Run(c *cli) (err error) {
 	defer func() { err = errors.Join(err, reg.Close()) }()
 	lk.reg = reg
 	defer lk.close()
-	e = export.New(export.NewRouter(reg), state)
+	rt := export.NewRouter(reg)
+	router.Store(rt)
+	e = export.New(rt, state)
 	exported.Store(e)
 	go removeNodeLogs(state)
 	if checkoutShares, err = newShares(state, reg, e); err != nil {

@@ -34,10 +34,13 @@
 - NFSv3 locks are client-local. Explicit NFSv4 clients use byte-range locks
   held in the daemon's memory, lost when it restarts. SMB has no hard links
   and no durable handles.
-- NFSv3 cannot push cache invalidations: `pull` and reattach can remain
-  cached until the client's attribute timeout (up to 60 s). NFSv4 read
-  delegations reduce that window for opened files, but do not cover
-  directories or files only inspected with `stat`.
+- NFSv3 cannot push cache invalidations. The daemon refreshes its own mount's
+  client for the paths a `pull` changed (see
+  [platforms](platforms.md#nfs)), so those show at once; a reattach, which
+  replaces whole trees, can remain cached below their roots until the client's
+  attribute timeout (up to 60 s), as can any change on a machine that mounted
+  the export itself. NFSv4 read delegations reduce that window for opened
+  files, but do not cover directories or files only inspected with `stat`.
 - One SMB daemon per Windows logon session: the SMB client keeps one set of
   credentials per server name, whatever the port, so a second daemon, whose
   state directory holds another password, cannot map `\\127.0.0.1\ovnfs`

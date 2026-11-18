@@ -30,7 +30,12 @@ own creates. LOOKUP and ACCESS replies leave out the attributes NFSv3 makes
 optional there (the directory's, the file's), which cost a host stat each.
 After creating or removing a checkout the daemon `statfs`es its own mount,
 making the client revalidate the export root so new checkouts show up
-immediately. The export root is read-only; cross-checkout rename returns EXDEV
+immediately. After changing a checkout's files itself (`pull`), it `chmod`s
+each changed file, and every directory from the checkout's root down to it, to
+the mode it already has, through the mount: the SETATTR replies carry the
+current attributes, and a client that finds them changed drops the file's
+cached data and the directory's cached names, missing ones included, instead
+of serving them until its attribute timeout. The export root is read-only; cross-checkout rename returns EXDEV
 so `mv` copies. It also holds an empty, unlisted `.metadata_never_index`, the
 file macOS checks for on every new volume to keep Spotlight from indexing it.
 
