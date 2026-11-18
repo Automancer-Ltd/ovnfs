@@ -66,6 +66,22 @@ func (b *folderBases) sources() [4]baseSource {
 	return [4]baseSource{{applySource, &b.marked}, {appliedSource, &b.applied}, {folderSource, &b.markedHere}, {pulledSource, &b.pulled}}
 }
 
+// folderMergeBases returns the entries of a checkout's merge bases that
+// describe its folder: a fork starts from the same files, so it starts from
+// the same agreement with the folder.
+func folderMergeBases(all map[string]string) map[string]string {
+	var out map[string]string
+	for _, s := range new(folderBases).sources() {
+		if id := all[s.source]; id != "" {
+			if out == nil {
+				out = map[string]string{}
+			}
+			out[s.source] = id
+		}
+	}
+	return out
+}
+
 // folderBases loads the bases of merges between h and its folder.
 func (r *Registry) folderBases(h *checkoutRecord) (folderBases, error) {
 	var b folderBases

@@ -445,13 +445,17 @@ func (cmd *applyCmd) Run(c *cli) error {
 	if err != nil {
 		return err
 	}
-	return printMerge(c, r, a.DryRun, "ovnfs apply "+a.Checkout)
+	return printMerge(c, r, a.DryRun, mergeAdvice{
+		resolve: fmt.Sprintf("resolve them, then run `%s` again", paint(stderr, styleAccent, "ovnfs apply "+a.Checkout)),
+		instead: fmt.Sprintf("`%s` merges the folder into the checkout instead, to resolve them there", paint(stderr, styleAccent, "ovnfs pull "+a.Checkout)),
+	})
 }
 
-// pullCmd merges one attached remote checkout's source changes into the local checkout.
+// pullCmd merges newer source changes into a checkout: its folder's, or those
+// of the remote checkout it is attached to.
 type pullCmd struct {
 	Checkout string `arg:"" name:"CHECKOUT" help:"checkout to pull into" completion-predictor:"checkout"`
-	From     string `name:"from" help:"host passed to attach; optional with one attachment"`
+	From     string `name:"from" help:"pull the checkout attached on this host instead of the folder; implied by a single attachment"`
 	DryRun   bool   `name:"dry-run" help:"report without writing"`
 }
 
@@ -459,18 +463,31 @@ func (cmd *pullCmd) Run(c *cli) error {
 	a := api.PullArgs{Checkout: cmd.Checkout, From: cmd.From, DryRun: cmd.DryRun}
 	r, err := call[api.PullReply](c, "pull", a)
 	if err != nil {
-		return err
+		return c.predates(err, a.From == "", "pull.folder", "pulling from the folder")
+	}
+	if !c.json {
+		printWarnings(r.Warnings)
 	}
 	again := "ovnfs pull " + a.Checkout
 	if a.From != "" {
 		again += " --from " + a.From
 	}
-	return printMerge(c, r.ApplyReply, a.DryRun, again)
+	advice := mergeAdvice{resolve: fmt.Sprintf("resolve them, then run `%s` again", paint(stderr, styleAccent, again))}
+	if r.Folder != "" {
+		advice.resolve = fmt.Sprintf("resolve them in %s, then `%s`", r.Source, paint(stderr, styleAccent, "ovnfs apply "+a.Checkout))
+	}
+	return printMerge(c, r.ApplyReply, a.DryRun, advice)
+}
+
+// mergeAdvice words what to do about the conflicts of an apply or a pull.
+type mergeAdvice struct {
+	resolve string // once conflict markers were written
+	instead string // when a dry run found that they would be; "" for nothing to offer
 }
 
 // printMerge prints apply and pull outcomes and fails when conflicts remain,
-// asking the user to resolve conflict markers and then run again.
-func printMerge(c *cli, r api.ApplyReply, dryRun bool, again string) error {
+// with advice on resolving the conflict markers.
+func printMerge(c *cli, r api.ApplyReply, dryRun bool, advice mergeAdvice) error {
 	if !c.json {
 		if dryRun {
 			fmt.Fprintln(stderr, paint(stderr, styleYellow, "dry run: nothing written"))
@@ -509,12 +526,24 @@ func printMerge(c *cli, r api.ApplyReply, dryRun bool, again string) error {
 		fmt.Fprintf(stderr, "%s left untouched\n", paint(stderr, styleYellow, plural(untouched, "conflict", "conflicts")))
 	}
 	switch {
+	case marked > 0 && dryRun && advice.instead != "":
+		fmt.Fprintf(stderr, "%s would have conflict markers; %s\n", paint(stderr, styleYellow, plural(marked, "file", "files")), advice.instead)
 	case marked > 0 && dryRun:
 		fmt.Fprintf(stderr, "%s would have conflict markers\n", paint(stderr, styleYellow, plural(marked, "file", "files")))
 	case marked > 0:
-		fmt.Fprintf(stderr, "%s conflict markers: resolve them, then run `%s` again\n", paint(stderr, styleYellow, plural(marked, "file has", "files have")), paint(stderr, styleAccent, again))
+		fmt.Fprintf(stderr, "%s conflict markers: %s\n", paint(stderr, styleYellow, plural(marked, "file has", "files have")), advice.resolve)
 	}
 	return exitCode(1)
+}
+
+// predates explains a daemon failure that only its age accounts for: when
+// applies holds and the running daemon lacks feature, it predates what this
+// binary asked of it, and err alone would not say so.
+func (c *cli) predates(err error, applies bool, feature, what string) error {
+	if !applies || c.conn == nil || slices.Contains(c.conn.Welcome().Features, feature) {
+		return err
+	}
+	return fmt.Errorf("%w\nthe running daemon predates %s: `ovnfs restart` starts this version", err, what)
 }
 
 // rmCmd removes a checkout.

@@ -112,6 +112,7 @@ type verbs struct {
 	Snap        snapCmd                   `cmd:"" group:"checkouts" help:"freeze a checkout's changes into a snapshot"`
 	Diff        diffCmd                   `cmd:"" group:"checkouts" help:"list source changes since a snapshot (default: the base)"`
 	Apply       applyCmd                  `cmd:"" group:"checkouts" help:"merge a checkout's source changes back into its folder"`
+	Pull        pullCmd                   `cmd:"" group:"checkouts" help:"merge the folder's newer files into a checkout, to resolve conflicts there (--from HOST: an attached machine's changes)"`
 	Grep        grepCmd                   `cmd:"" group:"inspect" help:"search contents in the daemon, bypassing the checkout mount"`
 	Glob        globCmd                   `cmd:"" group:"inspect" help:"list matching paths in the daemon, bypassing the checkout mount"`
 	Explain     explainCmd                `cmd:"" group:"inspect" help:"show which class a path gets and which rule decided"`
@@ -121,7 +122,6 @@ type verbs struct {
 	Drop        dropCmd                   `cmd:"" group:"clean up" help:"release a snapshot"`
 	Attach      attachCmd                 `cmd:"" group:"other machines" help:"make a checkout appear on another machine over ssh; content moves on first read"`
 	Send        sendCmd                   `cmd:"" group:"other machines" help:"attach over ssh, first installing ovnfs there if missing; PATH there links to the checkout"`
-	Pull        pullCmd                   `cmd:"" group:"other machines" help:"merge attached remote source changes into the local checkout"`
 	Push        pushCmd                   `cmd:"" group:"other machines" help:"have attached machines fetch all content they still read from this one, so they work without it"`
 	Share       shareCmd                  `cmd:"" group:"other machines" help:"serve a checkout over remote-fs for a VM (vmon --remote-fs TAG:SOCK[:rw]) or a peer"`
 	Link        linkCmd                   `cmd:"" group:"other machines" help:"pipe an attach session from ssh into this machine's daemon (run by attach)"`

@@ -119,7 +119,9 @@ func (r *Registry) New(ctx context.Context, args api.NewArgs) (api.NewReply, err
 			err = failure("not_found", "no snapshot %s", args.Snapshot)
 		default:
 			reserved = false
-			h, err = r.createFromSnapshotLocked(ctx, name, s, ready, ws)
+			// The snapshot may predate what its checkout and the folder agreed
+			// on since, so the new checkout counts from the capture alone.
+			h, err = r.createFromSnapshotLocked(ctx, name, s, ready, ws, nil)
 		}
 		var reply api.NewReply
 		if err == nil {
@@ -904,13 +906,14 @@ func writeGitfileAt(fsys *overlay.FS, p, gitdir string) error {
 // registry holds its lock throughout, the snapshot already retains the base, and
 // reopening after a crash removes the upper and git directory of a checkout the
 // state does not name.
-func (r *Registry) createFromSnapshotLocked(ctx context.Context, name string, s *snapRecord, ready string, ws jjWorkspace) (*checkoutRecord, error) {
+func (r *Registry) createFromSnapshotLocked(ctx context.Context, name string, s *snapRecord, ready string, ws jjWorkspace, bases map[string]string) (*checkoutRecord, error) {
 	delete(r.reserved, name)
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
 	h, err := r.installCheckoutLocked(ctx, name, s.base, s.stack, &s.meta.ID, gitSource{ready: ready}, ws)
 	if err == nil {
+		h.meta.MergeBases = bases
 		r.moveRootLocked()
 		if err = r.persistLocked(); err == nil {
 			return h, nil
@@ -1049,7 +1052,7 @@ func (r *Registry) Fork(ctx context.Context, args api.ForkArgs) (api.ForkReply, 
 	}
 	result := snapshotOf(s.meta)
 	reserved = false
-	created, createErr := r.createFromSnapshotLocked(ctx, child, s, ready, ws)
+	created, createErr := r.createFromSnapshotLocked(ctx, child, s, ready, ws, folderMergeBases(h.meta.MergeBases))
 	var childCheckout api.Checkout
 	if createErr != nil {
 		// The freeze stays published even when its child is not.

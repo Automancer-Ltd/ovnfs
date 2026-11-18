@@ -245,12 +245,16 @@ func (l *links) attach(ctx context.Context, args api.AttachArgs) (api.AttachRepl
 	}
 }
 
-// pull retrieves one attachment's source changes and merges them into its local checkout.
+// pull merges newer source changes into a local checkout: one attachment's,
+// or, for a checkout attached nowhere and without a host named, its folder's.
 func (l *links) pull(ctx context.Context, args api.PullArgs) (api.PullReply, error) {
 	if args.Checkout == "" {
 		return api.PullReply{}, &checkout.Error{Code: "invalid", Message: "pull needs a checkout"}
 	}
 	found := l.attached(args.Checkout, args.From)
+	if len(found) == 0 && args.From == "" {
+		return l.reg.PullFolder(ctx, args)
+	}
 	if len(found) == 0 {
 		return api.PullReply{}, &checkout.Error{Code: "not_found", Message: fmt.Sprintf("checkout %s has no matching attachment; attach it first", args.Checkout)}
 	}

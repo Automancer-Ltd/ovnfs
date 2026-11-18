@@ -98,8 +98,9 @@ func TestPullSelectsAttachment(t *testing.T) {
 		message     string
 	}{
 		{name: "checkout required", code: "invalid", message: "needs a checkout"},
-		{name: "no attachment", args: api.PullArgs{Checkout: "app"}, code: "not_found", message: "attach it first"},
-		{name: "other checkout", args: api.PullArgs{Checkout: "app"}, attachments: []string{"application@a"}, code: "not_found"},
+		// Without a host, a checkout attached nowhere pulls from its folder instead.
+		{name: "no attachment on the host", args: api.PullArgs{Checkout: "app", From: "a"}, code: "not_found", message: "attach it first"},
+		{name: "other checkout", args: api.PullArgs{Checkout: "app", From: "a"}, attachments: []string{"application@a"}, code: "not_found"},
 		{name: "unknown host", args: api.PullArgs{Checkout: "app", From: "missing"}, attachments: []string{"app@a"}, code: "not_found"},
 		{name: "one disconnected attachment", args: api.PullArgs{Checkout: "app"}, attachments: []string{"app@a"}, code: "unavailable", message: "app@a is not connected"},
 		{name: "ambiguous attachments", args: api.PullArgs{Checkout: "app"}, attachments: []string{"app@b", "app@a"}, code: "invalid", message: "a, b; choose --from HOST"},

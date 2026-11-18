@@ -289,3 +289,39 @@ Anything else (deletion against an edit, binary or symlink changes on both
 sides) is reported as a conflict and left untouched. Applying twice is a no-op.
 `--dry-run` writes nothing. Applies of several checkouts into one folder take
 turns, each merging against what the previous one wrote.
+
+Apply remembers the version of each path the folder took. A later apply merges
+against that version instead of the capture, so it brings only what the
+checkout changed since: a line applied and then edited again does not conflict
+with itself, and a file you changed back in the folder stays as you left it.
+
+## Pulling the folder in: `pull`
+
+`pull CHECKOUT [--dry-run]` is apply in reverse: it merges into the checkout
+what the folder changed since the checkout opened, or last pulled. Use it when
+the folder moved on while the checkout was worked in, and above all when
+`apply --dry-run` reports conflicts: the conflict markers then land in the
+checkout (`<<<<<<< checkout NAME` … `>>>>>>> folder`), not in the user's files.
+Resolve them there, and `apply`; until they are gone, apply leaves those paths
+out and says so.
+
+A path the checkout left alone takes the folder's version, text changed on both
+sides is merged, and what cannot be merged is reported and left untouched.
+Only source paths move, as with apply: the checkout's build directories and
+ignored files stay its own. The folder's files as pulled become the checkout's
+base for the paths they brought in, so `diff` lists, and `apply` merges, only
+what the checkout changed beyond them.
+
+Pull merges files, not history: the checkout's HEAD and index stay where they
+were. When the folder's HEAD has moved, pull prints the git command that
+follows it inside the checkout (`git reset FETCH_HEAD` after a fetch, or a
+rebase when the checkout has commits of its own). A checkout opened with
+`--rev` or `--take` refuses a pull: its files started from a revision, so the
+folder's are not newer versions of them, and its commits follow the folder's
+with a rebase instead.
+
+On NFS the daemon refreshes its mount's client for the paths a pull changed
+(see [platforms](platforms.md#nfs)), so the checkout shows them at once.
+`pull CHECKOUT --from HOST` instead pulls from a machine the checkout is
+[attached](remote.md#pull) to; a checkout attached to one machine pulls from
+it without `--from`.

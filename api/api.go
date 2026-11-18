@@ -8,14 +8,16 @@ package api
 import "time"
 
 // Ops lists every operation the daemon serves, in CLI help order.
-var Ops = []string{"status", "ls", "new", "fork", "snap", "diff", "grep", "glob", "apply", "rm", "prune", "drop", "explain", "plan", "profile", "attach", "pull", "push", "share", "subscribe", "stop"}
+var Ops = []string{"status", "ls", "new", "fork", "snap", "diff", "grep", "glob", "apply", "pull", "rm", "prune", "drop", "explain", "plan", "profile", "attach", "push", "share", "subscribe", "stop"}
 
 // Features names optional request fields this daemon honors, so clients can rely on
 // them without a new protocol generation: "new.base" (NewArgs.Base),
 // "diff.binary" (DiffArgs.Binary), "ls.select" (LsArgs.Select),
-// "rm.sticky_snapshots" and "prune.sticky_snapshots", and
-// "stop.keep_mount" (StopArgs.KeepMount).
-var Features = []string{"new.base", "diff.binary", "ls.select", "rm.sticky_snapshots", "prune.sticky_snapshots", "stop.keep_mount"}
+// "rm.sticky_snapshots" and "prune.sticky_snapshots",
+// "stop.keep_mount" (StopArgs.KeepMount), and
+// "pull.folder" (a pull of a checkout without attachments merges its folder).
+var Features = []string{"new.base", "diff.binary", "ls.select", "rm.sticky_snapshots", "prune.sticky_snapshots", "stop.keep_mount",
+	"pull.folder"}
 
 // Checkout is an isolated, copy-on-write copy of a source folder that an agent works in.
 type Checkout struct {
@@ -285,17 +287,28 @@ type AttachReply struct {
 	RemotePath     string   `json:"remote_path"`
 }
 
-// PullArgs merges an attached remote checkout's source changes into its local checkout.
+// PullArgs merges newer source changes into a checkout: those of its folder
+// since the checkout opened or last pulled, for a checkout attached to no
+// machine and without From, else those of the checkout attached on From.
+// After a pull from the folder, the folder's files as pulled are the
+// checkout's base for the paths it brought in: diff lists and apply merges
+// only what the checkout changed beyond them.
 type PullArgs struct {
 	Checkout string `json:"checkout"`
 	From     string `json:"from,omitempty"` // host passed to attach; optional with one attachment
 	DryRun   bool   `json:"dry_run,omitempty"`
 }
 
-// PullReply reports the remote snapshot and its changes merged into the local checkout.
+// PullReply reports the changes merged into the local checkout: ApplyReply's
+// Source is the checkout, Snapshot the remote snapshot they came from (zero
+// for a pull from the folder, which sets Folder instead).
 type PullReply struct {
 	ApplyReply
 	Snapshot Snapshot `json:"snapshot"`
+	Folder   string   `json:"folder,omitempty"`
+	// Warnings say what a pull from the folder left for git: the checkout's
+	// HEAD when the folder's has moved.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // PushArgs has the machines checkouts are attached to fetch every blob they

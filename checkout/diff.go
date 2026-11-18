@@ -65,25 +65,42 @@ func (r *Registry) lookupCheckout(name string) (*checkoutRecord, error) {
 	return h, nil
 }
 
-// fromTree resolves the tree a diff compares against: the checkout's base capture, or a hashed snapshot on the same base.
-func (r *Registry) fromTree(ctx context.Context, h *checkoutRecord, id string) (store.OID, error) {
+// checkoutBase returns the leaves a checkout's own changes count from: those
+// of its capture, with the folder's version of each path a pull brought in
+// (see folderBases) in their place.
+func (r *Registry) checkoutBase(h *checkoutRecord) (map[string]store.File, error) {
+	from, err := h.base.view.Store().Flatten(h.base.view.Meta().Tree)
+	if err != nil {
+		return nil, err
+	}
+	bases, err := r.folderBases(h)
+	if err != nil {
+		return nil, err
+	}
+	bases.over(from, false)
+	return from, nil
+}
+
+// fromLeaves resolves the leaves a diff compares against: the checkout's base
+// (see checkoutBase), or a hashed snapshot on the same capture.
+func (r *Registry) fromLeaves(ctx context.Context, h *checkoutRecord, id string) (map[string]store.File, error) {
 	if id == "" {
-		return h.base.view.Meta().Tree, nil
+		return r.checkoutBase(h)
 	}
 	r.mu.RLock()
 	s := r.snapshots[id]
 	r.mu.RUnlock()
 	if s == nil {
-		return "", failure("not_found", "no snapshot %s", id)
+		return nil, failure("not_found", "no snapshot %s", id)
 	}
 	if s.base != h.base {
-		return "", failure("invalid", "snapshot %s is not on the same capture as checkout %s", id, h.meta.Name)
+		return nil, failure("invalid", "snapshot %s is not on the same capture as checkout %s", id, h.meta.Name)
 	}
 	reply, err := r.waitHashed(ctx, s)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return store.OID(reply.Snapshot.Tree), nil
+	return h.base.view.Store().Flatten(store.OID(reply.Snapshot.Tree))
 }
 
 // Diff lists source paths that differ between a snapshot (default: the base) and the checkout now.
@@ -97,11 +114,7 @@ func (r *Registry) Diff(ctx context.Context, args api.DiffArgs) (api.DiffReply, 
 	if err != nil {
 		return api.DiffReply{}, err
 	}
-	fromID, err := r.fromTree(ctx, h, args.From)
-	if err != nil {
-		return api.DiffReply{}, err
-	}
-	from, err := h.base.view.Store().Flatten(fromID)
+	from, err := r.fromLeaves(ctx, h, args.From)
 	if err != nil {
 		return api.DiffReply{}, coded(err)
 	}
@@ -565,7 +578,11 @@ func (r *Registry) Apply(ctx context.Context, args api.ApplyArgs) (reply api.App
 	seen := map[string]bool{}
 	for _, c := range compare(from, to) {
 		seen[c.Path] = true
-		o, reason, err := r.applyOne(ctx, h, root, c.Path, from[c.Path], to[c.Path], s, args.DryRun)
+		held, err := r.holdsPullMarkers(h, bases, c.Path, to[c.Path])
+		o, reason := unresolved, "conflict markers from a pull are not resolved in the checkout"
+		if err == nil && !held {
+			o, reason, err = r.applyOne(ctx, h, root, c.Path, from[c.Path], to[c.Path], s, args.DryRun)
+		}
 		if err != nil {
 			return api.ApplyReply{}, coded(fmt.Errorf("%s: %w", c.Path, err))
 		}
@@ -586,6 +603,17 @@ func (r *Registry) Apply(ctx context.Context, args api.ApplyArgs) (reply api.App
 		return api.ApplyReply{}, coded(err)
 	}
 	return reply, nil
+}
+
+// holdsPullMarkers reports whether theirs, the checkout's version of p, still
+// holds the conflict markers a pull from the folder wrote into it: such a path
+// stays out of the folder until they are resolved.
+func (r *Registry) holdsPullMarkers(h *checkoutRecord, bases folderBases, p string, theirs store.File) (bool, error) {
+	if _, pending := bases.markedHere[p]; !pending || !regular(theirs) {
+		return false, nil
+	}
+	data, err := h.base.view.Blob(p, theirs.ID)
+	return hasMarkers(data), err
 }
 
 // applyOne brings one path of the folder to the checkout's version when that is safe,

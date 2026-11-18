@@ -36,6 +36,11 @@ type Meta struct {
 	Tree     store.OID `json:"tree"`
 	ReuseKey string    `json:"reuse_key,omitempty"` // ordinary capture identity; empty disables reuse
 	Remote   *Remote   `json:"remote,omitempty"`
+	// Chosen marks a base whose source tree is not the folder's as captured: a
+	// revision's tracked files, or paths taken from elsewhere, replaced some of
+	// it (CreateRevision). Its difference from the folder is what the checkout
+	// was opened to leave out, not what the folder changed since.
+	Chosen bool `json:"chosen,omitempty"`
 }
 
 // Remote marks a base attached from another machine: there is no local folder,
@@ -124,11 +129,11 @@ func CreateRevision(ctx context.Context, c Config, o source.Options, revision *g
 			return nil, nil, err
 		}
 	}
-	key := ""
 	if revision == nil && len(takes) == 0 {
-		key = res.ReuseKey()
+		b, err := CreateCaptured(c, res, fork, res.ReuseKey())
+		return b, warnings, err
 	}
-	b, err := CreateCaptured(c, res, fork, key)
+	b, err := create(c, Meta{ID: c.ID, Dir: res.Root, ForkTime: fork, Tree: res.Tree, Chosen: true}, &res)
 	return b, warnings, err
 }
 

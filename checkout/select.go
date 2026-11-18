@@ -127,10 +127,20 @@ func (r *Registry) pick(ctx context.Context, sel api.Select) ([]api.Checkout, er
 }
 
 // unchanged reports whether a checkout has no source changes since its base, as
-// an empty diff shows. bases caches flattened base trees across checkouts.
+// an empty diff shows. bases caches flattened capture trees across checkouts
+// that pulled nothing from their folder since.
 func (r *Registry) unchanged(h *checkoutRecord, bases map[*baseRecord]map[string]store.File) (bool, error) {
+	r.mu.RLock()
+	pulled := h.meta.MergeBases[pulledSource] != "" || h.meta.MergeBases[folderSource] != ""
+	r.mu.RUnlock()
 	from, ok := bases[h.base]
-	if !ok {
+	switch {
+	case pulled:
+		var err error
+		if from, err = r.checkoutBase(h); err != nil {
+			return false, err
+		}
+	case !ok:
 		var err error
 		if from, err = h.base.view.Store().Flatten(h.base.view.Meta().Tree); err != nil {
 			return false, err

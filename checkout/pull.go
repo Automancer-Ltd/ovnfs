@@ -170,51 +170,9 @@ func (r *Registry) mergePull(ctx context.Context, h *checkoutRecord, args api.Pu
 		}
 		seen[c.Path] = true
 		base, theirs := against[c.Path], pulled.Files[c.Path]
-		// A parent file or symlink must not redirect a remote path outside the checkout.
-		reason := ""
-		d := ""
-		parts := strings.Split(c.Path, "/")
-		for _, component := range parts[:len(parts)-1] {
-			d = path.Join(d, component)
-			info, err := h.fs.Lstat(d)
-			if err == nil && !info.IsDir() {
-				reason = "parent is not a directory in the local checkout"
-				break
-			}
-			if err != nil && !errors.Is(err, os.ErrNotExist) {
-				return api.PullReply{}, placed, coded(err)
-			}
-		}
-		if reason != "" {
-			reply.Conflicts = append(reply.Conflicts, api.Conflict{Path: c.Path, Reason: reason})
-			continue
-		}
-		ours, current, isDir, err := overlayLeaf(h.fs, c.Path)
+		o, reason, data, err := mergeOverlay(h.fs, c.Path, base, theirs, pulled.Data[theirs.ID], blob, s)
 		if err != nil {
-			return api.PullReply{}, placed, coded(err)
-		}
-		if isDir {
-			reply.Conflicts = append(reply.Conflicts, api.Conflict{Path: c.Path, Reason: "is a directory in the local checkout"})
-			continue
-		}
-		o, data := skipped, pulled.Data[theirs.ID]
-		switch {
-		case ours == theirs:
-		case ours == base:
-			o = applied
-		default:
-			why, text := s.conflict(base, ours, theirs)
-			if !text {
-				o, reason = conflict, why
-				break
-			}
-			var baseData []byte
-			if base.ID != "" {
-				if baseData, err = blob(base); err != nil {
-					return api.PullReply{}, placed, coded(fmt.Errorf("%s: %w", c.Path, err))
-				}
-			}
-			data, o, reason = mergeText(s.labels, current, baseData, data, why)
+			return api.PullReply{}, placed, coded(fmt.Errorf("%s: %w", c.Path, err))
 		}
 		if !args.DryRun && (o == applied || o == merged || o == marked) {
 			placed = append(placed, c.Path)
@@ -233,6 +191,52 @@ func (r *Registry) mergePull(ctx context.Context, h *checkoutRecord, args api.Pu
 		return api.PullReply{}, placed, coded(err)
 	}
 	return reply, placed, nil
+}
+
+// mergeOverlay settles one incoming path of a pull against the checkout's file
+// system: theirs, whose content is data, replaces a path the checkout left at
+// base, merges as text with one it changed too, and is otherwise a conflict,
+// as is a path a file or directory of the checkout stands in the way of. It
+// writes nothing: the caller places out for an applied, merged or marked
+// path. blob reads the content of base.
+func mergeOverlay(fs *overlay.FS, p string, base, theirs store.File, data []byte, blob func(store.File) ([]byte, error), s sides) (o outcome, reason string, out []byte, err error) {
+	// A parent file or symlink must not redirect an incoming path outside the checkout.
+	d := ""
+	parts := strings.Split(p, "/")
+	for _, component := range parts[:len(parts)-1] {
+		d = path.Join(d, component)
+		info, err := fs.Lstat(d)
+		if err == nil && !info.IsDir() {
+			return conflict, "parent is not a directory " + s.ours, nil, nil
+		}
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return 0, "", nil, err
+		}
+	}
+	ours, current, isDir, err := overlayLeaf(fs, p)
+	if err != nil {
+		return 0, "", nil, err
+	}
+	switch {
+	case isDir:
+		return conflict, "is a directory " + s.ours, nil, nil
+	case ours == theirs:
+		return skipped, "", nil, nil
+	case ours == base:
+		return applied, "", data, nil
+	}
+	why, text := s.conflict(base, ours, theirs)
+	if !text {
+		return conflict, why, nil, nil
+	}
+	var baseData []byte
+	if base.ID != "" {
+		if baseData, err = blob(base); err != nil {
+			return 0, "", nil, err
+		}
+	}
+	out, o, reason = mergeText(s.labels, current, baseData, data, why)
+	return o, reason, out, nil
 }
 
 // overlayLeaf reads only the local paths a pull needs to compare.

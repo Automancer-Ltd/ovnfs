@@ -101,7 +101,8 @@ labelled `local` and `remote NAME` to resolve in the local checkout before
 pulling again; other conflicts are reported without touching those paths.
 Pulling again makes no further changes; a dry run reports without writing.
 `--from` is needed only when the checkout is attached to more than one machine,
-and the link must be up.
+and the link must be up. A checkout attached to no machine pulls from its
+[folder](checkouts.md#pulling-the-folder-in-pull) instead.
 
 Then `ovnfs apply CHECKOUT` merges the local checkout back into the folder.
 Attaching a folder prints the local checkout name to use for pull and apply.
