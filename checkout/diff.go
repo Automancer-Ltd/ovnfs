@@ -501,7 +501,8 @@ func (r *Registry) Apply(ctx context.Context, args api.ApplyArgs) (api.ApplyRepl
 		return api.ApplyReply{}, failure("invalid", "checkout %s is attached from %s; its folder is not on this machine", h.meta.Name, remote.Source)
 	}
 	if args.Branch == "" {
-		return r.mergeFiles(ctx, h, mergeOptions{dryRun: args.DryRun, atomic: args.Atomic})
+		reply, _, err := r.mergeFiles(ctx, h, mergeOptions{dryRun: args.DryRun, atomic: args.Atomic})
+		return reply, err
 	}
 	if args.Atomic {
 		return api.ApplyReply{}, failure("invalid", "--atomic applies to files; --branch moves commits and writes none")
@@ -545,16 +546,20 @@ type mergeOptions struct {
 	dryRun bool
 	// atomic writes nothing unless a first pass finds no conflict.
 	atomic bool
+	// only, when not nil, keeps the merge to these paths; the changed paths
+	// outside it are counted instead.
+	only map[string]bool
 }
 
-// mergeFiles is Apply's merge of h's changed source paths into its folder.
-func (r *Registry) mergeFiles(ctx context.Context, h *checkoutRecord, o mergeOptions) (reply api.ApplyReply, err error) {
+// mergeFiles is Apply's merge of h's changed source paths into its folder, and
+// counts the changed paths that o.only left out.
+func (r *Registry) mergeFiles(ctx context.Context, h *checkoutRecord, o mergeOptions) (reply api.ApplyReply, left int, err error) {
 	root := h.base.view.Meta().Dir
 	h.merge.Lock()
 	defer h.merge.Unlock()
 	snap, err := r.Snap(ctx, api.SnapArgs{Checkout: h.meta.Name, Label: "apply", Wait: !o.dryRun})
 	if err != nil {
-		return api.ApplyReply{}, err
+		return api.ApplyReply{}, 0, err
 	}
 	// The snapshot outlives only a merge that left something in the folder to
 	// come back to: an error, or conflicts that were written.
@@ -571,37 +576,44 @@ func (r *Registry) mergeFiles(ctx context.Context, h *checkoutRecord, o mergeOpt
 		s := r.snapshots[id]
 		r.mu.RUnlock()
 		if s == nil {
-			return api.ApplyReply{}, failure("not_found", "no snapshot %s", id)
+			return api.ApplyReply{}, 0, failure("not_found", "no snapshot %s", id)
 		}
 		if snap, err = r.waitHashed(ctx, s); err != nil {
-			return api.ApplyReply{}, err
+			return api.ApplyReply{}, 0, err
 		}
 	}
 	// Unix would fail each path with ENOTDIR, but Windows reports them absent,
 	// which would turn every path into a deletion conflict.
 	if info, err := os.Stat(root); err == nil && !info.IsDir() {
-		return api.ApplyReply{}, failure("invalid", "source %s is not a directory", root)
+		return api.ApplyReply{}, 0, failure("invalid", "source %s is not a directory", root)
 	}
 	st := h.base.view.Store()
 	from, err := st.Flatten(h.base.view.Meta().Tree)
 	if err != nil {
-		return api.ApplyReply{}, coded(err)
+		return api.ApplyReply{}, 0, coded(err)
 	}
 	to, err := st.Flatten(store.OID(snap.Snapshot.Tree))
 	if err != nil {
-		return api.ApplyReply{}, coded(err)
+		return api.ApplyReply{}, 0, coded(err)
 	}
 	bases, err := r.folderBases(h)
 	if err != nil {
-		return api.ApplyReply{}, coded(err)
+		return api.ApplyReply{}, 0, coded(err)
 	}
 	bases.over(from, true)
 	release, err := r.applying.lock(ctx, root)
 	if err != nil {
-		return api.ApplyReply{}, err
+		return api.ApplyReply{}, 0, err
 	}
 	defer release()
-	changes := compare(from, to)
+	var changes []api.Change
+	for _, c := range compare(from, to) {
+		if o.only == nil || o.only[c.Path] {
+			changes = append(changes, c)
+		} else {
+			left++
+		}
+	}
 	s := sides{ours: "in the source folder", theirs: "in the checkout",
 		labels: git.Labels{Ours: "folder", Base: "base", Theirs: "checkout " + h.meta.Name}}
 	// pass merges every change, writing unless dry, and records in bases what
@@ -623,6 +635,9 @@ func (r *Registry) mergeFiles(ctx context.Context, h *checkoutRecord, o mergeOpt
 			bases.afterApply(c.Path, to[c.Path], o)
 		}
 		err := reportPending(&reply, bases.marked, seen, func(p string) (bool, error) {
+			if o.only != nil && !o.only[p] {
+				return false, nil
+			}
 			return hasMarkersAt(filepath.Join(root, filepath.FromSlash(p)))
 		})
 		return reply, coded(err)
@@ -636,22 +651,22 @@ func (r *Registry) mergeFiles(ctx context.Context, h *checkoutRecord, o mergeOpt
 		probe, err := pass(true, bases.clone())
 		if err != nil || len(probe.Conflicts) != 0 {
 			probe.Refused, probe.Pullable = err == nil, err == nil && pullable
-			return probe, err
+			return probe, left, err
 		}
 	}
 	if reply, err = pass(o.dryRun, bases); err != nil {
-		return api.ApplyReply{}, err
+		return api.ApplyReply{}, 0, err
 	}
 	reply.Pullable = pullable && len(reply.Conflicts) != 0
 	if o.dryRun {
 		reply.Refused = o.atomic && len(reply.Conflicts) != 0
-		return reply, nil
+		return reply, left, nil
 	}
 	read := func(p string, f store.File) ([]byte, error) { return h.base.view.Blob(p, f.ID) }
 	if err := r.setFolderBases(h, bases, read); err != nil {
-		return api.ApplyReply{}, coded(err)
+		return api.ApplyReply{}, 0, coded(err)
 	}
-	return reply, nil
+	return reply, left, nil
 }
 
 // holdsPullMarkers reports whether theirs, the checkout's version of p, still

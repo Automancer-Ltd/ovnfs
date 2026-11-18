@@ -437,7 +437,7 @@ type applyCmd struct {
 	Checkout string `arg:"" name:"CHECKOUT" help:"checkout to merge back" completion-predictor:"checkout"`
 	DryRun   bool   `name:"dry-run" help:"report without writing"`
 	Atomic   bool   `name:"atomic" help:"write nothing unless every path merges without a conflict"`
-	Branch   string `name:"branch" help:"fetch commits as this branch, or fast-forward it and its index if checked out"`
+	Branch   string `name:"branch" help:"fetch commits as this branch, files untouched (land moves the checked-out branch with its files)"`
 }
 
 func (cmd *applyCmd) Run(c *cli) error {
@@ -451,6 +451,65 @@ func (cmd *applyCmd) Run(c *cli) error {
 		advice.instead = fmt.Sprintf("`%s` merges the folder into the checkout instead, to resolve them there", paint(stderr, styleAccent, "ovnfs pull "+a.Checkout))
 	}
 	return printMerge(c, r, a.DryRun, advice)
+}
+
+// landCmd puts a checkout's commits on the branch checked out in its folder
+// and fails when it refused to.
+type landCmd struct {
+	Checkout string `arg:"" name:"CHECKOUT" help:"checkout whose commits to land" completion-predictor:"checkout"`
+	DryRun   bool   `name:"dry-run" help:"report without writing"`
+	Markers  bool   `name:"markers" help:"where a file conflicts with the folder's uncommitted edits, write conflict markers there instead of refusing"`
+}
+
+func (cmd *landCmd) Run(c *cli) error {
+	a := api.LandArgs{Checkout: cmd.Checkout, DryRun: cmd.DryRun, Markers: cmd.Markers}
+	r, err := call[api.LandReply](c, "land", a)
+	if err != nil {
+		return c.predates(err, true, "land", "land")
+	}
+	again := paint(stderr, styleAccent, "ovnfs land "+a.Checkout)
+	if c.json {
+		if len(r.Conflicts) != 0 {
+			return exitCode(1)
+		}
+		return nil
+	}
+	if a.DryRun {
+		fmt.Fprintln(stderr, paint(stderr, styleYellow, "dry run: nothing written"))
+	}
+	printMerged(r.ApplyReply, false)
+	pending := !slices.ContainsFunc(r.Conflicts, func(cf api.Conflict) bool { return !cf.Pending })
+	switch {
+	case r.Refused && pending:
+		fmt.Fprintf(stderr, "%s: %s conflict markers in %s; resolve them, then `%s`\n",
+			paint(stderr, styleYellow, "nothing landed"), plural(len(r.Conflicts), "file still has", "files still have"), r.Source, again)
+		return exitCode(1)
+	case r.Refused:
+		line := fmt.Sprintf("%s: %s with uncommitted changes in %s; `%s` writes conflict markers there to resolve, then `%s`",
+			paint(stderr, styleYellow, "nothing landed"), plural(len(r.Conflicts), "file conflicts", "files conflict"), r.Source,
+			paint(stderr, styleAccent, "ovnfs land "+a.Checkout+" --markers"), again)
+		if r.Pullable {
+			line += fmt.Sprintf("; or `%s` merges those changes into the checkout, to resolve them there first", paint(stderr, styleAccent, "ovnfs pull "+a.Checkout))
+		}
+		fmt.Fprintln(stderr, line)
+		return exitCode(1)
+	case len(r.Conflicts) != 0:
+		// Markers were asked for, or the folder changed under an atomic merge.
+		fmt.Fprintf(stderr, "%s: %s conflict markers in %s; resolve them, then `%s`\n",
+			paint(stderr, styleYellow, r.Branch+" did not move"), plural(len(r.Conflicts), "file has", "files have"), r.Source, again)
+		return exitCode(1)
+	case r.Commit == r.Old:
+		fmt.Fprintf(stderr, "%s: %s holds no commit beyond %s; `%s` merges its uncommitted changes\n",
+			paint(stderr, styleYellow, "nothing to land"), a.Checkout, r.Branch, paint(stderr, styleAccent, "ovnfs apply "+a.Checkout))
+		return nil
+	}
+	fmt.Fprintf(stdout, "%s %s %s %s %s\n", paint(stdout, styleDim, "branch"), paint(stdout, styleAccent, r.Branch), paint(stdout, styleDim, "at"),
+		paint(stdout, styleDim, abbrev(r.Commit, 12)), paint(stdout, styleDim, "(was "+abbrev(r.Old, 12)+")"))
+	if r.Left > 0 {
+		fmt.Fprintf(stderr, "%s in %s outside those commits; `%s` merges them as uncommitted edits\n",
+			paint(stderr, styleYellow, plural(r.Left, "path stays changed", "paths stay changed")), a.Checkout, paint(stderr, styleAccent, "ovnfs apply "+a.Checkout))
+	}
+	return nil
 }
 
 // pullCmd merges newer source changes into a checkout: its folder's, or those
@@ -555,10 +614,14 @@ func printMerged(r api.ApplyReply, index bool) {
 }
 
 // predates explains a daemon failure that only its age accounts for: when
-// applies holds and the running daemon lacks feature, it predates what this
-// binary asked of it, and err alone would not say so.
-func (c *cli) predates(err error, applies bool, feature, what string) error {
-	if !applies || c.conn == nil || slices.Contains(c.conn.Welcome().Features, feature) {
+// applies holds and the running daemon serves neither a feature nor an
+// operation called name, it predates what this binary asked of it, and err
+// alone would not say so.
+func (c *cli) predates(err error, applies bool, name, what string) error {
+	if !applies || c.conn == nil {
+		return err
+	}
+	if w := c.conn.Welcome(); slices.Contains(w.Features, name) || slices.Contains(w.Ops, name) {
 		return err
 	}
 	return fmt.Errorf("%w\nthe running daemon predates %s: `ovnfs restart` starts this version", err, what)

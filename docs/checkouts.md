@@ -6,14 +6,20 @@ A checkout of a repository gets a private git directory: HEAD, refs, config and
 the index are copies taken at open, and objects borrow the repository's through
 alternates. Inside the checkout, `git status` matches the folder's, commits land
 in the checkout, and they reach the user's repository only when
-`ovnfs apply CHECKOUT --branch NAME` fetches them as a branch or you fetch the
-checkout's [git remote](#git-remotes) yourself.
+[`ovnfs land CHECKOUT`](#landing-commits-land) puts them on the folder's
+checked-out branch with their files, `ovnfs apply CHECKOUT --branch NAME`
+fetches them as a branch, or you fetch the checkout's
+[git remote](#git-remotes) yourself.
 
-If NAME is checked out in the folder, apply fast-forwards it and updates only
-the index entries changed by those commits, never the working-tree files.
+If NAME is checked out in the folder, `apply --branch` fast-forwards it and
+updates only the index entries changed by those commits, never the working-tree
+files, which then read as modified: use `land` to move the files too.
 Staged changes on those paths or a non-fast-forward are refused; use another
 branch name instead. Unrelated staged work stays staged. `--dry-run` previews
-this checked-out-branch update without writing.
+this checked-out-branch update without writing. A folder whose repository is a
+partial clone takes the commits as a pack of what its refs do not reach; when
+the checkout's commits build on history fetched inside it, apply and land name
+the remote to fetch in the folder first.
 
 On a 49k-file repository, opening a checkout takes about a second and
 `git status` inside it under three. Later creates of the same folder reuse that
@@ -302,6 +308,31 @@ Apply remembers the version of each path the folder took. A later apply merges
 against that version instead of the capture, so it brings only what the
 checkout changed since: a line applied and then edited again does not conflict
 with itself, and a file you changed back in the folder stays as you left it.
+
+## Landing commits: `land`
+
+`land CHECKOUT [--dry-run]` puts the commits made in a checkout on the branch
+checked out in its folder, as committing there would have: the branch
+fast-forwards to the checkout's HEAD, its index follows, and the checkout's
+files for the paths those commits changed merge into the folder, so the
+folder's uncommitted edits stay on top and `git status` there shows only them.
+A path changed in the checkout outside those commits stays in the checkout;
+land counts them, and `apply` brings them as uncommitted edits.
+
+Land refuses before it writes anything: when the folder's HEAD is detached
+(`apply --branch NAME` then brings the commits as a branch), when the branch
+holds commits the checkout's are not based on (rebase inside the checkout, as
+the message spells out), when the commits' paths have staged changes, and when
+a file would conflict with the folder's uncommitted edits. For that last case
+`land --markers` merges anyway and writes the conflict markers into the folder,
+as apply does, leaving the branch where it is: resolve them and land again.
+Where the checkout can [pull](#pulling-the-folder-in-pull), pulling the
+folder's edits into it resolves the conflict there instead.
+
+The commits are copied before the files are merged, and the branch moves last,
+so a failure leaves at most merged files as uncommitted edits, which landing
+again completes. `apply CHECKOUT --branch NAME` remains for the other cases: it
+creates or fast-forwards a branch that is not checked out, touching no file.
 
 ## Pulling the folder in: `pull`
 

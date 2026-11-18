@@ -86,6 +86,8 @@ func (h *opsHandler) Call(ctx context.Context, op string, raw json.RawMessage) (
 		return dispatch(ctx, raw, h.reg.Glob)
 	case "apply":
 		return dispatch(ctx, raw, h.reg.Apply)
+	case "land":
+		return dispatch(ctx, raw, h.reg.Land)
 	case "rm":
 		return dispatch(ctx, raw, done(h.reg.Rm))
 	case "prune":

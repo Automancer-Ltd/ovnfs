@@ -112,6 +112,7 @@ type verbs struct {
 	Snap        snapCmd                   `cmd:"" group:"checkouts" help:"freeze a checkout's changes into a snapshot"`
 	Diff        diffCmd                   `cmd:"" group:"checkouts" help:"list source changes since a snapshot (default: the base)"`
 	Apply       applyCmd                  `cmd:"" group:"checkouts" help:"merge a checkout's source changes back into its folder"`
+	Land        landCmd                   `cmd:"" group:"checkouts" help:"put a checkout's commits on the branch checked out in its folder, with their files"`
 	Pull        pullCmd                   `cmd:"" group:"checkouts" help:"merge the folder's newer files into a checkout, to resolve conflicts there (--from HOST: an attached machine's changes)"`
 	Grep        grepCmd                   `cmd:"" group:"inspect" help:"search contents in the daemon, bypassing the checkout mount"`
 	Glob        globCmd                   `cmd:"" group:"inspect" help:"list matching paths in the daemon, bypassing the checkout mount"`

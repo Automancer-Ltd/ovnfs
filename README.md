@@ -98,8 +98,9 @@ handle the common cases; `.o2/ovnfs.yml` and `--rule` override them, and
 
 Writes go to the checkout's own copy-on-write layer, so the folder is never
 written until you `apply`. In a git repository the checkout gets a private git
-directory: commit freely, then `apply --branch NAME` to bring the commits back,
-or `git fetch ovnfs/NAME` them from its git remote. In a
+directory: commit freely, then `land` the commits on the folder's branch,
+`apply --branch NAME` to bring them back as another branch, or
+`git fetch ovnfs/NAME` them from its git remote. In a
 [jj](https://jj-vcs.github.io/jj/) repository each checkout is also a jj
 workspace of it.
 
@@ -108,7 +109,7 @@ ovnfs isolates files, not processes: it is not a sandbox.
 ## Documentation
 
 - [Configuration](docs/configuration.md): classes, rules, `.o2/ovnfs.yml` and `ovnfs config`, where state and checkouts live
-- [Checkouts](docs/checkouts.md): `--rev`, `--take`, `run`, snapshots, forks, `diff`, `apply` and `pull`
+- [Checkouts](docs/checkouts.md): `--rev`, `--take`, `run`, snapshots, forks, `diff`, `apply`, `land` and `pull`
 - [Remote checkouts](docs/remote.md): `attach`, `send`, `pull`, `push`, `share`
 - [Platforms](docs/platforms.md): NFS, FUSE, SMB and WinFsp frontends
 - [Internals](docs/internals.md): admin protocol for embedding, persistence, memory tiers

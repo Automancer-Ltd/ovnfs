@@ -8,7 +8,7 @@ package api
 import "time"
 
 // Ops lists every operation the daemon serves, in CLI help order.
-var Ops = []string{"status", "ls", "new", "fork", "snap", "diff", "grep", "glob", "apply", "pull", "rm", "prune", "drop", "explain", "plan", "profile", "attach", "push", "share", "subscribe", "stop"}
+var Ops = []string{"status", "ls", "new", "fork", "snap", "diff", "grep", "glob", "apply", "land", "pull", "rm", "prune", "drop", "explain", "plan", "profile", "attach", "push", "share", "subscribe", "stop"}
 
 // Features names optional request fields this daemon honors, so clients can rely on
 // them without a new protocol generation: "new.base" (NewArgs.Base),
@@ -217,6 +217,7 @@ type Conflict struct {
 	Path    string `json:"path"`
 	Reason  string `json:"reason"`
 	Markers bool   `json:"markers,omitempty"`
+	Pending bool   `json:"pending,omitempty"` // the markers are an earlier merge's, not resolved yet
 }
 
 // ApplyReply reports what apply wrote (or would write, for a dry run).
@@ -232,6 +233,34 @@ type ApplyReply struct {
 	// files into the checkout instead, so they are resolved there: it cannot
 	// for a checkout opened on a revision or with taken paths.
 	Pullable bool `json:"pullable,omitempty"`
+}
+
+// LandArgs puts a checkout's commits on the branch checked out in its folder,
+// as a fast-forward, and merges the checkout's files into the folder for the
+// paths those commits changed, so the folder's uncommitted edits stay: what
+// committing there would have left. The files merge as an atomic apply does,
+// and the branch moves only once they have; a branch that is not an ancestor
+// of the checkout's HEAD, staged changes on the commits' paths and a detached
+// HEAD in the folder are refused with code "conflict" before anything is
+// written.
+type LandArgs struct {
+	Checkout string `json:"checkout"`
+	DryRun   bool   `json:"dry_run,omitempty"`
+	// Markers merges the files even when some conflict, writing conflict
+	// markers into the folder as an apply does, for the folder's uncommitted
+	// edits to be reconciled there; the branch then stays where it is until
+	// they are resolved and the checkout is landed again.
+	Markers bool `json:"markers,omitempty"`
+}
+
+// LandReply reports the files land merged as ApplyReply does, with Branch
+// moved from Old to Commit: the two are equal when the checkout held no commit
+// to land, and Refused leaves the branch at Old. Left counts the paths the
+// checkout changed outside those commits, which stay there for an apply.
+type LandReply struct {
+	ApplyReply
+	Old  string `json:"old"`
+	Left int    `json:"left,omitempty"`
 }
 
 // RmArgs removes a checkout and its unused snapshots unless StickySnapshots is set.

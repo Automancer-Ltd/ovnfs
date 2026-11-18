@@ -242,7 +242,7 @@ func report(reply *api.ApplyReply, c api.Change, o outcome, reason string) {
 	case merged:
 		reply.Merged = append(reply.Merged, c.Path)
 	case marked, unresolved:
-		reply.Conflicts = append(reply.Conflicts, api.Conflict{Path: c.Path, Reason: reason, Markers: true})
+		reply.Conflicts = append(reply.Conflicts, api.Conflict{Path: c.Path, Reason: reason, Markers: true, Pending: o == unresolved})
 	case conflict:
 		reply.Conflicts = append(reply.Conflicts, api.Conflict{Path: c.Path, Reason: reason})
 	}
