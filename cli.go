@@ -1120,13 +1120,14 @@ func orDefault(s, fallback string) string {
 	return s
 }
 
-// stamp renders a time for tables, local and to the minute; "-" for none, as
-// from a daemon older than the field.
+// stamp renders a time for tables, local, to the minute and as one word, so
+// that the columns after it split on blanks; "-" for none, as from a daemon
+// older than the field.
 func stamp(t time.Time) string {
 	if t.IsZero() {
 		return "-"
 	}
-	return t.Local().Format("2006-01-02 15:04")
+	return t.Local().Format("2006-01-02T15:04")
 }
 
 // yesNo renders a flag for tables.

@@ -198,6 +198,16 @@ checkout's root, a folder (or repository) holding the mount, and `--rev`,
 `--take` or `--rule` with a checkout. These folders are told by file identity,
 so a symlink, another letter case or a bind mount does not get around the rule.
 
+## Output for scripts
+
+`new`, `fork` and `snap` print the one value they produce, the checkout's path
+or the snapshot's id, alone on stdout and last. On a terminal a summary of what
+was opened precedes it on stderr; when stderr is captured, only warnings do, so
+both `P=$(ovnfs new)` and `ovnfs new 2>&1 | tail -1` yield the path. `rm`,
+`apply`, `land` and `pull` say what they did, also when that is nothing.
+`--json` prints the whole reply instead of any of this. Tables show times as
+one word (`2026-11-18T05:52`), so their columns split on blanks.
+
 ## Listing and cleanup: `ls` and `prune`
 
 `ls` shows each checkout's TOUCHED time: its last write through its folder or
