@@ -186,6 +186,77 @@ func TestRemovalKeepsSharedSnapshots(t *testing.T) {
 	}
 }
 
+func TestRemovalKeepsEarlierCheckoutSnapshots(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		for _, prune := range []bool{false, true} {
+			t.Run(fmt.Sprintf("legacy=%t/prune=%t", legacy, prune), func(t *testing.T) {
+				ctx := t.Context()
+				f := newFixture(t)
+				dir := folder(t, map[string]string{"a": "base"})
+				f.newCheckout(dir, "probe")
+				f.put("probe", "a", "kept")
+				kept, err := f.reg.Snap(ctx, api.SnapArgs{Checkout: "probe", Wait: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				id := kept.Snapshot.ID
+				if err := f.reg.Rm(ctx, api.RmArgs{Checkout: "probe", StickySnapshots: true}); err != nil {
+					t.Fatal(err)
+				}
+				if legacy {
+					if err := f.reg.Close(); err != nil {
+						t.Fatal(err)
+					}
+					d := readDisk(t, f.state)
+					// Older state files did not record a snapshot's checkout life.
+					for i := range d.Snapshots {
+						d.Snapshots[i].Life = 0
+					}
+					if err := writeState(f.state, d); err != nil {
+						t.Fatal(err)
+					}
+					f.open()
+				}
+
+				f.newCheckout(dir, "probe")
+				f.put("probe", "a", "discarded")
+				if _, err := f.reg.Snap(ctx, api.SnapArgs{Checkout: "probe", Wait: true}); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.reg.Close(); err != nil {
+					t.Fatal(err)
+				}
+				f.open()
+
+				if prune {
+					_, err = f.reg.Prune(ctx, api.PruneArgs{Select: api.Select{Dir: dir}})
+				} else {
+					err = f.reg.Rm(ctx, api.RmArgs{Checkout: "probe"})
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				ls := f.ls()
+				if len(ls.Checkouts) != 0 || len(ls.Snapshots) != 1 || ls.Snapshots[0].ID != id {
+					t.Fatalf("checkouts = %+v, snapshots = %+v; want no checkouts and only %s", ls.Checkouts, ls.Snapshots, id)
+				}
+				if _, err := f.reg.New(ctx, api.NewArgs{Name: "restored", Snapshot: id}); err != nil {
+					t.Fatal(err)
+				}
+				if got := f.read("restored", "a"); got != "kept" {
+					t.Fatalf("restored content = %q", got)
+				}
+				if err := f.reg.Drop(ctx, api.DropArgs{Snapshot: id}); err != nil {
+					t.Fatal(err)
+				}
+				if snapshots := f.ls().Snapshots; len(snapshots) != 0 {
+					t.Fatalf("snapshots after explicit drop = %+v", snapshots)
+				}
+			})
+		}
+	}
+}
+
 // isCode reports whether err is a registry error with code.
 func isCode(err error, code string) bool {
 	e, ok := errors.AsType[*Error](err)

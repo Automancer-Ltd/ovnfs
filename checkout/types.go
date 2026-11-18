@@ -90,10 +90,12 @@ type copiedDir struct {
 }
 
 // snapMeta is the persisted description of a snapshot; Tree is set once hashed.
+// Life identifies the checkout instance; zero means its owner is unknown.
 type snapMeta struct {
 	ID       string    `json:"id"`
 	Checkout string    `json:"checkout"`
 	Dir      string    `json:"dir,omitempty"` // the checkout's checkoutMeta.Dir
+	Life     uint32    `json:"life,omitempty"`
 	Parent   *string   `json:"parent"`
 	Label    string    `json:"label"`
 	Created  time.Time `json:"created"`
