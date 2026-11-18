@@ -468,10 +468,11 @@ func head(b []byte) []byte { return b[:min(len(b), 8000)] }
 // Apply merges a checkout's source changes back into the folder it came from, three-way
 // against the base capture: paths unchanged in the folder take the checkout's version,
 // text files changed on both sides are merged, with conflict markers where both changed
-// the same lines, and everything else is a conflict left untouched. A path whose markers
-// the user resolved merges later changes against the version it was marked with
-// (see checkoutMeta.MergeBases). Applies into one folder take turns, each merging
-// against what the last one wrote. With Branch it instead copies the checkout's commits.
+// the same lines, and everything else is a conflict left untouched. A path the folder
+// took, or whose markers the user resolved, merges later changes against the version
+// it took then (see folderBases), so applying again brings only what changed since.
+// Applies into one folder take turns, each merging against what the last one wrote.
+// With Branch it instead copies the checkout's commits.
 func (r *Registry) Apply(ctx context.Context, args api.ApplyArgs) (reply api.ApplyReply, err error) {
 	resume, err := r.Quiesce(ctx)
 	if err != nil {
@@ -549,11 +550,11 @@ func (r *Registry) Apply(ctx context.Context, args api.ApplyArgs) (reply api.App
 	if err != nil {
 		return api.ApplyReply{}, coded(err)
 	}
-	bases, err := r.mergeBases(h, applySource)
+	bases, err := r.folderBases(h)
 	if err != nil {
 		return api.ApplyReply{}, coded(err)
 	}
-	maps.Copy(from, bases)
+	bases.over(from, true)
 	release, err := r.applying.lock(ctx, root)
 	if err != nil {
 		return api.ApplyReply{}, err
@@ -569,9 +570,9 @@ func (r *Registry) Apply(ctx context.Context, args api.ApplyArgs) (reply api.App
 			return api.ApplyReply{}, coded(fmt.Errorf("%s: %w", c.Path, err))
 		}
 		report(&reply, c, o, reason)
-		advance(bases, c.Path, to[c.Path], o)
+		bases.afterApply(c.Path, to[c.Path], o)
 	}
-	err = reportPending(&reply, bases, seen, func(p string) (bool, error) {
+	err = reportPending(&reply, bases.marked, seen, func(p string) (bool, error) {
 		return hasMarkersAt(filepath.Join(root, filepath.FromSlash(p)))
 	})
 	if err != nil {
@@ -581,7 +582,7 @@ func (r *Registry) Apply(ctx context.Context, args api.ApplyArgs) (reply api.App
 		return reply, nil
 	}
 	read := func(p string, f store.File) ([]byte, error) { return h.base.view.Blob(p, f.ID) }
-	if err := r.setMergeBases(h, applySource, bases, read); err != nil {
+	if err := r.setFolderBases(h, bases, read); err != nil {
 		return api.ApplyReply{}, coded(err)
 	}
 	return reply, nil

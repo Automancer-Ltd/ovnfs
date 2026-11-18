@@ -52,10 +52,12 @@ type checkoutMeta struct {
 	Git     bool      `json:"git"`          // the checkout has a private git directory
 	JJ      string    `json:"jj,omitempty"` // its jj workspace's name, its .jj at the upper's root (see addWorkspace)
 	Created time.Time `json:"created"`
-	// MergeBases maps a merge source (applySource, or pullSource of an attached
-	// lane) to a store tree of the incoming leaves its merges left conflict
-	// markers for. Later merges from that source take them as those paths' base,
-	// so a conflict the user resolved is not merged again.
+	// MergeBases maps a merge source to a store tree of the leaves later merges
+	// take as their paths' base in place of the capture's. Between the checkout
+	// and its folder these are the versions the two last agreed on (see
+	// folderBases); for pullSource of an attached lane, the incoming leaves a
+	// pull left conflict markers for, so a conflict the user resolved is not
+	// merged again.
 	MergeBases map[string]string `json:"merge_bases,omitempty"`
 	// Copied lists the directories of the upper that the checkout copied up to hold
 	// submodule gitfiles, with the metadata they had then; while they keep it, they

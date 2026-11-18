@@ -3,6 +3,7 @@ package checkout
 import (
 	"bytes"
 	"maps"
+	"path"
 	"slices"
 
 	"github.com/stencil-hq/ovnfs/api"
@@ -23,11 +24,135 @@ const (
 	conflict   // left untouched
 )
 
-// applySource keys the merge bases of apply (see checkoutMeta.MergeBases).
-const applySource = "apply"
+// The merge sources between a checkout and its folder (see folderBases and
+// checkoutMeta.MergeBases).
+const (
+	applySource   = "apply"       // paths an apply left conflict markers for in the folder
+	appliedSource = "applied"     // paths the folder took from the checkout in an apply
+	folderSource  = "pull folder" // paths a pull from the folder left conflict markers for in the checkout
+	pulledSource  = "pulled"      // paths the checkout took from the folder in a pull
+)
 
 // pullSource keys the merge bases of pulls from the lane attached as tree from.
 func pullSource(from store.OID) string { return "pull " + string(from) }
+
+// gone is the base of a path a checkout and its folder agreed is absent: an
+// empty directory, which is no file to either of them (see compare).
+var gone = store.File{Mode: store.ModeDir, ID: store.EmptyTree}
+
+// folderBases are the versions of paths on which a checkout and its folder
+// last agreed, by who took them. marked and applied hold the checkout's
+// version of a path an apply merged into the folder, marked when it left
+// conflict markers there; markedHere and pulled hold the folder's version of a
+// path a pull merged into the checkout, markedHere when it left conflict
+// markers there. A merge either way takes them as those paths' base in place
+// of the capture's, so what one side already took is neither merged into it
+// again nor mistaken for a change of its own: without them, a line applied
+// and then edited again would conflict with itself. A pull forgets what an
+// apply recorded for the paths it settles, so the apply side is the newer one
+// wherever both name a path.
+type folderBases struct {
+	marked, applied, markedHere, pulled map[string]store.File
+}
+
+// baseSource is one map of a folderBases and the merge source it is stored under.
+type baseSource struct {
+	source string
+	bases  *map[string]store.File
+}
+
+// sources lists b's maps with their merge sources.
+func (b *folderBases) sources() [4]baseSource {
+	return [4]baseSource{{applySource, &b.marked}, {appliedSource, &b.applied}, {folderSource, &b.markedHere}, {pulledSource, &b.pulled}}
+}
+
+// folderBases loads the bases of merges between h and its folder.
+func (r *Registry) folderBases(h *checkoutRecord) (folderBases, error) {
+	var b folderBases
+	for _, s := range b.sources() {
+		m, err := r.mergeBases(h, s.source)
+		if err != nil {
+			return folderBases{}, err
+		}
+		*s.bases = m
+	}
+	return b, nil
+}
+
+// setFolderBases persists b as the bases of merges between h and its folder;
+// read supplies the content of leaves the store lacks.
+func (r *Registry) setFolderBases(h *checkoutRecord, b folderBases, read func(p string, f store.File) ([]byte, error)) error {
+	all := make(map[string]map[string]store.File, 4)
+	for _, s := range b.sources() {
+		all[s.source] = *s.bases
+	}
+	return r.setMergeBases(h, all, read)
+}
+
+// over replaces the leaves of from, a capture's, by the bases a merge between
+// the checkout and its folder starts from; without applied, only by what pulls
+// brought into the checkout, which is the base its own changes count from.
+func (b folderBases) over(from map[string]store.File, applied bool) {
+	layers := []map[string]store.File{b.pulled, b.markedHere}
+	if applied {
+		layers = append(layers, b.applied, b.marked)
+	}
+	for _, bases := range layers {
+		for p, f := range bases {
+			if f.Mode == store.ModeDir {
+				delete(from, p)
+			} else {
+				from[p] = f
+			}
+		}
+	}
+}
+
+// setBase records f, or gone for an absent f, as p's base in bases.
+func setBase(bases map[string]store.File, p string, f store.File) {
+	if f.ID == "" || f.Mode == store.ModeDir {
+		f = gone
+	}
+	bases[p] = f
+}
+
+// afterApply records what an apply did with p, whose version in the checkout is
+// theirs: the folder took it, with conflict markers when marked. A path whose
+// pull markers kept it out of applies until now has been resolved.
+func (b folderBases) afterApply(p string, theirs store.File, o outcome) {
+	switch o {
+	case conflict, unresolved:
+		return
+	case marked:
+		setBase(b.marked, p, theirs)
+		delete(b.applied, p)
+	default:
+		setBase(b.applied, p, theirs)
+		delete(b.marked, p)
+	}
+	if f, ok := b.markedHere[p]; ok {
+		b.pulled[p] = f
+		delete(b.markedHere, p)
+	}
+}
+
+// afterPull records what a pull from the folder did with p, whose version in
+// the folder is theirs: the checkout took it, with conflict markers when
+// marked, which ends what applies recorded for p.
+func (b folderBases) afterPull(p string, theirs store.File, o outcome) {
+	switch o {
+	case conflict, unresolved:
+		return
+	case marked:
+		setBase(b.markedHere, p, theirs)
+		delete(b.pulled, p)
+	default:
+		setBase(b.pulled, p, theirs)
+		delete(b.markedHere, p)
+	}
+	delete(b.marked, p)
+	delete(b.applied, p)
+}
 
 // sides names the two sides of a merge: where each changed, for conflict
 // reasons, and how conflict markers label them.
@@ -146,13 +271,25 @@ func (r *Registry) mergeBases(h *checkoutRecord, source string) (map[string]stor
 	return r.store.Flatten(store.OID(id))
 }
 
-// setMergeBases persists bases as the merge bases of source's merges into h,
-// first storing with read any leaf content the store lacks.
-func (r *Registry) setMergeBases(h *checkoutRecord, source string, bases map[string]store.File, read func(p string, f store.File) ([]byte, error)) error {
-	id := ""
-	if len(bases) != 0 {
+// setMergeBases persists, in one state write, each entry of all as the merge
+// bases of its source's merges into h, first storing with read any leaf
+// content the store lacks. A base lying above another one (a file where a
+// later merge found a directory) is dropped: a tree holds only one of the two,
+// and the path's capture is a base still.
+func (r *Registry) setMergeBases(h *checkoutRecord, all map[string]map[string]store.File, read func(p string, f store.File) ([]byte, error)) error {
+	ids := make(map[string]string, len(all))
+	for source, bases := range all {
+		for p := range bases {
+			for up := path.Dir(p); up != "."; up = path.Dir(up) {
+				delete(bases, up)
+			}
+		}
+		if len(bases) == 0 {
+			ids[source] = ""
+			continue
+		}
 		for p, f := range bases {
-			if r.store.Has(f.ID) {
+			if f.Mode == store.ModeDir || r.store.Has(f.ID) {
 				continue
 			}
 			data, err := read(p, f)
@@ -167,30 +304,34 @@ func (r *Registry) setMergeBases(h *checkoutRecord, source string, bases map[str
 		if err != nil {
 			return err
 		}
-		id = string(tree)
+		ids[source] = string(tree)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
 		return failure("io", "registry is closed")
 	}
-	old := h.meta.MergeBases[source]
-	if id == old {
-		return nil
-	}
-	set := func(id string) {
+	old := maps.Clone(h.meta.MergeBases)
+	changed := false
+	for source, id := range ids {
+		if id == h.meta.MergeBases[source] {
+			continue
+		}
+		changed = true
 		if id == "" {
 			delete(h.meta.MergeBases, source)
-			return
+			continue
 		}
 		if h.meta.MergeBases == nil {
 			h.meta.MergeBases = map[string]string{}
 		}
 		h.meta.MergeBases[source] = id
 	}
-	set(id)
+	if !changed {
+		return nil
+	}
 	if err := r.persistLocked(); err != nil {
-		set(old)
+		h.meta.MergeBases = old
 		return err
 	}
 	return nil

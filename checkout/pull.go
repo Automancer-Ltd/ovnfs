@@ -122,7 +122,7 @@ func (r *Registry) MergePull(ctx context.Context, args api.PullArgs, from store.
 		}
 		return data, nil
 	}
-	if err := r.setMergeBases(h, source, bases, read); err != nil {
+	if err := r.setMergeBases(h, map[string]map[string]store.File{source: bases}, read); err != nil {
 		return api.PullReply{}, coded(err)
 	}
 	return reply, nil

@@ -63,6 +63,47 @@ func TestApplyConcurrentKeepsEveryEdit(t *testing.T) {
 	}
 }
 
+// TestApplyAgainStartsFromWhatTheFolderTook checks that a second apply, also
+// after a restart, merges against the versions the first one brought into the
+// folder: a line applied and then edited again does not conflict with itself,
+// a file the user changed back stays as they left it, and a file deleted and
+// then created again arrives.
+func TestApplyAgainStartsFromWhatTheFolderTook(t *testing.T) {
+	isolateGit(t)
+	f := newFixture(t)
+	dir := folder(t, map[string]string{"again.txt": "one\ntwo\nthree\n", "reverted.txt": "old\n", "back.txt": "first\n"})
+	f.newCheckout(dir, "c")
+	f.put("c", "again.txt", "one\nTWO\nthree\n")
+	f.put("c", "reverted.txt", "new\n")
+	f.remove("c", "back.txt")
+	ctx := context.Background()
+	first, err := f.reg.Apply(ctx, api.ApplyArgs{Checkout: "c"})
+	if err != nil || len(first.Applied) != 3 || len(first.Conflicts) != 0 {
+		t.Fatalf("first apply = %+v, %v", first, err)
+	}
+
+	f.put("c", "again.txt", "one\nTWO again\nthree\n")
+	write(t, filepath.Join(dir, "reverted.txt"), "old\n")
+	f.put("c", "back.txt", "second\n")
+	if err := f.reg.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.open()
+	second, err := f.reg.Apply(ctx, api.ApplyArgs{Checkout: "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []api.Change{{Path: "again.txt", Status: "M"}, {Path: "back.txt", Status: "A"}}
+	if !slices.Equal(second.Applied, want) || len(second.Merged) != 0 || len(second.Conflicts) != 0 {
+		t.Fatalf("second apply = %+v, want applied %v", second, want)
+	}
+	for p, want := range map[string]string{"again.txt": "one\nTWO again\nthree\n", "reverted.txt": "old\n", "back.txt": "second\n"} {
+		if data, err := os.ReadFile(filepath.Join(dir, p)); err != nil || string(data) != want {
+			t.Errorf("folder %s = %q, %v; want %q", p, data, err, want)
+		}
+	}
+}
+
 // TestApplyDryRunKeepsNoSnapshot checks that a dry run reports the same changes
 // as a real apply but leaves no snapshot behind to hold the checkout's layers.
 func TestApplyDryRunKeepsNoSnapshot(t *testing.T) {
