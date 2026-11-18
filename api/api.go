@@ -14,10 +14,11 @@ var Ops = []string{"status", "ls", "new", "fork", "snap", "diff", "grep", "glob"
 // them without a new protocol generation: "new.base" (NewArgs.Base),
 // "diff.binary" (DiffArgs.Binary), "ls.select" (LsArgs.Select),
 // "rm.sticky_snapshots" and "prune.sticky_snapshots",
-// "stop.keep_mount" (StopArgs.KeepMount), and
-// "pull.folder" (a pull of a checkout without attachments merges its folder).
+// "stop.keep_mount" (StopArgs.KeepMount),
+// "pull.folder" (a pull of a checkout without attachments merges its folder),
+// and "apply.atomic" (ApplyArgs.Atomic).
 var Features = []string{"new.base", "diff.binary", "ls.select", "rm.sticky_snapshots", "prune.sticky_snapshots", "stop.keep_mount",
-	"pull.folder"}
+	"pull.folder", "apply.atomic"}
 
 // Checkout is an isolated, copy-on-write copy of a source folder that an agent works in.
 type Checkout struct {
@@ -203,6 +204,10 @@ type ApplyArgs struct {
 	Checkout string `json:"checkout"`
 	DryRun   bool   `json:"dry_run,omitempty"`
 	Branch   string `json:"branch,omitempty"` // instead: fetch the checkout's commits into the source repo as this branch
+	// Atomic writes nothing unless a first pass finds that every path merges
+	// without a conflict; otherwise the reply lists the conflicts with Refused
+	// set. It cannot be combined with Branch.
+	Atomic bool `json:"atomic,omitempty"`
 }
 
 // Conflict is a path apply or pull could not settle: left untouched, or with
@@ -222,6 +227,11 @@ type ApplyReply struct {
 	Conflicts []Conflict `json:"conflicts"` // written only with conflict markers
 	Branch    string     `json:"branch,omitempty"`
 	Commit    string     `json:"commit,omitempty"`
+	Refused   bool       `json:"refused,omitempty"` // an atomic merge found Conflicts and wrote nothing
+	// Pullable reports, with Conflicts, that a pull can merge the folder's
+	// files into the checkout instead, so they are resolved there: it cannot
+	// for a checkout opened on a revision or with taken paths.
+	Pullable bool `json:"pullable,omitempty"`
 }
 
 // RmArgs removes a checkout and its unused snapshots unless StickySnapshots is set.

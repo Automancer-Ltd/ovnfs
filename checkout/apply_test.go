@@ -104,6 +104,42 @@ func TestApplyAgainStartsFromWhatTheFolderTook(t *testing.T) {
 	}
 }
 
+// TestApplyAtomicWritesAllOrNothing checks that an atomic apply with one
+// conflicting path writes no path at all, keeps no snapshot and records
+// nothing, so that once the conflict is gone the same apply brings everything.
+func TestApplyAtomicWritesAllOrNothing(t *testing.T) {
+	isolateGit(t)
+	f := newFixture(t)
+	dir := folder(t, map[string]string{"clean.txt": "old\n", "both.txt": "one\ntwo\n"})
+	f.newCheckout(dir, "c")
+	f.put("c", "clean.txt", "new\n")
+	f.put("c", "both.txt", "one\nmine\n")
+	write(t, filepath.Join(dir, "both.txt"), "one\nthe user's\n")
+	ctx := context.Background()
+
+	refused, err := f.reg.Apply(ctx, api.ApplyArgs{Checkout: "c", Atomic: true})
+	if err != nil || !refused.Refused || len(refused.Conflicts) != 1 || refused.Conflicts[0].Path != "both.txt" {
+		t.Fatalf("atomic apply over a conflict = %+v, %v", refused, err)
+	}
+	for p, want := range map[string]string{"clean.txt": "old\n", "both.txt": "one\nthe user's\n"} {
+		if data, err := os.ReadFile(filepath.Join(dir, p)); err != nil || string(data) != want {
+			t.Errorf("refused apply left %s = %q, %v; want %q", p, data, err, want)
+		}
+	}
+	if n := len(f.ls().Snapshots); n != 0 {
+		t.Errorf("snapshots after a refused apply = %d, want 0", n)
+	}
+
+	write(t, filepath.Join(dir, "both.txt"), "one\ntwo\n")
+	applied, err := f.reg.Apply(ctx, api.ApplyArgs{Checkout: "c", Atomic: true})
+	if err != nil || applied.Refused || len(applied.Applied) != 2 || len(applied.Conflicts) != 0 {
+		t.Fatalf("atomic apply without a conflict = %+v, %v", applied, err)
+	}
+	if data, _ := os.ReadFile(filepath.Join(dir, "both.txt")); string(data) != "one\nmine\n" {
+		t.Errorf("both.txt = %q", data)
+	}
+}
+
 // TestApplyDryRunKeepsNoSnapshot checks that a dry run reports the same changes
 // as a real apply but leaves no snapshot behind to hold the checkout's layers.
 func TestApplyDryRunKeepsNoSnapshot(t *testing.T) {

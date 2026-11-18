@@ -290,6 +290,14 @@ sides) is reported as a conflict and left untouched. Applying twice is a no-op.
 `--dry-run` writes nothing. Applies of several checkouts into one folder take
 turns, each merging against what the previous one wrote.
 
+`--atomic` writes nothing at all when a path would conflict: apply first
+merges every path without writing, and on a conflict lists them and exits 1,
+leaving the folder as it was. Without it, the paths that merge are written and
+the others get their markers. (Should the folder change between that check and
+the writing, the new conflict gets its markers like any other.) Where a pull
+can bring the folder's files into the checkout, a refused or dry-run apply says
+so: the conflict can then be resolved there instead.
+
 Apply remembers the version of each path the folder took. A later apply merges
 against that version instead of the capture, so it brings only what the
 checkout changed since: a line applied and then edited again does not conflict

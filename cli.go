@@ -436,19 +436,21 @@ func (cmd *diffCmd) Run(c *cli) error {
 type applyCmd struct {
 	Checkout string `arg:"" name:"CHECKOUT" help:"checkout to merge back" completion-predictor:"checkout"`
 	DryRun   bool   `name:"dry-run" help:"report without writing"`
+	Atomic   bool   `name:"atomic" help:"write nothing unless every path merges without a conflict"`
 	Branch   string `name:"branch" help:"fetch commits as this branch, or fast-forward it and its index if checked out"`
 }
 
 func (cmd *applyCmd) Run(c *cli) error {
-	a := api.ApplyArgs{Checkout: cmd.Checkout, DryRun: cmd.DryRun, Branch: cmd.Branch}
+	a := api.ApplyArgs{Checkout: cmd.Checkout, DryRun: cmd.DryRun, Branch: cmd.Branch, Atomic: cmd.Atomic}
 	r, err := call[api.ApplyReply](c, "apply", a)
 	if err != nil {
-		return err
+		return c.predates(err, a.Atomic, "apply.atomic", "apply --atomic")
 	}
-	return printMerge(c, r, a.DryRun, mergeAdvice{
-		resolve: fmt.Sprintf("resolve them, then run `%s` again", paint(stderr, styleAccent, "ovnfs apply "+a.Checkout)),
-		instead: fmt.Sprintf("`%s` merges the folder into the checkout instead, to resolve them there", paint(stderr, styleAccent, "ovnfs pull "+a.Checkout)),
-	})
+	advice := mergeAdvice{resolve: fmt.Sprintf("resolve them, then run `%s` again", paint(stderr, styleAccent, "ovnfs apply "+a.Checkout))}
+	if r.Pullable {
+		advice.instead = fmt.Sprintf("`%s` merges the folder into the checkout instead, to resolve them there", paint(stderr, styleAccent, "ovnfs pull "+a.Checkout))
+	}
+	return printMerge(c, r, a.DryRun, advice)
 }
 
 // pullCmd merges newer source changes into a checkout: its folder's, or those
@@ -492,29 +494,21 @@ func printMerge(c *cli, r api.ApplyReply, dryRun bool, advice mergeAdvice) error
 		if dryRun {
 			fmt.Fprintln(stderr, paint(stderr, styleYellow, "dry run: nothing written"))
 		}
-		for _, ch := range r.Applied {
-			if r.Branch != "" {
-				fmt.Fprintf(stdout, "%s %s\t%s\n", paint(stdout, styleDim, "index"), mark(stdout, ch.Status), ch.Path)
-			} else {
-				fmt.Fprintf(stdout, "%s\t%s\n", mark(stdout, ch.Status), ch.Path)
-			}
-		}
-		for _, p := range r.Merged {
-			fmt.Fprintf(stdout, "%s %s\n", paint(stdout, styleBlue, "merged"), p)
-		}
-		for _, cf := range r.Conflicts {
-			verb := "conflict"
-			if cf.Markers {
-				verb = "marked"
-			}
-			fmt.Fprintf(stdout, "%s %s: %s\n", paint(stdout, styleRed, verb), cf.Path, paint(stdout, styleDim, cf.Reason))
-		}
+		printMerged(r, r.Branch != "")
 		if r.Branch != "" {
 			fmt.Fprintf(stdout, "%s %s %s %s\n", paint(stdout, styleDim, "branch"), paint(stdout, styleAccent, r.Branch), paint(stdout, styleDim, "at"), paint(stdout, styleDim, abbrev(r.Commit, 12)))
 		}
 	}
 	if len(r.Conflicts) == 0 {
 		return nil
+	}
+	if r.Refused {
+		what := fmt.Sprintf("%s: %s", paint(stderr, styleYellow, "nothing written"), plural(len(r.Conflicts), "path conflicts", "paths conflict"))
+		if advice.instead != "" {
+			what += "; " + advice.instead
+		}
+		fmt.Fprintln(stderr, what)
+		return exitCode(1)
 	}
 	marked := 0
 	for _, cf := range r.Conflicts {
@@ -534,6 +528,30 @@ func printMerge(c *cli, r api.ApplyReply, dryRun bool, advice mergeAdvice) error
 		fmt.Fprintf(stderr, "%s conflict markers: %s\n", paint(stderr, styleYellow, plural(marked, "file has", "files have")), advice.resolve)
 	}
 	return exitCode(1)
+}
+
+// printMerged lists what a merge did or would do, path by path: the paths
+// taken, those merged as text and the conflicts, with markers or left alone.
+// index marks the paths of an apply to a checked-out branch, which moves index
+// entries and no file.
+func printMerged(r api.ApplyReply, index bool) {
+	for _, ch := range r.Applied {
+		if index {
+			fmt.Fprintf(stdout, "%s %s\t%s\n", paint(stdout, styleDim, "index"), mark(stdout, ch.Status), ch.Path)
+		} else {
+			fmt.Fprintf(stdout, "%s\t%s\n", mark(stdout, ch.Status), ch.Path)
+		}
+	}
+	for _, p := range r.Merged {
+		fmt.Fprintf(stdout, "%s %s\n", paint(stdout, styleBlue, "merged"), p)
+	}
+	for _, cf := range r.Conflicts {
+		verb := "conflict"
+		if cf.Markers && !r.Refused {
+			verb = "marked"
+		}
+		fmt.Fprintf(stdout, "%s %s: %s\n", paint(stdout, styleRed, verb), cf.Path, paint(stdout, styleDim, cf.Reason))
+	}
 }
 
 // predates explains a daemon failure that only its age accounts for: when

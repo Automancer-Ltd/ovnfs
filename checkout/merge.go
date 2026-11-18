@@ -124,6 +124,11 @@ func (b folderBases) over(from map[string]store.File, applied bool) {
 	}
 }
 
+// clone returns a copy a trial merge may advance without touching b.
+func (b folderBases) clone() folderBases {
+	return folderBases{marked: maps.Clone(b.marked), applied: maps.Clone(b.applied), markedHere: maps.Clone(b.markedHere), pulled: maps.Clone(b.pulled)}
+}
+
 // setBase records f, or gone for an absent f, as p's base in bases.
 func setBase(bases map[string]store.File, p string, f store.File) {
 	if f.ID == "" || f.Mode == store.ModeDir {

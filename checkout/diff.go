@@ -485,8 +485,9 @@ func head(b []byte) []byte { return b[:min(len(b), 8000)] }
 // took, or whose markers the user resolved, merges later changes against the version
 // it took then (see folderBases), so applying again brings only what changed since.
 // Applies into one folder take turns, each merging against what the last one wrote.
-// With Branch it instead copies the checkout's commits.
-func (r *Registry) Apply(ctx context.Context, args api.ApplyArgs) (reply api.ApplyReply, err error) {
+// Atomic writes nothing when a path would conflict. With Branch it instead copies the
+// checkout's commits.
+func (r *Registry) Apply(ctx context.Context, args api.ApplyArgs) (api.ApplyReply, error) {
 	resume, err := r.Quiesce(ctx)
 	if err != nil {
 		return api.ApplyReply{}, err
@@ -499,50 +500,73 @@ func (r *Registry) Apply(ctx context.Context, args api.ApplyArgs) (reply api.App
 	if remote := h.base.view.Meta().Remote; remote != nil {
 		return api.ApplyReply{}, failure("invalid", "checkout %s is attached from %s; its folder is not on this machine", h.meta.Name, remote.Source)
 	}
-	root := h.base.view.Meta().Dir
-	reply = api.ApplyReply{Source: root, Applied: []api.Change{}, Merged: []string{}, Conflicts: []api.Conflict{}}
-	if args.Branch != "" {
-		repo := h.base.view.Domains().Repo("")
-		if !h.meta.Git || repo == nil {
-			return api.ApplyReply{}, failure("invalid", "checkout %s has no git directory; --branch needs a repository source", h.meta.Name)
-		}
-		commit, updated, err := repo.FetchBranch(ctx, r.gitdirPath(h.meta.dir()), args.Branch, args.DryRun)
-		if conflict, ok := errors.AsType[*git.BranchConflict](err); ok {
-			advice := "choose a different branch name"
-			if !conflict.Diverged && len(conflict.Staged) == 0 {
-				advice = "run it again, or " + advice
-			}
-			return api.ApplyReply{}, failure("conflict", "%s; %s", conflict, advice)
-		}
-		if errors.Is(err, git.ErrBranchDryRun) {
-			return api.ApplyReply{}, failure("invalid", "%s", err)
-		}
-		if err != nil {
-			return api.ApplyReply{}, codedTransfer(err)
-		}
-		for _, change := range updated {
-			reply.Applied = append(reply.Applied, api.Change{Path: change.Path, Status: change.Status})
-		}
-		reply.Branch, reply.Commit = args.Branch, commit
-		return reply, nil
+	if args.Branch == "" {
+		return r.mergeFiles(ctx, h, mergeOptions{dryRun: args.DryRun, atomic: args.Atomic})
 	}
+	if args.Atomic {
+		return api.ApplyReply{}, failure("invalid", "--atomic applies to files; --branch moves commits and writes none")
+	}
+	repo := h.base.view.Domains().Repo("")
+	if !h.meta.Git || repo == nil {
+		return api.ApplyReply{}, failure("invalid", "checkout %s has no git directory; --branch needs a repository source", h.meta.Name)
+	}
+	commit, updated, err := repo.FetchBranch(ctx, r.gitdirPath(h.meta.dir()), args.Branch, args.DryRun)
+	if conflict, ok := errors.AsType[*git.BranchConflict](err); ok {
+		advice := "choose a different branch name"
+		if !conflict.Diverged && len(conflict.Staged) == 0 {
+			advice = "run it again, or " + advice
+		}
+		return api.ApplyReply{}, failure("conflict", "%s; %s", conflict, advice)
+	}
+	if errors.Is(err, git.ErrBranchDryRun) {
+		return api.ApplyReply{}, failure("invalid", "%s", err)
+	}
+	if err != nil {
+		return api.ApplyReply{}, codedTransfer(err)
+	}
+	reply := api.ApplyReply{Source: h.base.view.Meta().Dir, Applied: []api.Change{}, Merged: []string{}, Conflicts: []api.Conflict{}, Branch: args.Branch, Commit: commit}
+	for _, change := range updated {
+		reply.Applied = append(reply.Applied, api.Change{Path: change.Path, Status: change.Status})
+	}
+	return reply, nil
+}
+
+// codedTransfer is coded for a failure to copy a checkout's commits into its
+// folder's repository, which knows the one cause the user can act on.
+func codedTransfer(err error) error {
+	if partial, ok := errors.AsType[*git.PartialCloneError](err); ok {
+		return failure("unavailable", "%s", partial)
+	}
+	return coded(err)
+}
+
+// mergeOptions shape one merge of a checkout's files into its folder.
+type mergeOptions struct {
+	dryRun bool
+	// atomic writes nothing unless a first pass finds no conflict.
+	atomic bool
+}
+
+// mergeFiles is Apply's merge of h's changed source paths into its folder.
+func (r *Registry) mergeFiles(ctx context.Context, h *checkoutRecord, o mergeOptions) (reply api.ApplyReply, err error) {
+	root := h.base.view.Meta().Dir
 	h.merge.Lock()
 	defer h.merge.Unlock()
-	snap, err := r.Snap(ctx, api.SnapArgs{Checkout: args.Checkout, Label: "apply", Wait: !args.DryRun})
+	snap, err := r.Snap(ctx, api.SnapArgs{Checkout: h.meta.Name, Label: "apply", Wait: !o.dryRun})
 	if err != nil {
 		return api.ApplyReply{}, err
 	}
-	// Dry runs release even on failure; normal applies retain the snapshot on
-	// failure or conflict, but release it after a successful merge.
+	// The snapshot outlives only a merge that left something in the folder to
+	// come back to: an error, or conflicts that were written.
 	id := snap.Snapshot.ID
 	defer func() {
-		if args.DryRun || err == nil && len(reply.Conflicts) == 0 {
+		if o.dryRun || reply.Refused || err == nil && len(reply.Conflicts) == 0 {
 			if dropErr := r.Drop(context.WithoutCancel(ctx), api.DropArgs{Snapshot: id}); dropErr != nil && err == nil {
 				reply, err = api.ApplyReply{}, dropErr
 			}
 		}
 	}()
-	if args.DryRun {
+	if o.dryRun {
 		r.mu.RLock()
 		s := r.snapshots[id]
 		r.mu.RUnlock()
@@ -577,29 +601,50 @@ func (r *Registry) Apply(ctx context.Context, args api.ApplyArgs) (reply api.App
 		return api.ApplyReply{}, err
 	}
 	defer release()
+	changes := compare(from, to)
 	s := sides{ours: "in the source folder", theirs: "in the checkout",
 		labels: git.Labels{Ours: "folder", Base: "base", Theirs: "checkout " + h.meta.Name}}
-	seen := map[string]bool{}
-	for _, c := range compare(from, to) {
-		seen[c.Path] = true
-		held, err := r.holdsPullMarkers(h, bases, c.Path, to[c.Path])
-		o, reason := unresolved, "conflict markers from a pull are not resolved in the checkout"
-		if err == nil && !held {
-			o, reason, err = r.applyOne(ctx, h, root, c.Path, from[c.Path], to[c.Path], s, args.DryRun)
+	// pass merges every change, writing unless dry, and records in bases what
+	// the folder took.
+	pass := func(dry bool, bases folderBases) (api.ApplyReply, error) {
+		reply := api.ApplyReply{Source: root, Applied: []api.Change{}, Merged: []string{}, Conflicts: []api.Conflict{}}
+		seen := map[string]bool{}
+		for _, c := range changes {
+			seen[c.Path] = true
+			held, err := r.holdsPullMarkers(h, bases, c.Path, to[c.Path])
+			o, reason := unresolved, "conflict markers from a pull are not resolved in the checkout"
+			if err == nil && !held {
+				o, reason, err = r.applyOne(ctx, h, root, c.Path, from[c.Path], to[c.Path], s, dry)
+			}
+			if err != nil {
+				return api.ApplyReply{}, coded(fmt.Errorf("%s: %w", c.Path, err))
+			}
+			report(&reply, c, o, reason)
+			bases.afterApply(c.Path, to[c.Path], o)
 		}
-		if err != nil {
-			return api.ApplyReply{}, coded(fmt.Errorf("%s: %w", c.Path, err))
+		err := reportPending(&reply, bases.marked, seen, func(p string) (bool, error) {
+			return hasMarkersAt(filepath.Join(root, filepath.FromSlash(p)))
+		})
+		return reply, coded(err)
+	}
+	// A conflict can be settled in the checkout instead when a pull can bring
+	// the folder's files there.
+	pullable := !h.base.view.Meta().Chosen
+	if o.atomic && !o.dryRun {
+		// The folder may change between the passes: the second then writes
+		// that conflict's markers, as an apply that is not atomic would.
+		probe, err := pass(true, bases.clone())
+		if err != nil || len(probe.Conflicts) != 0 {
+			probe.Refused, probe.Pullable = err == nil, err == nil && pullable
+			return probe, err
 		}
-		report(&reply, c, o, reason)
-		bases.afterApply(c.Path, to[c.Path], o)
 	}
-	err = reportPending(&reply, bases.marked, seen, func(p string) (bool, error) {
-		return hasMarkersAt(filepath.Join(root, filepath.FromSlash(p)))
-	})
-	if err != nil {
-		return api.ApplyReply{}, coded(err)
+	if reply, err = pass(o.dryRun, bases); err != nil {
+		return api.ApplyReply{}, err
 	}
-	if args.DryRun {
+	reply.Pullable = pullable && len(reply.Conflicts) != 0
+	if o.dryRun {
+		reply.Refused = o.atomic && len(reply.Conflicts) != 0
 		return reply, nil
 	}
 	read := func(p string, f store.File) ([]byte, error) { return h.base.view.Blob(p, f.ID) }
@@ -607,15 +652,6 @@ func (r *Registry) Apply(ctx context.Context, args api.ApplyArgs) (reply api.App
 		return api.ApplyReply{}, coded(err)
 	}
 	return reply, nil
-}
-
-// codedTransfer is coded for a failure to copy a checkout's commits into its
-// folder's repository, which knows the one cause the user can act on.
-func codedTransfer(err error) error {
-	if partial, ok := errors.AsType[*git.PartialCloneError](err); ok {
-		return failure("unavailable", "%s", partial)
-	}
-	return coded(err)
 }
 
 // holdsPullMarkers reports whether theirs, the checkout's version of p, still
