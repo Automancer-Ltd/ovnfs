@@ -615,7 +615,8 @@ func (cmd *pullCmd) Run(c *cli) error {
 		nothing: "nothing to pull: " + a.Checkout + " is up to date",
 	}
 	if r.Folder != "" {
-		advice.resolve = fmt.Sprintf("resolve them in %s, then `%s`", r.Source, paint(stderr, styleAccent, "ovnfs apply "+a.Checkout))
+		advice.resolve = fmt.Sprintf("resolve them in %s, then `%s`, or `%s` for its commits", r.Source,
+			paint(stderr, styleAccent, "ovnfs apply "+a.Checkout), paint(stderr, styleAccent, "ovnfs land "+a.Checkout))
 	}
 	return printMerge(c, r.ApplyReply, a.DryRun, advice)
 }

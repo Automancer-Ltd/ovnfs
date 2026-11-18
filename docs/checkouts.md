@@ -349,9 +349,11 @@ with itself, and a file you changed back in the folder stays as you left it.
 checked out in its folder, as committing there would have: the branch
 fast-forwards to the checkout's HEAD, its index follows, and the checkout's
 files for the paths those commits changed merge into the folder, so the
-folder's uncommitted edits stay on top and `git status` there shows only them.
-A path changed in the checkout outside those commits stays in the checkout;
-land counts them, and `apply` brings them as uncommitted edits.
+folder's uncommitted edits stay on top. `git status` there then shows those
+edits, and whatever the checkout itself left uncommitted in the same files,
+which comes along as it is. A path changed in the checkout outside those
+commits stays in the checkout; land counts them, and `apply` brings them as
+uncommitted edits.
 
 Land refuses before it writes anything: when the folder's HEAD is detached
 (`apply --branch NAME` then brings the commits as a branch), when the branch
