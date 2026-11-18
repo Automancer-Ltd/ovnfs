@@ -16,13 +16,14 @@ type searchFlags struct {
 	Hidden      bool   `name:"hidden" help:"include dot-prefixed entries"`
 	NoIgnore    bool   `name:"no-ignore" help:"do not honor .gitignore/.ignore/exclude files"`
 	NodeModules bool   `name:"node-modules" help:"descend into node_modules"`
+	Git         bool   `name:"git" help:"include .git entries (they are dot-prefixed: add --hidden)"`
 	Workers     int    `name:"workers" help:"walking goroutines (0: platform default)"`
 	MaxDepth    int    `name:"max-depth" help:"maximum entry depth, with root children at 1 (0: unlimited)"`
 }
 
 // searchArgs resolves target as the search root and normalizes the subpath.
 func (s searchFlags) searchArgs(target string) (api.SearchArgs, error) {
-	a := api.SearchArgs{Path: s.Path, Hidden: s.Hidden, NoIgnore: s.NoIgnore, NodeModules: s.NodeModules, Workers: s.Workers, MaxDepth: s.MaxDepth}
+	a := api.SearchArgs{Path: s.Path, Hidden: s.Hidden, NoIgnore: s.NoIgnore, NodeModules: s.NodeModules, Git: s.Git, Workers: s.Workers, MaxDepth: s.MaxDepth}
 	var err error
 	if a.Dir, a.Checkout, err = resolveTarget(target); err != nil {
 		return a, err
@@ -74,7 +75,7 @@ func (cmd *grepCmd) Run(c *cli) error {
 	}
 	r, err := call[api.GrepReply](c, "grep", a)
 	if err != nil || c.json {
-		return err
+		return c.predates(err, err != nil && a.Git, "search.git", "grep --git")
 	}
 	pattern := ""
 	if a.Literal && !a.IgnoreCase {
@@ -138,7 +139,7 @@ func (cmd *globCmd) Run(c *cli) error {
 	}
 	r, err := call[api.GlobReply](c, "glob", a)
 	if err != nil || c.json {
-		return err
+		return c.predates(err, err != nil && a.Git, "search.git", "glob --git")
 	}
 	for _, m := range r.Matches {
 		if m.Type == "dir" {
