@@ -17,25 +17,38 @@ func gitProgram() (string, bool) {
 	return program, err == nil
 }
 
-// runGit runs the git executable program in r with args, leading `-c` pairs
-// included. It never inherits another repository, index or work tree from the
-// environment, runs no hooks, and adds env ("KEY=VALUE") to the environment. A
-// failure carries git's stderr.
-func (r *Repo) runGit(ctx context.Context, program string, env []string, args ...string) error {
-	dir := r.Top
-	if dir == "" {
-		dir = r.GitDir // a bare repository
+// dir is where git runs for r: its work tree, or the git directory of a bare
+// repository.
+func (r *Repo) dir() string {
+	if r.Top == "" {
+		return r.GitDir
 	}
-	cmd := exec.CommandContext(ctx, program, append([]string{"-C", dir, "-c", "core.hooksPath=/dev/null"}, args...)...)
+	return r.Top
+}
+
+// gitEnv is the environment of a git process ovnfs starts: this process's,
+// without the variables that would point git at another repository, index or
+// work tree, and with untranslated messages.
+func gitEnv() []string {
+	var env []string
 	for _, value := range os.Environ() {
 		key, _, _ := strings.Cut(value, "=")
 		switch key {
 		case "LC_ALL", "GIT_INDEX_FILE", "GIT_WORK_TREE", "GIT_DIR", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES":
 			continue
 		}
-		cmd.Env = append(cmd.Env, value)
+		env = append(env, value)
 	}
-	cmd.Env = append(append(cmd.Env, "LC_ALL=C"), env...)
+	return append(env, "LC_ALL=C")
+}
+
+// runGit runs the git executable program in r with args, leading `-c` pairs
+// included. It never inherits another repository, index or work tree from the
+// environment, runs no hooks, and adds env ("KEY=VALUE") to the environment. A
+// failure carries git's stderr.
+func (r *Repo) runGit(ctx context.Context, program string, env []string, args ...string) error {
+	cmd := exec.CommandContext(ctx, program, append([]string{"-C", r.dir(), "-c", "core.hooksPath=/dev/null"}, args...)...)
+	cmd.Env = append(gitEnv(), env...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {

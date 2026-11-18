@@ -1,10 +1,12 @@
 package git
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -19,8 +21,65 @@ import (
 	"github.com/stencil-hq/ovnfs/internal/hostfile"
 )
 
-// ErrBranchConflict identifies a branch or index that cannot be advanced safely.
+// ErrBranchConflict identifies a branch or index that cannot be advanced safely;
+// the error is a *BranchConflict saying why.
 var ErrBranchConflict = errors.New("branch conflict")
+
+// BranchConflict is why FetchBranch left a checked-out branch where it was. It
+// says what stands in the way and leaves what to do about it to the caller,
+// which knows what the user asked for.
+type BranchConflict struct {
+	Branch string
+	// Diverged reports that Branch holds commits the checkout's HEAD lacks.
+	Diverged bool
+	// Staged lists the paths whose staged content the checkout's commits would
+	// replace. With neither set, the branch stopped being the checked-out one
+	// while it was being advanced.
+	Staged []string
+}
+
+// Error names the obstacle.
+func (e *BranchConflict) Error() string {
+	switch {
+	case e.Diverged:
+		return e.Branch + " is not an ancestor of the checkout's HEAD"
+	case len(e.Staged) != 0:
+		return "staged changes in " + strings.Join(e.Staged, ", ")
+	}
+	return "the checked-out branch changed meanwhile"
+}
+
+// Is makes every BranchConflict match ErrBranchConflict.
+func (e *BranchConflict) Is(target error) bool { return target == ErrBranchConflict }
+
+// PartialCloneError reports that a checkout's commits cannot be copied into
+// its folder's repository, a partial clone: they build on history fetched
+// inside the checkout whose objects neither holds in full, and which only the
+// promisor remote can give the folder's repository.
+type PartialCloneError struct {
+	Top string
+	// Refs are the checkout's remote-tracking refs whose commits the folder's
+	// repository lacks, as "<remote>/<branch>".
+	Refs []string
+	Err  error
+}
+
+// Error says what to fetch in the folder's repository first.
+func (e *PartialCloneError) Error() string {
+	fetch := "git -C " + e.Top + " fetch"
+	if len(e.Refs) != 0 {
+		remote, _, _ := strings.Cut(e.Refs[0], "/")
+		fetch += " " + remote
+	}
+	what := "history fetched inside the checkout"
+	if len(e.Refs) != 0 {
+		what = strings.Join(e.Refs, ", ") + " as fetched inside the checkout"
+	}
+	return fmt.Sprintf("%s is a partial clone and lacks %s, which the checkout's commits build on; fetch it there first (%s), then run this again: %v", e.Top, what, fetch, e.Err)
+}
+
+// Unwrap returns git's failure.
+func (e *PartialCloneError) Unwrap() error { return e.Err }
 
 // ErrBranchDryRun preserves the unsupported dry run for branches not checked out.
 var ErrBranchDryRun = errors.New("--branch has no dry run")
@@ -61,7 +120,12 @@ func (r *Repo) FetchBranch(ctx context.Context, gitdir, branch string, dryRun bo
 			return "", nil, ErrBranchDryRun
 		}
 		program, ok := gitProgram()
-		if !ok {
+		partial, err := r.partial()
+		if err != nil {
+			return "", nil, err
+		}
+		if !ok || partial {
+			// git fetch cannot take a partial clone's commits; see transfer.
 			return r.fetchBranchRef(ctx, src, gitdir, ref)
 		}
 		if err := r.runGit(ctx, program, nil, "fetch", "--no-tags", "--quiet", gitdir, "HEAD:"+ref); err != nil {
@@ -89,7 +153,7 @@ func (r *Repo) FetchBranch(ctx context.Context, gitdir, branch string, dryRun bo
 			return "", nil, err
 		}
 		if head != ref {
-			return "", nil, fmt.Errorf("%w: the checked-out branch changed; retry or choose a different branch name", ErrBranchConflict)
+			return "", nil, &BranchConflict{Branch: branch}
 		}
 	}
 	tip, err := store.Resolve(ref)
@@ -117,7 +181,7 @@ func (r *Repo) FetchBranch(ctx context.Context, gitdir, branch string, dryRun bo
 		return "", nil, err
 	}
 	if !fastForward {
-		return "", nil, fmt.Errorf("%w: %s is not an ancestor of the checkout's HEAD; choose a different branch name", ErrBranchConflict, branch)
+		return "", nil, &BranchConflict{Branch: branch, Diverged: true}
 	}
 	diff, err := srcObjects.DiffTrees(old, next)
 	if err != nil {
@@ -198,18 +262,12 @@ func (r *Repo) FetchBranch(ctx context.Context, gitdir, branch string, dryRun bo
 	}
 	if len(conflicts) != 0 {
 		sort.Strings(conflicts)
-		return "", nil, fmt.Errorf("%w: staged changes in %s; choose a different branch name", ErrBranchConflict, strings.Join(conflicts, ", "))
+		return "", nil, &BranchConflict{Branch: branch, Staged: conflicts}
 	}
 	if dryRun || old == next {
 		return next.String(), changes, nil
 	}
-	// Copy the objects without touching any source ref or FETCH_HEAD.
-	if program, ok := gitProgram(); ok {
-		err = r.runGit(ctx, program, nil, "fetch", "--no-tags", "--no-write-fetch-head", "--quiet", gitdir, next.String())
-	} else {
-		err = r.copyObjects(ctx, src, next)
-	}
-	if err != nil {
+	if err := r.transfer(ctx, src, gitdir, next); err != nil {
 		return "", nil, err
 	}
 	if len(updates) == 0 {
@@ -305,7 +363,7 @@ func (r *Repo) fetchBranchRef(ctx context.Context, src *repo.Repository, gitdir,
 	if err != nil {
 		return "", nil, err
 	}
-	if err := r.copyObjects(ctx, src, head.ID); err != nil {
+	if err := r.transfer(ctx, src, gitdir, head.ID); err != nil {
 		return "", nil, err
 	}
 	store := r.repo.Refs()
@@ -335,6 +393,144 @@ func (r *Repo) fetchBranchRef(ctx context.Context, src *repo.Repository, gitdir,
 		return "", nil, err
 	}
 	return head.ID.String(), nil, nil
+}
+
+// CurrentBranch is `git symbolic-ref --quiet --short HEAD`: the branch checked
+// out in r's work tree, "" when HEAD is detached.
+func (r *Repo) CurrentBranch() (string, error) {
+	head, err := symbolicHead(r.repo.Refs())
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimPrefix(head, "refs/heads/"), nil
+}
+
+// FetchCommits copies the commits at the HEAD of gitdir, a checkout's private
+// git directory, into r's object database and moves no ref: the part of
+// FetchBranch that can fail for reasons outside r, done ahead of changes that
+// are not easily taken back.
+func (r *Repo) FetchCommits(ctx context.Context, gitdir string) error {
+	src, err := repo.Open(gitdir)
+	if err != nil {
+		return err
+	}
+	head, err := src.Refs().Resolve("HEAD")
+	if err != nil {
+		return err
+	}
+	return r.transfer(ctx, src, gitdir, head.ID)
+}
+
+// transfer copies the objects of want, a commit of the checkout whose private
+// git directory is src, at gitdir, into r, touching no ref of either and no
+// FETCH_HEAD. git does it when installed: by fetch, or for a partial clone by
+// transferPack, since fetch's connectivity check there refuses a pack whose
+// trees name blobs r was only promised.
+func (r *Repo) transfer(ctx context.Context, src *repo.Repository, gitdir string, want object.ID) error {
+	program, ok := gitProgram()
+	if !ok {
+		return r.copyObjects(ctx, src, want)
+	}
+	partial, err := r.partial()
+	if err != nil {
+		return err
+	}
+	if !partial {
+		return r.runGit(ctx, program, nil, "fetch", "--no-tags", "--no-write-fetch-head", "--quiet", gitdir, want.String())
+	}
+	return r.transferPack(ctx, program, src, gitdir, want)
+}
+
+// partial reports whether r is a partial clone: it has a promisor remote,
+// which promised objects r does not hold.
+func (r *Repo) partial() (bool, error) {
+	cfg, err := r.repo.Config()
+	if err != nil {
+		return false, err
+	}
+	if name, ok := cfg.Get("extensions.partialclone"); ok && name != "" {
+		return true, nil
+	}
+	for _, name := range cfg.Subsections("remote") {
+		if promisor, _, err := cfg.Bool("remote." + name + ".promisor"); err == nil && promisor {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// transferPack copies the objects of want that r's refs do not reach from the
+// checkout's private git directory into r, a partial clone, as one pack:
+// `git pack-objects --revs` there, read by `git index-pack --stdin` in r.
+// Everything r's refs reach is left out, held or promised, so the pack carries
+// only what the checkout added, and neither side may fetch from the promisor
+// remote to complete it: a checkout whose commits build on history fetched
+// inside it, which r lacks, fails with a *PartialCloneError.
+func (r *Repo) transferPack(ctx context.Context, program string, src *repo.Repository, gitdir string, want object.ID) error {
+	from, err := src.OpenDB()
+	if err != nil {
+		return err
+	}
+	defer from.Close()
+	to, err := r.repo.OpenDB()
+	if err != nil {
+		return err
+	}
+	defer to.Close()
+	if to.Has(want) {
+		return nil // an empty pack is no pack to index
+	}
+	revs := want.String() + "\n"
+	tips, err := r.repo.Refs().List("refs/")
+	if err != nil {
+		return err
+	}
+	if head, err := r.repo.Refs().Resolve("HEAD"); err == nil {
+		tips = append(tips, head)
+	}
+	for _, tip := range tips {
+		// The checkout reads r's objects too, but not one r was only promised.
+		if !tip.Symbolic() && from.Contains(tip.ID) {
+			revs += "^" + tip.ID.String() + "\n"
+		}
+	}
+	env := append(gitEnv(), "GIT_NO_LAZY_FETCH=1")
+	pack := exec.CommandContext(ctx, program, "--git-dir", gitdir, "pack-objects", "--revs", "--stdout", "--delta-base-offset", "-q")
+	index := exec.CommandContext(ctx, program, "-C", r.dir(), "index-pack", "--stdin")
+	read, write, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	var packErr, indexErr bytes.Buffer
+	pack.Env, pack.Stdin, pack.Stdout, pack.Stderr = env, strings.NewReader(revs), write, &packErr
+	index.Env, index.Stdin, index.Stderr = env, read, &indexErr
+	packRun, indexRun := pack.Start(), index.Start()
+	// The children hold the pipe now; index-pack sees its end once pack-objects exits.
+	write.Close()
+	read.Close()
+	if packRun == nil {
+		packRun = pack.Wait()
+	}
+	if indexRun == nil {
+		indexRun = index.Wait()
+	}
+	if packRun == nil && indexRun == nil {
+		return nil
+	}
+	failure := fmt.Errorf("git pack-objects: %s: %w", strings.TrimSpace(packErr.String()), packRun)
+	if packRun == nil {
+		failure = fmt.Errorf("git index-pack: %s: %w", strings.TrimSpace(indexErr.String()), indexRun)
+	}
+	// Remote-tracking refs the checkout moved past r's are the history it fetched.
+	missing := &PartialCloneError{Top: r.dir(), Err: failure}
+	if tracking, err := src.Refs().List("refs/remotes/"); err == nil {
+		for _, ref := range tracking {
+			if !ref.Symbolic() && !to.Contains(ref.ID) {
+				missing.Refs = append(missing.Refs, strings.TrimPrefix(ref.Name, "refs/remotes/"))
+			}
+		}
+	}
+	return missing
 }
 
 // copyObjects copies the objects reachable from want that r lacks from src,

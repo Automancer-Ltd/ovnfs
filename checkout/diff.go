@@ -507,14 +507,18 @@ func (r *Registry) Apply(ctx context.Context, args api.ApplyArgs) (reply api.App
 			return api.ApplyReply{}, failure("invalid", "checkout %s has no git directory; --branch needs a repository source", h.meta.Name)
 		}
 		commit, updated, err := repo.FetchBranch(ctx, r.gitdirPath(h.meta.dir()), args.Branch, args.DryRun)
-		if errors.Is(err, git.ErrBranchConflict) {
-			return api.ApplyReply{}, failure("conflict", "%s", err)
+		if conflict, ok := errors.AsType[*git.BranchConflict](err); ok {
+			advice := "choose a different branch name"
+			if !conflict.Diverged && len(conflict.Staged) == 0 {
+				advice = "run it again, or " + advice
+			}
+			return api.ApplyReply{}, failure("conflict", "%s; %s", conflict, advice)
 		}
 		if errors.Is(err, git.ErrBranchDryRun) {
 			return api.ApplyReply{}, failure("invalid", "%s", err)
 		}
 		if err != nil {
-			return api.ApplyReply{}, coded(err)
+			return api.ApplyReply{}, codedTransfer(err)
 		}
 		for _, change := range updated {
 			reply.Applied = append(reply.Applied, api.Change{Path: change.Path, Status: change.Status})
@@ -603,6 +607,15 @@ func (r *Registry) Apply(ctx context.Context, args api.ApplyArgs) (reply api.App
 		return api.ApplyReply{}, coded(err)
 	}
 	return reply, nil
+}
+
+// codedTransfer is coded for a failure to copy a checkout's commits into its
+// folder's repository, which knows the one cause the user can act on.
+func codedTransfer(err error) error {
+	if partial, ok := errors.AsType[*git.PartialCloneError](err); ok {
+		return failure("unavailable", "%s", partial)
+	}
+	return coded(err)
 }
 
 // holdsPullMarkers reports whether theirs, the checkout's version of p, still

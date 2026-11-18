@@ -179,13 +179,16 @@ func TestFetchCheckedOutBranchRefusals(t *testing.T) {
 			if err == nil {
 				t.Fatal("unsafe apply succeeded")
 			}
-			if reason == "staged" || reason == "non-fast-forward" {
-				if !errors.Is(err, ErrBranchConflict) || !strings.Contains(err.Error(), "different branch name") {
-					t.Fatalf("conflict = %v", err)
+			conflict, _ := errors.AsType[*BranchConflict](err)
+			switch reason {
+			case "non-fast-forward":
+				if conflict == nil || !conflict.Diverged || conflict.Branch != "main" || !errors.Is(err, ErrBranchConflict) {
+					t.Fatalf("conflict = %#v (%v), want main diverged", conflict, err)
 				}
-			}
-			if reason == "staged" && !strings.Contains(err.Error(), "tracked") {
-				t.Fatalf("conflicting path missing: %v", err)
+			case "staged":
+				if conflict == nil || conflict.Diverged || len(conflict.Staged) != 1 || conflict.Staged[0] != "tracked" {
+					t.Fatalf("conflict = %#v (%v), want staged tracked", conflict, err)
+				}
 			}
 			if !bytes.Equal(before, indexBytes(t, r)) || testGit(t, r.Top, "rev-parse", "HEAD") != old {
 				t.Fatal("refused apply changed index or ref")
