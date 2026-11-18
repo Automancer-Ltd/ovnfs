@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/stencil-hq/ovnfs/git"
 	"github.com/stencil-hq/ovnfs/rules"
@@ -80,7 +81,7 @@ func (v *takeView) ReadFile(p string) ([]byte, error) {
 	return objects.Blob(string(f.ID))
 }
 
-func takeCapture(ctx context.Context, c Config, set rules.Set, res *source.Result, work source.Result, takes []Take) error {
+func takeCapture(ctx context.Context, c Config, set rules.Set, res *source.Result, work source.Result, takes []Take, fork time.Time) error {
 	if len(takes) == 0 {
 		return nil
 	}
@@ -122,48 +123,53 @@ func takeCapture(ctx context.Context, c Config, set rules.Set, res *source.Resul
 		}
 		return false
 	}
-	var indexFiles map[string]store.File
-	var indexInfo map[string]source.Info
-	type selectedTree struct {
-		files map[string]store.File
-		info  map[string]source.Info
-	}
-	revisions := map[*git.Revision]selectedTree{}
+	var index *gitFiles
+	revisions := map[*git.Revision]gitFiles{}
 	for _, take := range takes {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		src, sizes := work.Files, work.Info
+		var pointers map[string]bool
 		if take.Source != "." {
-			if work.Domains.Repo("") == nil {
+			root := work.Domains.Repo("")
+			if root == nil {
 				if take.Revision == nil {
 					return fmt.Errorf("%w: index source needs a git repository at the folder root", ErrTake)
 				}
 				return fmt.Errorf("%w: revision source needs a git repository at the folder root", ErrTake)
 			}
+			var tree gitFiles
 			if take.Revision != nil {
-				tree, ok := revisions[take.Revision]
-				if !ok {
-					tree.files, tree.info = treeFiles(take.Revision.Entries, work)
+				var ok bool
+				if tree, ok = revisions[take.Revision]; !ok {
+					var err error
+					if tree, err = treeFiles(take.Revision.Entries, work, root, git.AttributeOptions{Source: take.Revision.Commit}, fork); err != nil {
+						return err
+					}
 					revisions[take.Revision] = tree
 				}
-				src, sizes = tree.files, tree.info
 			} else {
-				if indexFiles == nil {
+				if index == nil {
 					var entries []git.TreeEntry
 					for _, repo := range work.Repos {
 						if repo.Path == "" && repo.Index != "" {
 							var err error
-							entries, err = work.Domains.Repo("").IndexTree(ctx, repo.Index)
+							entries, err = root.IndexTree(ctx, repo.Index)
 							if err != nil {
 								return err
 							}
 						}
 					}
-					indexFiles, indexInfo = treeFiles(entries, work)
+					files, err := treeFiles(entries, work, root, git.AttributeOptions{}, fork)
+					if err != nil {
+						return err
+					}
+					index = &files
 				}
-				src, sizes = indexFiles, indexInfo
+				tree = *index
 			}
+			src, sizes, pointers = tree.files, tree.info, tree.lfs
 		}
 		inSource := containsPath(src, take.Path) || (take.Source == "." && containsRoot(work.Root, work.Roots, take.Path))
 		if !inSource && !containsPath(files, take.Path) && !containsRoot(res.Root, res.Roots, take.Path) {
@@ -174,6 +180,7 @@ func takeCapture(ctx context.Context, c Config, set rules.Set, res *source.Resul
 				delete(files, p)
 				delete(info, p)
 				delete(res.BlobRepo, p)
+				delete(res.LFS, p)
 			}
 		}
 		for p, f := range src {
@@ -209,9 +216,16 @@ func takeCapture(ctx context.Context, c Config, set rules.Set, res *source.Resul
 				delete(files, dir)
 				delete(info, dir)
 				delete(res.BlobRepo, dir)
+				delete(res.LFS, dir)
 			}
 			files[p], info[p] = f, sizes[p]
 			delete(res.BlobRepo, p)
+			if pointers[p] {
+				if res.LFS == nil {
+					res.LFS = map[string]bool{}
+				}
+				res.LFS[p] = true
+			}
 			if f.Mode != store.ModeDir {
 				origin := work.Domains.Repo("")
 				if take.Source == "." {
@@ -247,22 +261,46 @@ func takeCapture(ctx context.Context, c Config, set rules.Set, res *source.Resul
 	return err
 }
 
-func treeFiles(entries []git.TreeEntry, work source.Result) (map[string]store.File, map[string]source.Info) {
-	files := make(map[string]store.File, len(entries))
-	info := make(map[string]source.Info, len(entries))
+// gitFiles are the files git's checkout of a tree or index writes: the
+// leaves, their stat data, and the Git LFS pointers among them
+// (source.Result.LFS).
+type gitFiles struct {
+	files map[string]store.File
+	info  map[string]source.Info
+	lfs   map[string]bool
+}
+
+// treeFiles describes checking out entries of repo, whose lfs filter reads
+// the attributes attrs selects. An LFS pointer presents its object's size and
+// lfsMtime; a file the work tree holds unchanged keeps its stat data; other
+// content presents its blob's size.
+func treeFiles(entries []git.TreeEntry, work source.Result, repo *git.Repo, attrs git.AttributeOptions, fork time.Time) (gitFiles, error) {
+	lfs, err := newLFSFinder(repo, attrs)
+	if err != nil {
+		return gitFiles{}, err
+	}
+	defer lfs.Close()
+	t := gitFiles{files: make(map[string]store.File, len(entries)), info: make(map[string]source.Info, len(entries)), lfs: map[string]bool{}}
 	for _, e := range entries {
 		f := store.File{Mode: e.Mode, ID: store.OID(e.OID)}
 		if e.Type == "commit" {
 			f = store.File{Mode: store.ModeDir, ID: store.EmptyTree}
 		}
-		files[e.Path] = f
-		if work.Files[e.Path] == f {
-			info[e.Path] = work.Info[e.Path]
-		} else {
-			info[e.Path] = source.Info{Size: e.Size}
+		t.files[e.Path] = f
+		size, pointer, err := lfs.object(e)
+		switch {
+		case err != nil:
+			return gitFiles{}, err
+		case pointer:
+			t.info[e.Path] = source.Info{Size: size, Mtime: lfsMtime(fork)}
+			t.lfs[e.Path] = true
+		case work.Files[e.Path] == f:
+			t.info[e.Path] = work.Info[e.Path]
+		default:
+			t.info[e.Path] = source.Info{Size: e.Size}
 		}
 	}
-	return files, info
+	return t, nil
 }
 
 func within(p, root string) bool {

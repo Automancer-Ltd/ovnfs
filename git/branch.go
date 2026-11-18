@@ -128,7 +128,7 @@ func (r *Repo) FetchBranch(ctx context.Context, gitdir, branch string, dryRun bo
 			// git fetch cannot take a partial clone's commits; see transfer.
 			return r.fetchBranchRef(ctx, src, gitdir, ref)
 		}
-		if err := r.runGit(ctx, program, nil, "fetch", "--no-tags", "--quiet", gitdir, "HEAD:"+ref); err != nil {
+		if err := r.runGit(ctx, program, gitRun{}, "fetch", "--no-tags", "--quiet", gitdir, "HEAD:"+ref); err != nil {
 			return "", nil, err
 		}
 		tip, err := store.Resolve(ref)
@@ -436,7 +436,7 @@ func (r *Repo) transfer(ctx context.Context, src *repo.Repository, gitdir string
 		return err
 	}
 	if !partial {
-		return r.runGit(ctx, program, nil, "fetch", "--no-tags", "--no-write-fetch-head", "--quiet", gitdir, want.String())
+		return r.runGit(ctx, program, gitRun{}, "fetch", "--no-tags", "--no-write-fetch-head", "--quiet", gitdir, want.String())
 	}
 	return r.transferPack(ctx, program, src, gitdir, want)
 }

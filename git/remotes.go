@@ -136,7 +136,7 @@ func (r *Repo) deleteTracking(ctx context.Context, names []string) error {
 		return fmt.Errorf("git is not installed to delete %s", strings.Join(doomed, ", "))
 	}
 	for _, ref := range doomed {
-		if err := r.runGit(ctx, program, nil, "update-ref", "--no-deref", "-d", ref); err != nil {
+		if err := r.runGit(ctx, program, gitRun{}, "update-ref", "--no-deref", "-d", ref); err != nil {
 			return err
 		}
 	}

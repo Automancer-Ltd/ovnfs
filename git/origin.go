@@ -146,7 +146,7 @@ func (r *Repo) FetchOrigin(ctx context.Context, o Origin) error {
 		if command, ok := batchSSH(); ok {
 			env = append(env, "GIT_SSH_COMMAND="+command)
 		}
-		return r.runGit(ctx, program, env, args...)
+		return r.runGit(ctx, program, gitRun{env: env}, args...)
 	}
 	want, err := object.ParseIDFormat(r.repo.Format, o.Commit)
 	if err != nil {

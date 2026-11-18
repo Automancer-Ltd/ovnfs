@@ -61,8 +61,12 @@ type Result struct {
 	Stats    api.Capture            `json:"-"`
 	Warnings []string               `json:"-"`
 	BlobRepo map[string]string      `json:"blob_repo,omitempty"` // taken file -> root-relative object repository
-	Domains  *Domains               `json:"-"`
-	reuse    *reuseRecord           // set only by Capture; see ReuseKey
+	// LFS holds the files from git whose blob is a Git LFS pointer the view
+	// serves as the object it names, as git's checkout writes it; their Info
+	// has the object's size.
+	LFS     map[string]bool `json:"-"`
+	Domains *Domains        `json:"-"`
+	reuse   *reuseRecord    // set only by Capture; see ReuseKey
 }
 
 // Resolve returns the source root for dir: the repository's top level when dir is

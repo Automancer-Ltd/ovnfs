@@ -127,11 +127,15 @@ func (r *Registry) Offer(ctx context.Context, name, remoteName string) (peer.Off
 	for _, p := range source.SortedPaths(files) {
 		f := files[p]
 		e := peer.Entry{Path: p, Mode: f.Mode, ID: f.ID, Mtime: snap.Snapshot.Created.UnixNano()}
+		// An LFS leaf is offered as git stores it: the pointer, whose size its
+		// Info (the object's) does not have.
 		if f.Mode != store.ModeDir {
-			if info, ok := view.Info(p); ok && leafIs(view, p, f) {
+			if info, ok := view.Info(p); ok && leafIs(view, p, f) && !view.LFS(p) {
 				e.Size, e.Mtime = info.Size, info.Mtime.UnixNano()
 			} else if size, err := st.Size(f.ID); err == nil {
 				e.Size = size
+			} else if data, err := view.Blob(p, f.ID); err == nil {
+				e.Size = int64(len(data))
 			}
 		}
 		entries = append(entries, e)

@@ -302,6 +302,10 @@ type AttributeOptions struct {
 	// Index is the index snapshot whose .gitattributes blobs back unusable
 	// work-tree files; nil reads the repository's live index on first need.
 	Index *Index
+	// Source names a tree-ish whose .gitattributes files replace the work
+	// tree's and the index's, as GIT_ATTR_SOURCE does, which it overrides:
+	// the attributes git checks out a revision's files with.
+	Source string
 }
 
 // Attributes prepares queries for names with r's attribute files and
@@ -357,7 +361,7 @@ func (r *Repo) Attributes(names []string, opts AttributeOptions) (*Attributes, e
 		a.indexed = opts.Index.attrFiles
 		a.indexOnce.Do(func() {})
 	}
-	if err := a.useTreeSource(cfg); err != nil {
+	if err := a.useTreeSource(cfg, opts.Source); err != nil {
 		return nil, err
 	}
 	// Macros are global, a later definition replacing an earlier one, in this
@@ -416,12 +420,15 @@ func readHostAttributes(name string) []byte {
 }
 
 // useTreeSource makes a read .gitattributes files from a tree instead of the
-// work tree when GIT_ATTR_SOURCE or attr.tree names one, as git does: a
-// GIT_ATTR_SOURCE that names no tree is an error, an attr.tree that names none
-// is ignored (git 2.56 reads the work tree then, whatever config/attr.adoc
-// says). The tree's files are read once, here.
-func (a *Attributes) useTreeSource(cfg *config.Config) error {
-	spec, fromEnv := os.LookupEnv("GIT_ATTR_SOURCE")
+// work tree when source, else GIT_ATTR_SOURCE or attr.tree, names one, as git
+// does: a source or GIT_ATTR_SOURCE that names no tree is an error, an
+// attr.tree that names none is ignored (git 2.56 reads the work tree then,
+// whatever config/attr.adoc says). The tree's files are read once, here.
+func (a *Attributes) useTreeSource(cfg *config.Config, source string) error {
+	spec, fromEnv := source, source != ""
+	if !fromEnv {
+		spec, fromEnv = os.LookupEnv("GIT_ATTR_SOURCE")
+	}
 	if !fromEnv {
 		var ok bool
 		if spec, ok = cfg.Get("attr.tree"); !ok {
@@ -432,7 +439,7 @@ func (a *Attributes) useTreeSource(cfg *config.Config) error {
 		root, err := rev.Resolve(s, spec+"^{tree}", rev.Options{})
 		if err != nil {
 			if fromEnv {
-				return fmt.Errorf("bad GIT_ATTR_SOURCE %q: %w", spec, err)
+				return fmt.Errorf("bad attribute source %q: %w", spec, err)
 			}
 			return nil
 		}

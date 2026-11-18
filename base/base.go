@@ -117,11 +117,11 @@ func CreateRevision(ctx context.Context, c Config, o source.Options, revision *g
 	}
 	work := res
 	if revision != nil {
-		if err := reviseCapture(ctx, c, &res, revision); err != nil {
+		if err := reviseCapture(ctx, c, &res, revision, fork); err != nil {
 			return nil, nil, err
 		}
 	}
-	if err := takeCapture(ctx, c, o.Rules, &res, work, takes); err != nil {
+	if err := takeCapture(ctx, c, o.Rules, &res, work, takes, fork); err != nil {
 		return nil, nil, err
 	}
 	if revision != nil {

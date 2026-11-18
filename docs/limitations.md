@@ -12,6 +12,11 @@
   [configuration](configuration.md#classes)).
 - A tracked file the user changes after open is read from the repository's
   objects; pruning those objects can make it unreadable.
+- Files from git (`--rev`, `--take` from the index or a revision) go through
+  only Git LFS's checkout conversion. One git would write with CRLF line
+  endings, an expanded `ident`, a `working-tree-encoding` or another filter
+  driver's smudge shows its blob as git stores it. An attached copy of such a
+  checkout shows LFS pointers, not objects.
 - ovnfs reads git repositories with its own implementation, not a git
   installation. It reads the system configuration and attributes from
   `GIT_CONFIG_SYSTEM` or `/etc/gitconfig` and `/etc/gitattributes` (none on

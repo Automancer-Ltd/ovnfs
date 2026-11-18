@@ -36,8 +36,9 @@ const revisionIndex = "revision-index"
 
 // reviseCapture substitutes tree metadata, not a materialized checkout. The
 // capture's stat identities remain usable only for content identical to REV.
+// LFS pointers, under REV's attributes, present their objects (see lfsFile).
 // Its index has no stat data yet: seedRevisionIndex adds it once takes are done.
-func reviseCapture(ctx context.Context, c Config, res *source.Result, revision *git.Revision) error {
+func reviseCapture(ctx context.Context, c Config, res *source.Result, revision *git.Revision, fork time.Time) error {
 	index := filepath.Join(c.StateDir, revisionIndex)
 	if err := revision.WriteIndex(ctx, index, nil); err != nil {
 		return err
@@ -53,7 +54,11 @@ func reviseCapture(ctx context.Context, c Config, res *source.Result, revision *
 		return err
 	}
 	defer objects.Close()
-	files, info := treeFiles(revision.Entries, *res)
+	tree, err := treeFiles(revision.Entries, *res, repo, git.AttributeOptions{Source: revision.Commit}, fork)
+	if err != nil {
+		return err
+	}
+	files, info := tree.files, tree.info
 	// Gitlinks start empty in revision checkouts. Their contents belong to the
 	// submodule and must not be judged by the superproject's ignore rules.
 	gitlinks := map[string]bool{}
@@ -170,13 +175,14 @@ func reviseCapture(ctx context.Context, c Config, res *source.Result, revision *
 			delete(roots, p)
 		}
 	}
-	res.Files, res.Info, res.Roots, res.Repos, res.Domains = files, info, roots, repos, domains
+	res.Files, res.Info, res.Roots, res.Repos, res.Domains, res.LFS = files, info, roots, repos, domains, tree.lfs
 	res.Tree, err = c.Store.Build(files)
 	return err
 }
 
 // seedRevisionIndex rewrites the revision index with the stat data the view
-// presents for every file it serves with exactly REV's blob and mode, so git's
+// presents for every file it serves with exactly REV's blob and mode (an LFS
+// pointer's object, which git's clean filter stores as that blob), so git's
 // first refresh trusts those files instead of reading each one. It runs on the
 // final capture: a path taken with other content, a gitlink, and any other path
 // the view does not serve as REV's keep zero stat data, which git reads.

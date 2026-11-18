@@ -43,7 +43,8 @@ import (
 //	        u32, with the tracking repository (1-based into meta's list, 0:
 //	        untracked) above attrTrackedShift and attrLeaf and attrOID in the
 //	        top bits; blob repository u32
-//	        (1-based into meta's list, 0: none); nanoseconds u32, with attrInfo and attrMtime in the
+//	        (1-based into meta's list, 0: none), with attrLFS in the top bit;
+//	        nanoseconds u32, with attrInfo and attrMtime in the
 //	        top bits; seconds i64; size i64; inode u64
 //	table   open-addressed hash table of every node's path (pathHash),
 //	        probed linearly: per slot, node+1 u32 (0: empty) and the hash's
@@ -83,8 +84,9 @@ const (
 )
 
 // Fields above the store mode bits of an attr's mode, and flags in the top bits
-// of its nanoseconds.
+// of its blob repository and nanoseconds.
 const (
+	attrLFS          = 1 << 31 // blob repository: the leaf is a Git LFS pointer served as its object (source.Result.LFS)
 	attrLeaf         = 1 << 30 // mode: a captured leaf (source.Result.Files)
 	attrOID          = 1 << 31 // mode: the leaf has a blob id
 	attrModes        = 1<<attrTrackedShift - 1
@@ -419,12 +421,16 @@ func (x *captureIndex) info(n uint32) (source.Info, bool) {
 
 // origin returns the root-relative repository holding node n's blob, when a take overrode it.
 func (x *captureIndex) origin(n uint32) (string, bool) {
-	i := x.u32(x.attrAt(n) + 24)
+	i := x.u32(x.attrAt(n)+24) &^ attrLFS
 	if i == 0 || int(i) > len(x.origins) {
 		return "", false
 	}
 	return x.origins[i-1], true
 }
+
+// lfs reports whether node n's leaf is a Git LFS pointer the view serves as
+// the object it names.
+func (x *captureIndex) lfs(n uint32) bool { return x.u32(x.attrAt(n)+24)&attrLFS != 0 }
 
 // fileMode is the mode a view presents for node n.
 func (x *captureIndex) fileMode(n uint32) os.FileMode {
@@ -690,13 +696,18 @@ func (t *captureTree) write(f *os.File, res *source.Result) error {
 			}
 		}
 		le.PutUint32(rec[20:], mode)
+		var blobRepo uint32
 		if origin, ok := res.BlobRepo[p]; ok {
 			if origins[origin] == 0 {
 				originList = append(originList, origin)
 				origins[origin] = uint32(len(originList))
 			}
-			le.PutUint32(rec[24:], origins[origin])
+			blobRepo = origins[origin]
 		}
+		if res.LFS[p] {
+			blobRepo |= attrLFS
+		}
+		le.PutUint32(rec[24:], blobRepo)
 		if info, ok := res.Info[p]; ok {
 			nanos := uint32(attrInfo)
 			if !info.Mtime.IsZero() {

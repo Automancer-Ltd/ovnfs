@@ -153,7 +153,7 @@ func (v bottom) ReadDir(p string) ([]os.FileInfo, error) {
 
 // Open opens the folder's file while it still matches the capture, or the
 // snapshot's file, else serves the captured blob (from memory when the store
-// caches it).
+// caches it), or the object an LFS pointer blob names (see lfsFile).
 func (v bottom) Open(p string) (overlay.Content, error) {
 	b := v.b
 	p = overlay.Clean(p)
@@ -178,6 +178,9 @@ func (v bottom) Open(p string) (overlay.Content, error) {
 			}
 			f.Close()
 		}
+	}
+	if b.index.lfs(e.n) {
+		return b.lfsFile(p, b.index.oid(e.n))
 	}
 	return b.blobFile(p, b.index.oid(e.n))
 }

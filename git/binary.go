@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -42,13 +43,21 @@ func gitEnv() []string {
 	return append(env, "LC_ALL=C")
 }
 
+// gitRun tunes runGit: variables ("KEY=VALUE") added to the environment, and
+// the process's standard input and output, unconnected when nil.
+type gitRun struct {
+	env []string
+	in  io.Reader
+	out io.Writer
+}
+
 // runGit runs the git executable program in r with args, leading `-c` pairs
 // included. It never inherits another repository, index or work tree from the
-// environment, runs no hooks, and adds env ("KEY=VALUE") to the environment. A
-// failure carries git's stderr.
-func (r *Repo) runGit(ctx context.Context, program string, env []string, args ...string) error {
+// environment and runs no hooks. A failure carries git's stderr.
+func (r *Repo) runGit(ctx context.Context, program string, o gitRun, args ...string) error {
 	cmd := exec.CommandContext(ctx, program, append([]string{"-C", r.dir(), "-c", "core.hooksPath=/dev/null"}, args...)...)
-	cmd.Env = append(gitEnv(), env...)
+	cmd.Env = append(gitEnv(), o.env...)
+	cmd.Stdin, cmd.Stdout = o.in, o.out
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {

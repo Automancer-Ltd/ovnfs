@@ -114,7 +114,9 @@ commit, tag or `HEAD` detaches it. Untracked nonignored files disappear from
 the checkout, while ignored files and build directories remain available.
 Hidden paths stay absent, except files REV tracks.
 Ignore rules come from REV, not the folder's dirty `.gitignore` files. The
-source folder and its git state are never changed. `--rev` cannot be combined
+source folder and its git state are never changed, except that LFS objects
+REV needs may be downloaded into the repository's LFS storage (see below).
+`--rev` cannot be combined
 with `--from SNAP`; it requires a repository and a revision resolving to a
 commit.
 
@@ -126,6 +128,15 @@ The private index records the size and mtime the checkout shows for each file
 holding REV's content, so the first `git status` trusts those files instead of
 reading them; other files, and any shown with an mtime within the second the
 index was written, are read.
+
+Files Git LFS tracks show the objects their pointers name, as `git checkout`
+writes them, when the repository's `lfs` filter smudges (not after `git lfs
+install --skip-smudge` or with `GIT_LFS_SKIP_SMUDGE`). Listing them reads no
+object: each is opened from the repository's LFS storage on first read, or
+produced by `git lfs smudge`, which downloads a missing object into that
+storage and fails the read (EIO, with a notice) when it cannot. They show the
+mtime one second before the checkout opened, so `git status` trusts them
+unread. Trees, `diff` and the private index keep the pointers git stores.
 
 ## Taking paths: `--take`
 
@@ -139,8 +150,9 @@ ordinary or `--rev` behavior. `--take` cannot be combined with `--from SNAP`.
 
 Taken content becomes part of the base: the initial diff is empty, snapshots
 and forks retain it, and apply never writes the selection back to the folder.
-Content stays lazy, and the private git index is unchanged: it still comes from
-REV with `--rev`, or from the folder otherwise. Git therefore shows taken
+Content stays lazy, Git LFS objects included (as with `--rev`), and the
+private git index is unchanged: it still comes from REV with `--rev`, or from
+the folder otherwise. Git therefore shows taken
 content as working-tree changes relative to that index. For example:
 
 ```sh
