@@ -322,40 +322,53 @@ func (cmd *newCmd) Run(c *cli) error {
 	if err != nil || c.json {
 		return err
 	}
-	fmt.Fprintln(stdout, r.Checkout.Path)
-	from := r.Checkout.Source
-	if a.Snapshot != "" {
-		from = strings.TrimPrefix(from+"@", "@") + a.Snapshot
-	}
-	fmt.Fprintf(stderr, "%s  %s  %s\n", paint(stderr, styleAccent.Bold(true), r.Checkout.Name), paint(stderr, styleDim, "←"), paint(stderr, styleDim, from))
-	if cp := r.Capture; cp != nil {
-		fmt.Fprintf(stderr, "  %s %s files (%s) · %s %s (%s) in %.1fs\n", paint(stderr, styleDim, "source"),
-			commas(int64(cp.Files)), humanBytes(cp.Bytes), paint(stderr, styleDim, "hashed"), commas(int64(cp.Hashed)), humanBytes(cp.HashedBytes), cp.Seconds)
-		git := "none"
-		if len(cp.Repos) > 0 {
-			repos := make([]string, len(cp.Repos))
-			for i, r := range cp.Repos {
-				repos[i] = orDefault(r, ".")
+	printResult(r.Checkout.Path, r.Warnings, func() {
+		from := r.Checkout.Source
+		if a.Snapshot != "" {
+			from = strings.TrimPrefix(from+"@", "@") + a.Snapshot
+		}
+		fmt.Fprintf(stderr, "%s  %s  %s\n", paint(stderr, styleAccent.Bold(true), r.Checkout.Name), paint(stderr, styleDim, "←"), paint(stderr, styleDim, from))
+		if cp := r.Capture; cp != nil {
+			fmt.Fprintf(stderr, "  %s %s files (%s) · %s %s (%s) in %.1fs\n", paint(stderr, styleDim, "source"),
+				commas(int64(cp.Files)), humanBytes(cp.Bytes), paint(stderr, styleDim, "hashed"), commas(int64(cp.Hashed)), humanBytes(cp.HashedBytes), cp.Seconds)
+			git := "none"
+			if len(cp.Repos) > 0 {
+				repos := make([]string, len(cp.Repos))
+				for i, r := range cp.Repos {
+					repos[i] = orDefault(r, ".")
+				}
+				git = strings.Join(repos, ", ")
 			}
-			git = strings.Join(repos, ", ")
+			vcs := "git: " + git
+			if r.Checkout.JJ != "" {
+				vcs += " · jj: " + r.Checkout.JJ
+			}
+			fmt.Fprintf(stderr, "  %s · %s · %s · %s\n",
+				paint(stderr, styleDim, "cache "+commas(int64(cp.Cache))),
+				paint(stderr, styleDim, "local "+commas(int64(cp.Local))),
+				paint(stderr, styleDim, "hidden "+commas(int64(cp.Hidden))),
+				paint(stderr, styleDim, vcs))
+		} else if r.Checkout.JJ != "" {
+			fmt.Fprintf(stderr, "  %s\n", paint(stderr, styleDim, "jj: "+r.Checkout.JJ))
 		}
-		vcs := "git: " + git
-		if r.Checkout.JJ != "" {
-			vcs += " · jj: " + r.Checkout.JJ
-		}
-		fmt.Fprintf(stderr, "  %s · %s · %s · %s\n",
-			paint(stderr, styleDim, "cache "+commas(int64(cp.Cache))),
-			paint(stderr, styleDim, "local "+commas(int64(cp.Local))),
-			paint(stderr, styleDim, "hidden "+commas(int64(cp.Hidden))),
-			paint(stderr, styleDim, vcs))
-	} else if r.Checkout.JJ != "" {
-		fmt.Fprintf(stderr, "  %s\n", paint(stderr, styleDim, "jj: "+r.Checkout.JJ))
-	}
-	printWarnings(r.Warnings)
+	})
 	return nil
 }
 
-// printWarnings shows a reply's warnings on stderr, after its result.
+// printResult prints the one value a verb exists to produce, such as new's
+// path, alone on stdout and last: after summary, the detail a person may want,
+// which runs only when stderr is a terminal, and after the warnings. So a
+// caller that captures stdout gets the value, and one that merges the streams
+// finds it on the last line.
+func printResult(value string, warnings []string, summary func()) {
+	if isTerminal(os.Stderr) {
+		summary()
+	}
+	printWarnings(warnings)
+	fmt.Fprintln(stdout, value)
+}
+
+// printWarnings shows a reply's warnings on stderr.
 func printWarnings(ws []string) {
 	for _, w := range ws {
 		fmt.Fprintln(stderr, paint(stderr, styleYellow, "warning:"), w)
@@ -375,13 +388,13 @@ func (cmd *forkCmd) Run(c *cli) error {
 	if err != nil || c.json {
 		return err
 	}
-	fmt.Fprintln(stdout, r.Checkout.Path)
-	fmt.Fprintf(stderr, "%s  %s  %s@%s\n", paint(stderr, styleAccent.Bold(true), r.Checkout.Name), paint(stderr, styleDim, "←"),
-		paint(stderr, styleAccent, a.Checkout), paint(stderr, styleDim, r.Snapshot.ID))
-	if r.Checkout.JJ != "" {
-		fmt.Fprintf(stderr, "  %s\n", paint(stderr, styleDim, "jj: "+r.Checkout.JJ))
-	}
-	printWarnings(r.Warnings)
+	printResult(r.Checkout.Path, r.Warnings, func() {
+		fmt.Fprintf(stderr, "%s  %s  %s@%s\n", paint(stderr, styleAccent.Bold(true), r.Checkout.Name), paint(stderr, styleDim, "←"),
+			paint(stderr, styleAccent, a.Checkout), paint(stderr, styleDim, r.Snapshot.ID))
+		if r.Checkout.JJ != "" {
+			fmt.Fprintf(stderr, "  %s\n", paint(stderr, styleDim, "jj: "+r.Checkout.JJ))
+		}
+	})
 	return nil
 }
 
@@ -398,13 +411,14 @@ func (cmd *snapCmd) Run(c *cli) error {
 	if err != nil || c.json {
 		return err
 	}
-	fmt.Fprintln(stdout, r.Snapshot.ID)
-	line := fmt.Sprintf("%s %s %s %s", paint(stderr, styleDim, "snapshot"), paint(stderr, styleAccent, r.Snapshot.ID),
-		paint(stderr, styleDim, "of"), paint(stderr, styleAccent, a.Checkout))
-	if r.Snapshot.Tree != "" {
-		line += " " + paint(stderr, styleDim, "tree "+abbrev(r.Snapshot.Tree, 12))
-	}
-	fmt.Fprintln(stderr, line)
+	printResult(r.Snapshot.ID, nil, func() {
+		line := fmt.Sprintf("%s %s %s %s", paint(stderr, styleDim, "snapshot"), paint(stderr, styleAccent, r.Snapshot.ID),
+			paint(stderr, styleDim, "of"), paint(stderr, styleAccent, a.Checkout))
+		if r.Snapshot.Tree != "" {
+			line += " " + paint(stderr, styleDim, "tree "+abbrev(r.Snapshot.Tree, 12))
+		}
+		fmt.Fprintln(stderr, line)
+	})
 	return nil
 }
 
