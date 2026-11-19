@@ -481,23 +481,25 @@ func (c *rpcClient) commit3(id uint64) (status, []byte) {
 	return st, verf
 }
 
-// TestV3WriteCommitVerifier checks WRITE reaches the file FILE_SYNC at any
-// stability asked for, and WRITE and COMMIT share a verifier that changes
-// with the server instance.
+// TestV3WriteCommitVerifier checks the advertised stability and the verifier
+// shared by WRITE and COMMIT, which changes with the server instance.
 func TestV3WriteCommitVerifier(t *testing.T) {
 	fs := newTestFS(t)
 	fs.write(t, "f", "hello world")
 	c := v3server(t, fs)
 	id := fs.FileID("f")
 
-	st, n, committed, verf := c.write3(id, 6, 0, []byte("WORLD!"))
-	if st != stOK || n != 6 || committed != fileSync3 {
+	st, n, committed, verf := c.write3(id, 6, unstable3, []byte("WORLD!"))
+	if st != stOK || n != 6 || committed != unstable3 {
 		t.Fatalf("WRITE: %d count %d committed %d", st, n, committed)
 	}
 	if got, _ := os.ReadFile(fs.host("f")); string(got) != "hello WORLD!" {
 		t.Fatalf("file holds %q", got)
 	}
-	_, _, _, verf2 := c.write3(id, 0, 1, []byte("H"))
+	st, n, committed, verf2 := c.write3(id, 0, 1, []byte("H"))
+	if st != stOK || n != 1 || committed != fileSync3 {
+		t.Fatalf("DATA_SYNC WRITE: %d count %d committed %d", st, n, committed)
+	}
 	st, cverf := c.commit3(id)
 	if st != stOK || !bytes.Equal(verf, verf2) || !bytes.Equal(verf, cverf) {
 		t.Fatalf("verifiers differ: %x %x %x", verf, verf2, cverf)

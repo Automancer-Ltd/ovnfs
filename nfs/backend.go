@@ -16,6 +16,10 @@ type Backend interface {
 	// Link makes newname another name of the file oldname. Errors keep their
 	// errno (EXDEV, EMLINK, ENOTSUP, ...), which clients see as statuses.
 	Link(oldname, newname string) error
+	// SyncFile commits the data and metadata of the regular file named by
+	// (id, gen). p is its last resolved path. writer, when non-nil, is an
+	// open descriptor the caller holds for the duration of the call.
+	SyncFile(p string, id, gen uint64, writer billy.File) error
 	// FileID returns the id of the entry at p, Lstating it; 0 when p does not
 	// exist or has no identity. File handles and fileids carry the id, so it
 	// must follow the entry across renames. Callers holding a FileInfo for p

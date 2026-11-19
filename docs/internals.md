@@ -390,10 +390,10 @@ copy atomically), and before
 `snap`, `fork`, `diff` and a planned stop, which therefore cost one host create
 per file written in the last 2 s; files deleted sooner never reach the disk.
 Directories, symlinks and whiteouts always live in the upper. A deleted name
-keeps its whiteout on disk until the new memory file at that name spills. With
-`--fsync` enabled, syncing a named memory file also spills and syncs it;
-the default leaves it in memory. NFS does not forward application fsync calls.
-This sync does not include the parent directory or snapshot data.
+keeps its whiteout on disk until the new memory file at that name spills.
+On FUSE, SMB and WinFsp a handle sync spills memory files only with `--fsync`.
+NFS stable writes and COMMIT spill and sync their file and its directory
+metadata regardless of the flag; unstable writes can stay in memory.
 
 When a file's write to disk fails (a full disk, say), the file stays in memory
 and the daemon retries it every second. While any file waits, new files go to

@@ -29,6 +29,13 @@ const (
 	Stale  uint32 = 70
 )
 
+// Stability levels for NFSv3 WRITE.
+const (
+	Unstable uint32 = iota
+	DataSync
+	FileSync
+)
+
 // Client is an unprivileged TCP RPC client and its mounted export root handle.
 // The helpers return the wire status unchanged; err describes only RPC or XDR failures.
 type Client struct {
@@ -149,14 +156,15 @@ func (c *Client) Read(handle []byte, offset uint64, count uint32) ([]byte, bool,
 	return result.Data, result.EOF, status, err
 }
 
-// Write issues a FILE_SYNC write and returns the server's accepted byte count.
-func (c *Client) Write(handle []byte, offset uint64, data []byte) (uint32, uint32, error) {
+// Write issues WRITE at the requested stability and returns the count and
+// stability level acknowledged by the server.
+func (c *Client) Write(handle []byte, offset uint64, data []byte, stable uint32) (count, committed, status uint32, err error) {
 	args := struct {
 		Handle        []byte
 		Offset        uint64
 		Count, Stable uint32
 		Data          []byte
-	}{handle, offset, uint32(len(data)), 2, data}
+	}{handle, offset, uint32(len(data)), stable, data}
 	r, status, err := c.call(client.Nfs3Prog, client.NFSProc3Write, args)
 	var result struct {
 		Wcc              client.WccData
@@ -166,7 +174,25 @@ func (c *Client) Write(handle []byte, offset uint64, data []byte) (uint32, uint3
 	if err == nil && status == OK {
 		err = xdr.Read(r, &result)
 	}
-	return result.Count, status, err
+	return result.Count, result.Committed, status, err
+}
+
+// Commit flushes all buffered writes for handle.
+func (c *Client) Commit(handle []byte) (uint32, error) {
+	args := struct {
+		Handle []byte
+		Offset uint64
+		Count  uint32
+	}{Handle: handle}
+	r, status, err := c.call(client.Nfs3Prog, client.NFSProc3Commit, args)
+	if err == nil && status == OK {
+		var result struct {
+			Wcc      client.WccData
+			Verifier uint64
+		}
+		err = xdr.Read(r, &result)
+	}
+	return status, err
 }
 
 // modeAttrs sets only the requested permission bits, leaving ownership and times unchanged.

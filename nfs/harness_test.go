@@ -2,6 +2,7 @@ package nfs
 
 import (
 	"bufio"
+	"errors"
 	"net"
 	"os"
 	"path"
@@ -9,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -93,6 +95,24 @@ func (f *testFS) Path(id, gen uint64) (string, bool) {
 	defer f.mu.Unlock()
 	p, ok := f.paths[id]
 	return p, ok && f.gens[id] == gen
+}
+
+func (f *testFS) SyncFile(p string, id, gen uint64, writer billy.File) error {
+	current, ok := f.Path(id, gen)
+	if !ok || current != p {
+		return syscall.ESTALE
+	}
+	if w, ok := writer.(interface{ Sync() error }); ok {
+		return w.Sync()
+	}
+	fd, err := os.OpenFile(f.host(p), os.O_WRONLY, 0)
+	if errors.Is(err, os.ErrPermission) {
+		fd, err = os.Open(f.host(p))
+	}
+	if err != nil {
+		return err
+	}
+	return errors.Join(fd.Sync(), fd.Close())
 }
 
 // RetireHandle bumps id's generation, keeping its path and fileid.

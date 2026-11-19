@@ -189,11 +189,15 @@ func v4Read(id v4StateID, offset uint64, count uint32) v4op {
 }
 
 func v4Write(id v4StateID, offset uint64, data string) v4op {
+	return v4WriteHow(id, offset, data, stable4FileSync)
+}
+
+func v4WriteHow(id v4StateID, offset uint64, data string, stable uint32) v4op {
 	return func(e *encoder) {
 		e.u32(op4Write)
 		putStateID4(e, id)
 		e.u64(offset)
-		e.u32(stable4FileSync)
+		e.u32(stable)
 		e.opaque([]byte(data))
 	}
 }

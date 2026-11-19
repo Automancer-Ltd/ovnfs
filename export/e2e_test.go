@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -115,10 +116,10 @@ func nfsRead(t *testing.T, c *nfstest.Client, fh []byte, want string) {
 // nfsWrite requires a full stable write.
 func nfsWrite(t *testing.T, c *nfstest.Client, fh []byte, data string) {
 	t.Helper()
-	n, status, err := c.Write(fh, 0, []byte(data))
+	n, committed, status, err := c.Write(fh, 0, []byte(data), nfstest.FileSync)
 	nfsStatus(t, status, nfstest.OK, err)
-	if n != uint32(len(data)) {
-		t.Fatalf("WRITE accepted %d of %d bytes", n, len(data))
+	if n != uint32(len(data)) || committed != nfstest.FileSync {
+		t.Fatalf("WRITE accepted %d of %d bytes at stability %d", n, len(data), committed)
 	}
 }
 
@@ -297,6 +298,108 @@ func TestNFSForkIsolation(t *testing.T) {
 	nfsStatus(t, status, nfstest.NoEnt, err)
 }
 
+// TestNFSWriteDurability checks the disk view before shutdown or idle spill:
+// stable writes persist by themselves; buffered writes wait for COMMIT.
+func TestNFSWriteDurability(t *testing.T) {
+	f := newStack(t, map[string]string{"nested/base": "lower"})
+	f.create(t, "co")
+	c := nfstest.Start(t, f.export.NFS())
+	dir := lookup(t, c, "co/nested")
+	var session checkout.Session
+	if err := f.reg.Enter("co", &session); err != nil {
+		t.Fatal(err)
+	}
+	upper := filepath.Join(session.FS.Upper(), "nested")
+	session.Done()
+
+	create := func(name string) []byte {
+		t.Helper()
+		fh, status, err := c.Create(dir, name, 0644)
+		nfsStatus(t, status, nfstest.OK, err)
+		return fh
+	}
+	checkDisk := func(name, want string) {
+		t.Helper()
+		got, err := os.ReadFile(filepath.Join(upper, name))
+		if err != nil || string(got) != want {
+			t.Fatalf("disk %s = %q, %v; want %q", name, got, err, want)
+		}
+	}
+	checkBuffered := func(name string) {
+		t.Helper()
+		if _, err := os.Stat(filepath.Join(upper, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s reached disk before COMMIT: %v", name, err)
+		}
+	}
+
+	buffered := create("buffered")
+	n, committed, status, err := c.Write(buffered, 0, []byte("pending"), nfstest.Unstable)
+	nfsStatus(t, status, nfstest.OK, err)
+	if n != 7 || committed != nfstest.Unstable {
+		t.Fatalf("buffered WRITE = %d bytes, stability %d", n, committed)
+	}
+	for _, tc := range []struct {
+		name string
+		how  uint32
+	}{{"data-sync", nfstest.DataSync}, {"file-sync", nfstest.FileSync}} {
+		n, committed, status, err := c.Write(create(tc.name), 0, []byte(tc.name), tc.how)
+		nfsStatus(t, status, nfstest.OK, err)
+		if n != uint32(len(tc.name)) || committed != nfstest.FileSync {
+			t.Fatalf("%s WRITE = %d bytes, stability %d", tc.name, n, committed)
+		}
+		checkDisk(tc.name, tc.name)
+	}
+	checkBuffered("buffered") // A stable WRITE must not flush the whole upper.
+
+	// Renaming bypasses the writer cached at the old path. COMMIT must still
+	// resolve this handle and spill only its current name.
+	status, err = c.Rename(dir, "buffered", dir, "moved")
+	nfsStatus(t, status, nfstest.OK, err)
+	checkBuffered("moved")
+	status, err = c.Commit(buffered)
+	nfsStatus(t, status, nfstest.OK, err)
+	checkDisk("moved", "pending")
+}
+
+func TestNFSWriteDurabilityFailure(t *testing.T) {
+	f := newStack(t, nil)
+	f.create(t, "co")
+	c := nfstest.Start(t, f.export.NFS())
+	fh, status, err := c.Create(lookup(t, c, "co"), "file", 0644)
+	nfsStatus(t, status, nfstest.OK, err)
+
+	var session checkout.Session
+	if err := f.reg.Enter("co", &session); err != nil {
+		t.Fatal(err)
+	}
+	upper := session.FS.Upper()
+	session.Done()
+	work := filepath.Join(upper, ".wh..wh.work")
+	if err := os.Rename(work, work+".saved"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := os.Stat(work + ".saved"); err == nil {
+			_ = os.Rename(work+".saved", work)
+		}
+	})
+	_, _, status, err = c.Write(fh, 0, []byte("retry"), nfstest.FileSync)
+	nfsStatus(t, status, nfstest.NoEnt, err)
+	status, err = c.Commit(fh)
+	nfsStatus(t, status, nfstest.NoEnt, err)
+	nfsRead(t, c, fh, "retry")
+
+	if err := os.Rename(work+".saved", work); err != nil {
+		t.Fatal(err)
+	}
+	status, err = c.Commit(fh)
+	nfsStatus(t, status, nfstest.OK, err)
+	got, err := os.ReadFile(filepath.Join(upper, "file"))
+	if err != nil || string(got) != "retry" {
+		t.Fatalf("disk after COMMIT retry = %q, %v", got, err)
+	}
+}
+
 // TestNFSCachedWrites checks retained writers across rename, freeze and replacement.
 func TestNFSCachedWrites(t *testing.T) {
 	for _, mode := range []string{"memory", "disk"} {
@@ -310,10 +413,18 @@ func TestNFSCachedWrites(t *testing.T) {
 			c := nfstest.Start(t, f.export.NFS())
 			parent := lookup(t, c, "parent")
 			file := lookup(t, c, "parent/dir/file")
-			nfsWrite(t, c, file, "cached")
+			buffer := func(data string) {
+				t.Helper()
+				n, committed, status, err := c.Write(file, 0, []byte(data), nfstest.Unstable)
+				nfsStatus(t, status, nfstest.OK, err)
+				if n != uint32(len(data)) || committed != nfstest.Unstable {
+					t.Fatalf("buffered WRITE = %d bytes, stability %d", n, committed)
+				}
+			}
+			buffer("cached")
 			status, err := c.Rename(parent, "dir", parent, "moved")
 			nfsStatus(t, status, nfstest.OK, err)
-			nfsWrite(t, c, file, "rename")
+			buffer("rename")
 			if _, err := f.reg.Fork(t.Context(), api.ForkArgs{Checkout: "parent", Name: "child"}); err != nil {
 				t.Fatal(err)
 			}
@@ -325,7 +436,7 @@ func TestNFSCachedWrites(t *testing.T) {
 			replacement := nfsCreate(t, c, moved, "replacement", "newone")
 			status, err = c.Rename(moved, "replacement", moved, "file")
 			nfsStatus(t, status, nfstest.OK, err)
-			_, status, err = c.Write(file, 0, []byte("stale!"))
+			_, _, status, err = c.Write(file, 0, []byte("stale!"), nfstest.FileSync)
 			nfsStatus(t, status, nfstest.Stale, err)
 			nfsWrite(t, c, replacement, "latest")
 			nfsRead(t, c, lookup(t, c, "parent/moved/file"), "latest")

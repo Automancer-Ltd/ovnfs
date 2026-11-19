@@ -12,7 +12,7 @@ import (
 )
 
 // TestV4ReadWriteCommit checks the READ, WRITE and COMMIT result layouts:
-// READ's eof, WRITE's count, FILE_SYNC and the instance's verifier.
+// READ's eof, WRITE's count and stability, and the instance's verifier.
 func TestV4ReadWriteCommit(t *testing.T) {
 	fs := newTestFS(t)
 	if err := os.Mkdir(fs.host("d"), 0o755); err != nil {
@@ -26,14 +26,18 @@ func TestV4ReadWriteCommit(t *testing.T) {
 	c.setup(srv, "c", nil)
 	o := c.mustOpen("o", "f", share4AccessAll, true)
 
-	r := c.run(v4Root(), v4Look("f"), v4Write(o.id, 0, "hello"), v4Commit())
+	r := c.run(v4Root(), v4Look("f"), v4WriteHow(o.id, 0, "he", stable4Unstable), v4Commit(), v4Write(o.id, 2, "llo"))
 	r.skip(op4PutRootFH, op4Lookup)
 	d := r.next(op4Write, stOK)
-	if n, committed, verf := d.u32(), d.u32(), d.fixed(8); n != 5 || committed != stable4FileSync || string(verf) != string(srv.verf[:]) {
+	if n, committed, verf := d.u32(), d.u32(), d.fixed(8); n != 2 || committed != stable4Unstable || string(verf) != string(srv.verf[:]) {
 		t.Fatalf("WRITE count %d committed %d verf %x", n, committed, verf)
 	}
 	if verf := r.next(op4Commit, stOK).fixed(8); string(verf) != string(srv.verf[:]) {
 		t.Fatalf("COMMIT verf %x", verf)
+	}
+	d = r.next(op4Write, stOK)
+	if n, committed, verf := d.u32(), d.u32(), d.fixed(8); n != 3 || committed != stable4FileSync || string(verf) != string(srv.verf[:]) {
+		t.Fatalf("stable WRITE count %d committed %d verf %x", n, committed, verf)
 	}
 	r.end()
 

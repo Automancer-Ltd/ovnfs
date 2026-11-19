@@ -2,8 +2,11 @@ package export
 
 import (
 	"os"
+	"syscall"
 	"time"
 
+	"github.com/go-git/go-billy/v5"
+	"github.com/stencil-hq/ovnfs/checkout"
 	"github.com/stencil-hq/ovnfs/nfs"
 	"github.com/stencil-hq/ovnfs/overlay"
 )
@@ -43,6 +46,47 @@ func (n *nfsFS) Path(id, gen uint64) (string, bool) {
 		return "", false
 	}
 	return p, true
+}
+
+// SyncFile commits a handle in its current checkout generation. A writer
+// kept across a freeze may be closed; sync the current backing without
+// reopening that writer, which would copy it into the new upper.
+func (n *nfsFS) SyncFile(p string, id, gen uint64, writer billy.File) error {
+	slot, entry := splitFileID(id)
+	if slot == 0 {
+		switch id {
+		case rootID:
+			return syscall.EISDIR
+		case markerID:
+			return nil
+		default:
+			return syscall.ESTALE
+		}
+	}
+	var s checkout.Session
+	rf, _ := writer.(*routerFile)
+	if rf != nil {
+		// Match routerFile.current's lock order.
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if rf.closed || rf.life.retired.Load() || rf.identity != entry {
+			return syscall.ESTALE
+		}
+	}
+	co, life, err := n.rt.reg.EnterSlot(slot, &s)
+	if err != nil {
+		return syscall.ESTALE
+	}
+	defer s.Done()
+	name, rel := splitRouterPath(p)
+	if co != name || gen != uint64(life)<<32|uint64(n.handles.get(id)) {
+		return syscall.ESTALE
+	}
+	var opened billy.File
+	if rf != nil && rf.gen == s.Gen {
+		opened = rf.file
+	}
+	return s.FS.SyncFile(rel, entry, opened)
 }
 
 // RetireHandle makes id's existing NFS handles stale while its path keeps
