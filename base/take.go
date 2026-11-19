@@ -33,6 +33,7 @@ type takeView struct {
 	files   map[string]store.File
 	info    map[string]source.Info
 	dirs    map[string]bool
+	ignores map[string]store.OID
 	store   *store.Store
 	domains *source.Domains
 	objects map[*git.Repo]*git.Objects
@@ -58,12 +59,15 @@ func (v *takeView) Lstat(p string) (os.FileInfo, error) {
 }
 
 func (v *takeView) ReadFile(p string) ([]byte, error) {
-	f, ok := v.files[p]
-	if !ok {
+	id := v.files[p].ID
+	if id == "" {
+		id = v.ignores[p]
+	}
+	if id == "" {
 		return nil, os.ErrNotExist
 	}
-	if v.store.Has(f.ID) {
-		return v.store.ReadBlob(f.ID)
+	if v.store.Has(id) {
+		return v.store.ReadBlob(id)
 	}
 	repo := v.domains.RepoOf(p)
 	if repo == nil {
@@ -78,17 +82,17 @@ func (v *takeView) ReadFile(p string) ([]byte, error) {
 		}
 		v.objects[repo] = objects
 	}
-	return objects.Blob(string(f.ID))
+	return objects.Blob(string(id))
 }
 
-func takeCapture(ctx context.Context, c Config, set rules.Set, res *source.Result, work source.Result, takes []Take, fork time.Time) error {
+func takeCapture(ctx context.Context, c Config, set rules.Set, res *source.Result, work source.Result, takes []Take, ignores map[string]store.OID, fork time.Time) error {
 	if len(takes) == 0 {
 		return nil
 	}
 	// Freeze classification and the working-tree source before any ordered substitutions.
 	files := make(map[string]store.File, len(res.Files))
 	info := make(map[string]source.Info, len(res.Info))
-	view := &takeView{Dir: source.Dir(res.Root), files: res.Files, info: res.Info, dirs: map[string]bool{}, store: c.Store, domains: res.Domains, objects: map[*git.Repo]*git.Objects{}}
+	view := &takeView{Dir: source.Dir(res.Root), files: res.Files, info: res.Info, dirs: map[string]bool{}, ignores: ignores, store: c.Store, domains: res.Domains, objects: map[*git.Repo]*git.Objects{}}
 	for p, f := range res.Files {
 		files[p] = f
 		for dir := path.Dir(p); dir != "." && !view.dirs[dir]; dir = path.Dir(dir) {

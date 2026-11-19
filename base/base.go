@@ -41,6 +41,8 @@ type Meta struct {
 	// it (CreateRevision). Its difference from the folder is what the checkout
 	// was opened to leave out, not what the folder changed since.
 	Chosen bool `json:"chosen,omitempty"`
+	// RevisionHidden records hidden roots and their rule positions in the frozen lock.
+	RevisionHidden map[string]int `json:"revision_hidden,omitempty"`
 }
 
 // Remote marks a base attached from another machine: there is no local folder,
@@ -107,11 +109,11 @@ func Create(ctx context.Context, c Config, o source.Options) (*Base, []string, e
 }
 
 // CreateRevision captures a folder but, when revision is set, serves the
-// revision's tracked tree and index instead. Only metadata changes: unchanged
-// paths still read the folder and other tracked content comes from git lazily.
-// Ordered takes replace only source paths and leave the captured index's
-// entries unchanged; a revision index carries stat data only where content is
-// still REV's.
+// revision's tracked tree projected through the hidden rules. Only metadata
+// changes: unchanged paths read the folder and other content comes from git
+// lazily. The index keeps REV's entries, marking hidden paths skip-worktree.
+// Takes replace only source paths; only paths still serving REV's content
+// contribute stat data to a revision index.
 func CreateRevision(ctx context.Context, c Config, o source.Options, revision *git.Revision, takes ...Take) (*Base, []string, error) {
 	fork := time.Now().UTC()
 	res, warnings, err := Capture(ctx, c, o)
@@ -119,16 +121,17 @@ func CreateRevision(ctx context.Context, c Config, o source.Options, revision *g
 		return nil, nil, err
 	}
 	work := res
+	var projection revisionProjection
 	if revision != nil {
-		if err := reviseCapture(ctx, c, &res, revision, fork); err != nil {
+		if projection, err = reviseCapture(ctx, c, &res, revision, o.Rules, fork, len(takes) != 0); err != nil {
 			return nil, nil, err
 		}
 	}
-	if err := takeCapture(ctx, c, o.Rules, &res, work, takes, fork); err != nil {
+	if err := takeCapture(ctx, c, o.Rules, &res, work, takes, projection.ignores, fork); err != nil {
 		return nil, nil, err
 	}
 	if revision != nil {
-		if err := seedRevisionIndex(ctx, c, res, revision, fork); err != nil {
+		if err := seedRevisionIndex(ctx, c, res, revision, projection.skipped, fork); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -136,7 +139,7 @@ func CreateRevision(ctx context.Context, c Config, o source.Options, revision *g
 		b, err := CreateCaptured(c, res, fork, res.ReuseKey())
 		return b, warnings, err
 	}
-	b, err := create(c, Meta{ID: c.ID, Dir: res.Root, ForkTime: fork, Tree: res.Tree, Chosen: true}, &res)
+	b, err := create(c, Meta{ID: c.ID, Dir: res.Root, ForkTime: fork, Tree: res.Tree, Chosen: true, RevisionHidden: projection.hidden}, &res)
 	return b, warnings, err
 }
 

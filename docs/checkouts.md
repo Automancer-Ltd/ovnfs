@@ -112,9 +112,15 @@ workspace, with a warning. Checkouts attached on another machine get none.
 branch name (including `refs/heads/NAME`) attaches HEAD to that branch; a
 commit, tag or `HEAD` detaches it. Untracked nonignored files disappear from
 the checkout, while ignored files and build directories remain available.
-Hidden paths stay absent, except files REV tracks.
-Ignore rules come from REV, not the folder's dirty `.gitignore` files. The
-source folder and its git state are never changed, except that LFS objects
+Hidden rules omit paths even when REV tracks them, using REV's path types and
+tracked status. Ignore rules come from REV, not the folder's dirty `.gitignore`
+files. The private Git index keeps hidden tracked entries with `skip-worktree`,
+so `git status` does not report them deleted and ordinary commits preserve them.
+This filters the initial checkout and its ovnfs base, not files a later
+`git switch` may check out. Git history still contains the hidden files;
+`hidden` is not an access-control mechanism.
+
+The source folder and its git state are never changed, except that LFS objects
 REV needs may be downloaded into the repository's LFS storage (see below).
 `--rev` cannot be combined
 with `--from SNAP`; it requires a repository and a revision resolving to a

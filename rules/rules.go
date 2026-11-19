@@ -156,12 +156,20 @@ type Set struct{ Rules []Rule }
 
 // Match returns the first rule matching p.
 func (s Set) Match(p string, f Facts) (Rule, bool) {
-	for _, r := range s.Rules {
-		if r.Matches(p, f) {
-			return r, true
-		}
+	if i := s.MatchIndex(p, f); i >= 0 {
+		return s.Rules[i], true
 	}
 	return Rule{}, false
+}
+
+// MatchIndex returns the position of the first matching rule, or -1.
+func (s Set) MatchIndex(p string, f Facts) int {
+	for i, r := range s.Rules {
+		if r.Matches(p, f) {
+			return i
+		}
+	}
+	return -1
 }
 
 // Decision is a path's class and the rule that decided it; At is the prefix
