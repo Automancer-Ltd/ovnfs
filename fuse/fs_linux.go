@@ -734,12 +734,19 @@ func (x *exportFS) ReadDir(_ <-chan struct{}, in *gofuse.ReadIn, out *gofuse.Dir
 	return x.readDir(in, out, false)
 }
 
-// ReadDirPlus lists names with attributes from the snapshot.
+// ReadDirPlus lists names from the snapshot with their attributes as they are
+// now (see readDir).
 func (x *exportFS) ReadDirPlus(_ <-chan struct{}, in *gofuse.ReadIn, out *gofuse.DirEntryList) gofuse.Status {
 	return x.readDir(in, out, true)
 }
 
 // readDir resumes the listing at the kernel's offset, refreshing it on rewind.
+// The snapshot keeps names and offsets stable; READDIRPLUS attributes are read
+// when the kernel asks, never from the snapshot. The kernel applies them as
+// newer than any write that finished before this request, so a size from the
+// snapshot (taken at opendir, before a write) would replace the writer's size
+// and its next read would come back empty or short (t20826). An entry gone
+// since the snapshot is listed by name only, with no attributes.
 func (x *exportFS) readDir(in *gofuse.ReadIn, out *gofuse.DirEntryList, plus bool) gofuse.Status {
 	d := x.dir(in.Fh)
 	if d == nil {
@@ -762,15 +769,17 @@ func (x *exportFS) readDir(in *gofuse.ReadIn, out *gofuse.DirEntryList, plus boo
 			}
 			continue
 		}
+		var now gofuse.EntryOut
+		fresh := e.info != nil && x.entry(path.Join(d.path, e.name), &now).Ok()
+		if fresh {
+			de.Ino, de.Mode = now.NodeId, now.Attr.Mode
+		}
 		eo := out.AddDirLookupEntry(de)
 		if eo == nil {
 			break
 		}
-		if e.info != nil {
-			eo.NodeId = e.ino
-			x.fill(&eo.Attr, e.ino, e.info)
-			eo.SetEntryTimeout(TTL)
-			eo.SetAttrTimeout(attrTTL(&eo.Attr))
+		if fresh {
+			*eo = now
 		}
 	}
 	return gofuse.OK
