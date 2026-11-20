@@ -117,13 +117,14 @@ func grepLine(w io.Writer, path string, line int, text string, match bool, patte
 }
 
 // globCmd lists matching paths, marking directories with a trailing slash.
+// Type is a pointer so that an omitted --type, nil, passes kong's enum check.
 type globCmd struct {
-	Pattern     string `arg:"" name:"PATTERN" help:"glob pattern"`
-	Target      string `arg:"" optional:"" name:"DIR|CHECKOUT" help:"folder or checkout to search (default .)" completion-predictor:"checkout"`
-	Anchored    bool   `name:"anchored" help:"match slash-free patterns at the root only"`
-	Type        string `name:"type" default:"" enum:"file,dir,symlink" help:"keep only file, dir, or symlink entries"`
-	Limit       int    `name:"limit" help:"return at most N matches (0: all)"`
-	SortByMtime bool   `name:"mtime" help:"newest first, with size and mtime"`
+	Pattern     string  `arg:"" name:"PATTERN" help:"glob pattern"`
+	Target      string  `arg:"" optional:"" name:"DIR|CHECKOUT" help:"folder or checkout to search (default .)" completion-predictor:"checkout"`
+	Anchored    bool    `name:"anchored" help:"match slash-free patterns at the root only"`
+	Type        *string `name:"type" enum:"file,dir,symlink" help:"keep only file, dir, or symlink entries"`
+	Limit       int     `name:"limit" help:"return at most N matches (0: all)"`
+	SortByMtime bool    `name:"mtime" help:"newest first, with size and mtime"`
 	searchFlags
 }
 
@@ -134,7 +135,10 @@ func (cmd *globCmd) Run(c *cli) error {
 	}
 	a := api.GlobArgs{
 		SearchArgs: search, Pattern: cmd.Pattern, Anchored: cmd.Anchored,
-		Type: cmd.Type, Limit: cmd.Limit, SortByMtime: cmd.SortByMtime,
+		Limit: cmd.Limit, SortByMtime: cmd.SortByMtime,
+	}
+	if cmd.Type != nil {
+		a.Type = *cmd.Type
 	}
 	r, err := call[api.GlobReply](c, "glob", a)
 	if err != nil || c.json {
