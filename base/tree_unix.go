@@ -54,13 +54,17 @@ func (t *tree) close() {
 
 // lstat describes slash path rel below the tree without following a final
 // symlink; its Sys is the *syscall.Stat_t whose inode is the State identity.
-func (t *tree) lstat(rel string) (os.FileInfo, error) {
+func (t *tree) lstat(rel string, l *locator) (os.FileInfo, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	if t.fd < 0 {
 		return nil, absent(rel)
 	}
-	return fsys.Lstatat(t.fd, rel)
+	info, err := fsys.Lstatat(t.fd, rel)
+	if err == nil && l != nil {
+		l.seen(info, rel)
+	}
+	return info, err
 }
 
 // openFile opens regular file rel below the tree for reading.

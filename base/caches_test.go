@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -364,6 +365,7 @@ func TestSnapshotWithoutFenceFileIsFencedWhenComplete(t *testing.T) {
 // its path.
 func TestBaseIdentities(t *testing.T) {
 	repo, dir := repository(t)
+	writeTestFile(t, filepath.Join(dir, ".env"), "local")
 	writeTestFile(t, filepath.Join(dir, "node_modules", "pkg", "index.js"), "v1")
 	b, _ := createTestBase(t, repo, nil)
 	c := b.TakeCaches("c1")
@@ -384,28 +386,47 @@ func TestBaseIdentities(t *testing.T) {
 			t.Errorf("locate %v = %q, %v; want %q", id, got, ok, p)
 		}
 	}
-	for _, p := range []string{"node_modules/pkg", "node_modules/pkg/index.js"} {
+	for _, p := range []string{".env", "node_modules/pkg", "node_modules/pkg/index.js"} {
+		// Query the ID from the listing first, as WinFsp does. It must
+		// resolve before a client makes a separate lookup of the name.
+		entries, err := view.ReadDir(path.Dir(p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := path.Base(p)
+		at := slices.IndexFunc(entries, func(info os.FileInfo) bool { return info.Name() == name })
+		if at < 0 {
+			t.Fatalf("missing %s in listing", p)
+		}
+		listed, ok := ident.Of(entries[at])
+		if !ok {
+			t.Fatalf("listed %s has no identity", p)
+		}
+		if got, ok := view.Locate(listed); !ok || got != p {
+			t.Fatalf("listed %s resolves to %q, %v", p, got, ok)
+		}
 		info, err := view.Lstat(p)
 		if err != nil {
 			t.Fatal(err)
 		}
-		host, err := os.Lstat(filepath.Join(dir, filepath.FromSlash(p)))
+		root := dir
+		if p == ".env" {
+			root = c.tree
+		}
+		host, err := os.Lstat(filepath.Join(root, filepath.FromSlash(p)))
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, ino, err := fileIdentity(host, dir, p)
+		_, ino, err := fileIdentity(host, root, p)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if runtime.GOOS == "windows" {
+			ino = ident.NTFSRecord(ino)
 		}
 		want, fits := ident.New(ident.State, ino)
-		if id, ok := ident.Of(info); fits && (!ok || id != want) {
-			t.Errorf("%s: identity %v, %v; want the folder inode's State identity %v", p, id, ok, want)
-		}
-		// Windows frontends name files by path: nothing locates an inode there.
-		if runtime.GOOS != "windows" {
-			if got, ok := view.Locate(want); !ok || got != p {
-				t.Errorf("locate %s = %q, %v", p, got, ok)
-			}
+		if id, ok := ident.Of(info); !fits || !ok || id != want || listed != want {
+			t.Errorf("%s: lookup %v, listing %v, want State identity %v", p, id, listed, want)
 		}
 	}
 	hidden, _ := ident.New(ident.Capture, uint64(b.index.nodes))

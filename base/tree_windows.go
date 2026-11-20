@@ -26,17 +26,17 @@ func (t *tree) open() error { return nil }
 func (t *tree) close() { t.closed.Store(true) }
 
 // lstat describes slash path rel below the tree without following a final
-// symlink or junction, with its State identity (see [stateInfo]).
-func (t *tree) lstat(rel string) (os.FileInfo, error) {
+// symlink or junction. Entries exposed to clients use l for their State identity.
+func (t *tree) lstat(rel string, l *locator) (os.FileInfo, error) {
 	if t.closed.Load() {
 		return nil, absent(rel)
 	}
 	host := t.path(rel)
 	info, err := hostfile.Lstat(host)
-	if err != nil {
-		return nil, err
+	if err == nil && l != nil {
+		info = l.lookupInfo(info, host, rel)
 	}
-	return stateInfo(info, host), nil
+	return info, err
 }
 
 // openFile opens regular file rel below the tree for reading.

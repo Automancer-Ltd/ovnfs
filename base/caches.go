@@ -438,11 +438,7 @@ func (c *Caches) lstat(p, root string, n uint32, listing bool) (os.FileInfo, err
 	if p != root && (!r.Mode.IsDir() || !c.dirsBelow(root, p)) {
 		return nil, absent(p)
 	}
-	info, err := c.files.lstat(p)
-	if err == nil {
-		c.locator.seen(info, p)
-	}
-	return info, err
+	return c.files.lstat(p, &c.locator)
 }
 
 // list returns the entries of snapshot directory p, once complete.
@@ -460,8 +456,7 @@ func (c *Caches) list(p string) ([]os.FileInfo, error) {
 			return nil, err
 		}
 		host := filepath.Join(dir, e.Name())
-		out = append(out, stateInfo(hostfile.Linked(info, host), host))
-		c.locator.listed(info, p)
+		out = append(out, c.locator.listedInfo(hostfile.Linked(info, host), host, p))
 	}
 	return out, nil
 }
@@ -479,7 +474,7 @@ func (c *Caches) dirsBelow(root, p string) bool {
 	}
 	c.proofsMu.Unlock()
 	for _, dir := range unproven {
-		if info, err := c.files.lstat(dir); err != nil || !info.IsDir() {
+		if info, err := c.files.lstat(dir, nil); err != nil || !info.IsDir() {
 			return false
 		}
 	}

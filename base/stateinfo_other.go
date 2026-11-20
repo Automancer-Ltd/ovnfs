@@ -4,7 +4,14 @@ package base
 
 import "os"
 
-// stateInfo returns the metadata of host, a file on the state volume serving
-// an entry below a root, as served: its native stat already carries the inode
-// that is its State identity.
-func stateInfo(info os.FileInfo, _ string) os.FileInfo { return info }
+// lookupInfo and listedInfo return the native stat, which carries a State
+// entry's inode, remembering its view path where needed for Locate.
+func (l *locator) lookupInfo(info os.FileInfo, _, p string) os.FileInfo {
+	l.seen(info, p)
+	return info
+}
+
+func (l *locator) listedInfo(info os.FileInfo, _, dir string) os.FileInfo {
+	l.listed(info, dir)
+	return info
+}

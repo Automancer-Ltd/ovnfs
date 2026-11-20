@@ -9,17 +9,13 @@ import (
 	"io/fs"
 	"os"
 
+	"github.com/stencil-hq/ovnfs/internal/ident"
 	"golang.org/x/sys/windows"
 )
 
 // nativeIdentity: Windows file information carries no file index, so every
 // host file's metadata is an [idInfo].
 const nativeIdentity = false
-
-// fileIndexBits keeps an NTFS file index's record number, dropping the
-// sequence number in its top 16 bits: a reused record then reads as a reused
-// inode does on Unix, and the value fits an identity.
-const fileIndexBits = 48
 
 // nativeKey finds no inode in Windows file information; [describe] queries it.
 func nativeKey(os.FileInfo) (inodeKey, bool) { return inodeKey{}, false }
@@ -47,7 +43,7 @@ func fileKey(name string, _ os.FileInfo) (inodeKey, error) {
 }
 
 // stateValue is the [ident.State] value of a file: its record number.
-func stateValue(key inodeKey) uint64 { return key.inode & (1<<fileIndexBits - 1) }
+func stateValue(key inodeKey) uint64 { return ident.NTFSRecord(key.inode) }
 
 // reusesInodes reports true: NTFS and ReFS reuse file records, whose
 // sequence numbers [stateValue] drops.

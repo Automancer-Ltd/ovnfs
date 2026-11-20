@@ -363,9 +363,10 @@ and cache roots are empty directories elsewhere. A reused inode number
 cannot name two entries: its new holder was made after the fence, which
 hides it (a directory, where the filesystem records birth times). `Locate`
 maps an identity back to its path with `fsgetpath(2)` on
-macOS. Linux has no such call: there a snapshot remembers the paths of the
-last 32,768 identities it handed out, and one it forgot is stale to the
-kernel, which looks the name up again. Windows frontends name files by path.
+macOS. On Linux and Windows a snapshot remembers paths in a bounded table
+of 32,768 slots and rechecks a path before returning it. On Windows a local
+or cache entry's State identity uses the NTFS record number, without the
+file reference's sequence bits. WinFsp uses it to resolve open directories.
 
 Two names of one folder file, as cargo links an artifact into `deps/` and
 beside it, share that identity, where a clone gave each name a file of its

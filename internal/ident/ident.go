@@ -59,6 +59,12 @@ func New(s Space, v uint64) (ID, bool) {
 	return ID(uint64(s)<<ValueBits | v), true
 }
 
+// NTFSRecord is the file record number of an NTFS file reference. Its high
+// 16 bits identify the incarnation of that record, not a different record.
+// Only the record number is a State identity's value; callers comparing
+// host files for replacement must still compare the full reference.
+func NTFSRecord(ref uint64) uint64 { return ref & (1<<48 - 1) }
+
 // Space returns the identity's space; [None] for the zero ID.
 func (id ID) Space() Space { return Space(id >> ValueBits) }
 

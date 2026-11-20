@@ -144,8 +144,7 @@ func (v bottom) fenced(p, root string, n uint32) (entry, error) {
 	if p == root {
 		e.info = hostInfo{FileInfo: info, id: captureID(n)}
 	} else {
-		e.info = stateInfo(info, host)
-		v.c.locator.seen(info, p)
+		e.info = v.c.locator.lookupInfo(info, host, p)
 	}
 	return e, nil
 }
@@ -179,8 +178,7 @@ func (v bottom) fencedDir(p string) ([]os.FileInfo, error) {
 			host = filepath.Join(dir, e.Name())
 		}
 		if info = hostfile.Linked(info, host); f.shows(host, info) {
-			out = append(out, stateInfo(info, host))
-			v.c.locator.listed(info, p)
+			out = append(out, v.c.locator.listedInfo(info, host, p))
 		}
 	}
 	return out, nil

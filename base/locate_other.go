@@ -1,11 +1,10 @@
-//go:build !darwin && !linux
+//go:build !darwin && !linux && !windows
 
 package base
 
 import "os"
 
-// locator is empty: Windows frontends name files by path, and the file index
-// that would identify a snapshot's entry costs an open to read.
+// locator is empty on hosts with no State identity resolver.
 type locator struct{}
 
 // seen remembers nothing: see [locator].
