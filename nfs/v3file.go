@@ -157,8 +157,9 @@ func (s *Server) access3(d *decoder, res *encoder) status {
 	if err != nil {
 		return statusOf(err)
 	}
+	_, granted := accessOf(info, mask)
 	res.bool(false) // obj_attributes
-	res.u32(accessOf(info.Mode(), mask))
+	res.u32(granted)
 	return stOK
 }
 

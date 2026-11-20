@@ -26,8 +26,12 @@ Changes to a directory's entries are serialized per directory, so each reply
 carries the directory's attributes from just before the change: the macOS
 client keeps its name cache of a directory, negative entries included, only
 when they match what it last saw, and otherwise purged it after each of its
-own creates. LOOKUP and ACCESS replies leave out the attributes NFSv3 makes
-optional there (the directory's, the file's), which cost a host stat each.
+own creates. LOOKUP and ACCESS replies leave out their optional NFSv3
+attributes. Both NFS versions answer ACCESS from the object's current mode
+for the daemon's effective user and groups. A directory's execute bit permits
+lookup; changing entries needs write and lookup. This is a mode check, not
+an ACL check or authentication of the RPC caller. The backend enforces its
+own restrictions when the client performs an operation.
 After creating or removing a checkout the daemon `statfs`es its own mount,
 making the client revalidate the export root so new checkouts show up
 immediately. After changing a checkout's files itself (`pull`), it `chmod`s

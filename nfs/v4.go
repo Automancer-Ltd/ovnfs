@@ -497,7 +497,7 @@ func (x *v4compound) lookupp() status {
 }
 
 // access answers ACCESS with the rights the current file's mode permits
-// (accessOf). supported is every bit this server can grant.
+// (accessOf). Both result masks are subsets of the request.
 func (x *v4compound) access() status {
 	want := x.d.u32()
 	if x.d.err != nil {
@@ -511,8 +511,9 @@ func (x *v4compound) access() status {
 	if err != nil {
 		return statusOf(err)
 	}
-	x.e.u32(access4All)
-	x.e.u32(accessOf(info.Mode(), want))
+	supported, granted := accessOf(info, want)
+	x.e.u32(supported)
+	x.e.u32(granted)
 	return stOK
 }
 

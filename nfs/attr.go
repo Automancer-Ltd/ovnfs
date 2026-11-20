@@ -3,6 +3,8 @@ package nfs
 import (
 	"encoding/binary"
 	"os"
+	"slices"
+	"sync"
 	"time"
 
 	"github.com/stencil-hq/ovnfs/internal/unixstat"
@@ -140,29 +142,69 @@ func goMode(v uint32) os.FileMode {
 	return m
 }
 
-// accessOf returns the ACCESS bits (RFC 1813 section 3.3.4, RFC 7530
-// section 16.1) the file's mode permits, of those asked for in want.
-// Credentials are not checked; the bits follow the permission GETATTR
-// already reports. LOOKUP and DELETE apply only to directories.
-func accessOf(mode os.FileMode, want uint32) uint32 {
-	perm := mode.Perm()
-	var have uint32
-	if perm&0o444 != 0 {
-		have |= access4Read
+// ACCESS is advisory, not RPC authorization. Backend operations run as the
+// daemon, so select its permission class rather than combining classes.
+type accessIdentity struct {
+	uid, gid int
+	groups   []int
+}
+
+var daemonIdentity = sync.OnceValue(func() accessIdentity {
+	groups, _ := os.Getgroups()
+	return accessIdentity{os.Geteuid(), os.Getegid(), groups}
+})
+
+// permissions returns the daemon's rwx bits. Virtual files without POSIX
+// ownership use the owner bits, including read-only export-root entries.
+func (u accessIdentity) permissions(info os.FileInfo) os.FileMode {
+	mode := info.Mode()
+	st, ok := unixstat.Of(info)
+	switch {
+	case !ok || u.uid < 0:
+		return mode.Perm() >> 6
+	case u.uid == 0:
+		if mode.IsDir() || mode.Perm()&0o111 != 0 {
+			return 7
+		}
+		return 6
+	case st.UID == uint32(u.uid):
+		return mode.Perm() >> 6
+	case st.GID == uint32(u.gid) || slices.Contains(u.groups, int(st.GID)):
+		return mode >> 3 & 7
+	default:
+		return mode & 7
 	}
-	if perm&0o222 != 0 {
-		have |= access4Modify | access4Extend
-		if mode.IsDir() {
-			have |= access4Delete
+}
+
+// accessOf returns the requested, applicable rights (RFC 7530 §16.1)
+// and the subset permitted by the mode. Deleting a non-directory depends
+// on its parent, not this file handle.
+func accessOf(info os.FileInfo, want uint32) (supported, granted uint32) {
+	perm := daemonIdentity().permissions(info)
+	supported = access4Read | access4Modify | access4Extend
+	if perm&4 != 0 {
+		granted |= access4Read
+	}
+	if info.IsDir() {
+		supported |= access4Lookup | access4Delete
+		if perm&1 != 0 {
+			granted |= access4Lookup
+			if perm&2 != 0 {
+				granted |= access4Modify | access4Extend | access4Delete
+			}
+		}
+	} else {
+		if perm&2 != 0 {
+			granted |= access4Modify | access4Extend
+		}
+		if info.Mode().IsRegular() {
+			supported |= access4Execute
+			if perm&1 != 0 {
+				granted |= access4Execute
+			}
 		}
 	}
-	if perm&0o111 != 0 {
-		have |= access4Execute
-		if mode.IsDir() {
-			have |= access4Lookup
-		}
-	}
-	return have & want & access4All
+	return want & supported, want & granted
 }
 
 // fhSize is the length of every file handle this server issues: the file id,
