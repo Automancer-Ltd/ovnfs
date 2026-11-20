@@ -195,3 +195,59 @@ The default run, two binaries and three `io` rounds, takes about 25 seconds:
 go build -o /tmp/ovnfs-new .
 go run ./scripts/buildbench -ovnfs /tmp/ovnfs-old -ovnfs /tmp/ovnfs-new -project ~/src/some-crate -modes io,cargo -runs 5
 ```
+
+### Guest comparisons
+
+`scripts/guestbench` times the same workloads on one tree as a vibevmm guest
+reaches it four ways: `remotefs` (the VMM's remote-fs v1 virtio-fs device on
+an `ovnfs share` socket), `nfs3` and `nfs4` (the guest kernel's NFS client on
+the daemon's TCP port, through the VM's user-mode NAT) and `ext4` (the fixture
+unpacked on the guest's root disk, the ceiling the others are compared with).
+It starts a private daemon built from the working tree, opens one checkout of
+buildbench's fixture per config and boots one VM for each. Its runner,
+cross-built into a read-only share, is the guest's PID 1: it sets the clock
+from the host (a guest boots at the Unix epoch), mounts the tree and reports
+every phase on the console.
+
+The workloads are `net` (round-trip time and throughput of the VM's network,
+the floor under the NFS columns), `walk` (an lstat of every entry), `git`
+(`git status`, with the git directory on the guest's disk, since a checkout's
+`.git` names a host path), `rg`, `fio`, `small` (create, stat, rename and
+unlink 10,000 files), `replay` (buildbench's `io` phases) and `cargo`. A
+`.cold` phase remounts the tree and drops the guest's caches first. At every
+phase boundary the daemon's `calls` timers are sampled, so the report shows,
+beside each median and its ratio to ext4, the daemon calls per guest operation
+and their summed duration; `-out` saves every event.
+
+It needs vibevmm's `vmon` and guest kernel (`just release` and
+`just kernel --arch aarch64` in a vibevmm checkout) and a guest image from
+`scripts/guestbench/rootfs/build.sh`, which needs only docker. It runs on
+macOS hosts: vmon's user-mode network, which carries NFS and the calibration,
+exists only there. The default run, 50,000 bulk files and three rounds, takes
+about 40 minutes, most of it in the remote-fs column:
+
+```sh
+scripts/guestbench/rootfs/build.sh
+go run ./scripts/guestbench -vmon ~/src/vibevmm/target/release/vmon \
+    -kernel ~/src/vibevmm/target/kernel/Image-aarch64 \
+    -rootfs ~/.cache/ovnfs-guestbench/rootfs-aarch64.ext4 -out results.json
+```
+
+Two more configs are opt-in (`-configs kmod,erofs,nfs3,ext4`):
+
+- `kmod` reaches the tree through the kernel client: the daemon serves the
+  checkout with `ovnfs share NAME --rw --kernel`, vmon gets `--ovnfs SOCK`,
+  and the runner loads `ovnfs.ko` and mounts filesystem type `ovnfs`.
+  `kmod/build.sh` builds the module in docker against vibevmm's pinned guest
+  kernel (it needs the `vmon-kernel-build` image and the `vmon-kernel-cache`
+  volume that `just kernel` leaves behind) and checks its vermagic; `-ko FILE`
+  takes a prebuilt one. At the end of a run the module's own counters
+  (`/sys/kernel/debug/ovnfs/calls`: calls and nanoseconds per operation) and
+  the guest kernel's warnings are saved with the results.
+- `erofs` gives the guest an EROFS image of the tree as the lower of an
+  overlayfs whose upper is the guest's disk, so nothing but block reads leaves
+  the guest. The image is built with `mkfs.erofs` from the guest image's
+  docker image (`-mkfs-image`) and appended to the VM's private root disk.
+
+The numbers of the first run and the targets derived from them are in
+[kernel-client.md](kernel-client.md).

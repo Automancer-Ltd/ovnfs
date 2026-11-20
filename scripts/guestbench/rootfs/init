@@ -1,0 +1,25 @@
+#!/bin/sh
+# PID 1 of the guestbench guest: mount the pseudo filesystems and the read-only
+# "bench" share, then become the runner, which powers the VM off when done.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# fatal reports one failure on the console in the runner's event format and
+# powers the VM off, so the host never waits for a guest that cannot start.
+fatal() {
+	printf 'GUESTBENCH {"ev":"fatal","round":0,"msg":"init: %s"}\n' "$1"
+	poweroff -f 2>/dev/null || echo o >/proc/sysrq-trigger
+	while :; do sleep 1; done
+}
+
+# The kernel may already have mounted these; a repeat mount is harmless.
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sysfs /sys 2>/dev/null
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /run
+
+mount -t virtiofs -o ro bench /bench || fatal "mounting virtiofs tag bench failed"
+# "command" keeps a failed exec from terminating this shell, which as PID 1
+# would panic the kernel before fatal could print.
+command exec /bench/guest
+fatal "exec /bench/guest failed"
