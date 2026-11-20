@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -200,6 +201,80 @@ func TestCacheRootsOnAnotherVolume(t *testing.T) {
 	gone(t, view, "another volume", "node_modules/pkg", "node_modules/pkg/index.js")
 	if got := read(t, view, ".env"); got != "SECRET=1" {
 		t.Errorf("local root = %q, want a copy", got)
+	}
+}
+
+// An incomplete snapshot lists even non-directory roots while every directory
+// slot is busy. Either kind of shutdown releases its waiter without recording
+// a completed tree; a later open must copy the directory, not serve it empty.
+func TestLocalDirectoryTakeQueue(t *testing.T) {
+	repo, dir := repository(t)
+	writeTestFile(t, filepath.Join(dir, ".aws", "item"), "local")
+	writeTestFile(t, filepath.Join(dir, ".env"), "local file")
+	writeTestFile(t, filepath.Join(dir, "node_modules", "item"), "cache")
+
+	b, config := createTestBase(t, repo, nil)
+	other, _ := createTestBase(t, repo, nil)
+	stop := make(chan struct{})
+	other.config.StopTakes = stop
+	for range cap(takeSlots) {
+		takeSlots <- struct{}{}
+	}
+	release := sync.OnceFunc(func() {
+		for range cap(takeSlots) {
+			<-takeSlots
+		}
+	})
+	defer release()
+
+	promptly := func(what string, f func() error) {
+		t.Helper()
+		done := make(chan error, 1)
+		go func() { done <- f() }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("%s: %v", what, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s waited for a directory-copy slot", what)
+		}
+	}
+	c, second := b.OpenCaches("c1"), other.OpenCaches("c2")
+	promptly("parent listing", func() error {
+		infos, err := b.Bottom(c).ReadDir("")
+		if err != nil {
+			return err
+		}
+		for _, name := range []string{".aws", ".env", "node_modules"} {
+			if !slices.ContainsFunc(infos, func(i os.FileInfo) bool { return i.Name() == name }) {
+				return fmt.Errorf("missing %s", name)
+			}
+		}
+		return nil
+	})
+	promptly("second root listing", func() error { <-second.listed; return nil })
+	promptly("base close", b.Close)
+	close(stop)
+	promptly("registry stop", func() error { second.Wait(); return nil })
+	for _, take := range []*Caches{c, second} {
+		if _, err := os.Stat(filepath.Join(take.dir, rootsFile)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("queued snapshot marked complete: %v", err)
+		}
+	}
+
+	release()
+	reopened, err := Open(config, b.Meta())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	retaken := reopened.OpenCaches("c1")
+	if got := read(t, reopened.Bottom(retaken), ".aws/item"); got != "local" {
+		t.Errorf("retaken local directory: %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(retaken.tree, "node_modules")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a fenced cache root was copied: %v", err)
 	}
 }
 

@@ -48,6 +48,10 @@ const (
 	fenceFile = "fence"
 )
 
+// Directory copies share two slots across all bases. A snapshot with no
+// local directories never queues, no matter how many cache roots it fences.
+var takeSlots = make(chan struct{}, 2)
+
 // Caches is one cache snapshot of a local base: the copies of its local roots
 // and the fence of its cache roots, which the checkouts the registry opens on
 // it read instead of the folder as it is now (see [Base.Bottom]). The
@@ -289,12 +293,7 @@ func (c *Caches) take(b *Base) {
 		close(c.listed)
 	})
 	defer listed()
-	// Whatever an interrupted take of this id left goes; its fence stays.
-	stale := os.Remove(filepath.Join(c.dir, rootsFile))
-	if errors.Is(stale, os.ErrNotExist) {
-		stale = nil
-	}
-	if err := errors.Join(stale, os.RemoveAll(c.tree), os.MkdirAll(c.tree, 0o700), c.files.open()); err != nil {
+	if err := c.prepareTree(b); err != nil {
 		b.fault(fmt.Sprintf("cache snapshot %s: %v; local roots are missing", c.id, err))
 		return
 	}
@@ -315,8 +314,23 @@ func (c *Caches) take(b *Base) {
 		}
 	}
 	listed()
-	for _, p := range dirs {
-		c.copyRoot(b, p, roots[p])
+	if len(dirs) != 0 {
+		select {
+		case takeSlots <- struct{}{}:
+		case <-b.closing:
+			return
+		case <-b.config.StopTakes:
+			return
+		}
+		defer func() { <-takeSlots }()
+		for _, p := range dirs {
+			// Check again after admission: the slot and stop can be ready
+			// together. An unfinished take must not write rootsFile.
+			if b.stoppingTakes() {
+				return
+			}
+			c.copyRoot(b, p, roots[p])
+		}
 	}
 	data, err := json.Marshal(roots)
 	if err == nil {
@@ -328,6 +342,42 @@ func (c *Caches) take(b *Base) {
 	if err != nil {
 		b.fault(fmt.Sprintf("cache snapshot %s: %v; it is taken again at the next start", c.id, err))
 	}
+}
+
+// prepareTree replaces an interrupted take's tree without touching its new
+// fence. The registry moves the old tree to its trash instead of making
+// listings wait for a recursive deletion (possibly of a pre-fence snapshot).
+func (c *Caches) prepareTree(b *Base) error {
+	if err := os.Remove(filepath.Join(c.dir, rootsFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if _, err := os.Lstat(c.tree); err == nil {
+		if discard := b.config.DiscardTree; discard != nil {
+			err = discard(c.tree, "caches-"+c.id)
+		} else {
+			err = os.RemoveAll(c.tree)
+		}
+		if err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.MkdirAll(c.tree, 0o700); err != nil {
+		return err
+	}
+	return c.files.open()
+}
+
+// stoppingTakes reports whether this base or the entire registry is closing.
+func (b *Base) stoppingTakes() bool {
+	select {
+	case <-b.closing:
+	case <-b.config.StopTakes:
+	default:
+		return false
+	}
+	return true
 }
 
 // dirKind is what copyRoot needs of a root's metadata: whether it is a directory.
@@ -371,9 +421,9 @@ func (c *Caches) path(p string) string { return filepath.Join(c.tree, filepath.F
 // lstat serves p, at or below local root root (index node n), as the snapshot
 // holds it. A directory root presents the folder's metadata of when the
 // snapshot began and its Capture identity, so listing its parent never waits
-// for the copy; any other path waits until the snapshot is complete and
-// carries its own (State) identity.
-func (c *Caches) lstat(p, root string, n uint32) (os.FileInfo, error) {
+// for the copy. A parent listing can also describe an already copied file
+// root; accessing its content still waits for the snapshot to finish.
+func (c *Caches) lstat(p, root string, n uint32, listing bool) (os.FileInfo, error) {
 	<-c.listed
 	r, ok := c.roots[root]
 	if !ok {
@@ -382,7 +432,9 @@ func (c *Caches) lstat(p, root string, n uint32) (os.FileInfo, error) {
 	if p == root && r.Mode.IsDir() {
 		return capturedInfo{name: path.Base(p), mode: r.Mode, mtime: r.Mtime, id: captureID(n)}, nil
 	}
-	<-c.done
+	if !listing {
+		<-c.done
+	}
 	if p != root && (!r.Mode.IsDir() || !c.dirsBelow(root, p)) {
 		return nil, absent(p)
 	}

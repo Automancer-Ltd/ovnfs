@@ -81,6 +81,11 @@ type Config struct {
 	Mirror       Mirror          // remote bases only; nil reads everything through Fetch
 	Stats        *stats.Recorder // records how long cache snapshots take; nil records nothing
 	OnFault      func(msg string)
+	// StopTakes closes on registry shutdown, before its workers and bases are joined.
+	StopTakes <-chan struct{}
+	// DiscardTree moves an interrupted snapshot tree to the registry's trash.
+	// Without a trash collector, the base removes the tree itself.
+	DiscardTree func(path, label string) error
 }
 
 // Base serves one capture of a folder to every checkout opened on it.
@@ -97,6 +102,7 @@ type Base struct {
 	proofs     dirProofs // folder directories proven real, for lookups below cache roots
 	mu         sync.Mutex
 	caches     map[string]*Caches // mu: the cache snapshots served, by id
+	closing    chan struct{}      // closed before Close waits for active takes
 	closeOnce  sync.Once
 	closeErr   error
 	remote     *remoteState
@@ -262,7 +268,7 @@ func available(c Config, m Meta, repos []source.Repo) []source.Repo {
 // newBase serves an open capture index.
 func newBase(c Config, m Meta, x *captureIndex, stats api.Capture, domains *source.Domains) *Base {
 	m.ForkTime = m.ForkTime.UTC()
-	b := &Base{config: c, meta: m, index: x, stats: stats, domains: domains, objects: make(map[string]*git.Objects), cacheRoots: cacheRootsOf(x), caches: make(map[string]*Caches)}
+	b := &Base{config: c, meta: m, index: x, stats: stats, domains: domains, objects: make(map[string]*git.Objects), cacheRoots: cacheRootsOf(x), caches: make(map[string]*Caches), closing: make(chan struct{})}
 	if m.Remote != nil {
 		b.remote = &remoteState{b: b, prefetched: map[string]bool{}}
 	}
@@ -388,6 +394,7 @@ func (b *Base) Bottom(c *Caches) overlay.Bottom {
 // was, never unmapped memory.
 func (b *Base) Close() error {
 	b.closeOnce.Do(func() {
+		close(b.closing)
 		var errs []error
 		b.objectsMu.Lock()
 		for _, objects := range b.objects {

@@ -303,8 +303,12 @@ collection, and one on disk no checkout names by the next start.
 **Local roots are copied** below the base's `caches/<id>/tree/`, in the
 background: with `clonefile(2)` on APFS, a reflink per file where the volume
 has them, bytes elsewhere; first the roots that are no directory, then the
-directories. `roots.json`, written last, marks the snapshot complete; one a
-stop interrupted is taken again when its checkout reopens. A root directory
+directories. At most two snapshots copy local directories at once across the
+daemon. A snapshot without local directories needs no slot. A stop cancels
+queued copies and skips directories not yet started; an in-progress native
+copy finishes. `roots.json`, written last, marks the snapshot complete; one a
+stop interrupted is taken again when its checkout reopens. Its previous tree
+goes to the trash, not its newly recorded fence. A root directory
 presents the folder's metadata of when the snapshot began and its capture
 node's identity, so listing its parent waits only for the first step;
 anything below a local root waits for the copy, before the overlay takes its

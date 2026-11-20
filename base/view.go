@@ -120,7 +120,7 @@ func (v bottom) ReadDir(p string) ([]os.FileInfo, error) {
 			child = p + "/" + child
 		}
 		if x.kind(n) == kindNone {
-			if root, err := v.below(child, child, n, x.class(n)); err == nil {
+			if root, err := v.below(child, child, n, x.class(n), true); err == nil {
 				out = append(out, root.info)
 			}
 			continue
@@ -316,18 +316,18 @@ func (v bottom) resolve(p string) (entry, error) {
 		}
 		return entry{host: host, info: info, n: n}, nil
 	}
-	return v.below(p, root, n, class)
+	return v.below(p, root, n, class, false)
 }
 
 // below finds what serves p, at or below the root of class whose index node
 // is n: the cache snapshot's copy of a local root, the folder's entry its
 // fence shows of a cache root. A view without a snapshot, and a root of
 // another class, has nothing there.
-func (v bottom) below(p, root string, n uint32, class rules.Class) (entry, error) {
+func (v bottom) below(p, root string, n uint32, class rules.Class, listing bool) (entry, error) {
 	switch {
 	case v.c == nil:
 	case class == rules.Local:
-		info, err := v.c.lstat(p, root, n)
+		info, err := v.c.lstat(p, root, n, listing)
 		return entry{info: info, snapshot: true}, err
 	case class == rules.Cache:
 		return v.fenced(p, root, n)
