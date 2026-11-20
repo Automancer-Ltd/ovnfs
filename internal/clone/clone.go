@@ -81,9 +81,6 @@ type walk struct {
 	// copying is set once a clone was unsupported, so later files skip the
 	// attempt: the rest of the hierarchy is almost always on the same volume.
 	copying bool
-	// shared refuses byte copies: a file whose blocks cannot be shared stops
-	// the walk with errors.ErrUnsupported (see [Shared]).
-	shared bool
 }
 
 // tree copies the entry at src, described by info, to the new path dst.
@@ -139,7 +136,7 @@ func (w *walk) file(src, dst string, mode os.FileMode) error {
 	defer in.Close()
 	if !w.copying {
 		err := Reflink(in, dst, mode)
-		if !errors.Is(err, errors.ErrUnsupported) || w.shared {
+		if !errors.Is(err, errors.ErrUnsupported) {
 			return err
 		}
 		w.copying = true

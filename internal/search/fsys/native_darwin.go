@@ -559,6 +559,9 @@ func vtypeMode(vtype uint32) os.FileMode {
 // mtimeOf is st's modification time.
 func mtimeOf(st *syscall.Stat_t) time.Time { return time.Unix(st.Mtimespec.Sec, st.Mtimespec.Nsec) }
 
+// statChange is st's status change time in Unix nanoseconds.
+func statChange(st *syscall.Stat_t) int64 { return nanos(st.Ctimespec.Sec, st.Ctimespec.Nsec) }
+
 // fstatat is lstat (with flags AT_SYMLINK_NOFOLLOW) of cname, NUL-terminated,
 // relative to directory dir, into st.
 func fstatat(dir handle, cname []byte, st *syscall.Stat_t, flags uintptr) error {

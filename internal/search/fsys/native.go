@@ -50,6 +50,23 @@ type session struct {
 // buffers across calls.
 var readDirSessions = sync.Pool{New: func() any { return &session{fs: native} }}
 
+// FileChangeTime reads the change time of the open file, not of its current
+// name. Cache readers use it to reject host writes even if mtime was restored.
+func FileChangeTime(file *os.File) (int64, error) {
+	conn, err := file.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	var stamp Stamp
+	var statErr error
+	if err := conn.Control(func(fd uintptr) {
+		stamp, _, _, statErr = statHandle(handle(fd))
+	}); err != nil {
+		return 0, err
+	}
+	return stamp.Ctime, statErr
+}
+
 // ReadDir lists host directory path sorted by name with the native backend's
 // own listing, without following symlinks. Every entry is returned, special
 // files included, and its Info is complete [os.Lstat] data (the same Mode,

@@ -234,6 +234,9 @@ func mtimeOf(st *syscall.Stat_t) time.Time {
 	return time.Unix(int64(st.Mtim.Sec), int64(st.Mtim.Nsec))
 }
 
+// statChange is st's status change time in Unix nanoseconds.
+func statChange(st *syscall.Stat_t) int64 { return nanos(int64(st.Ctim.Sec), int64(st.Ctim.Nsec)) }
+
 // fstatat is unix.Fstatat on a NUL-terminated name without converting it to
 // a string, retrying EINTR.
 func fstatat(dir int, cname []byte, st *syscall.Stat_t, flags int) error {
