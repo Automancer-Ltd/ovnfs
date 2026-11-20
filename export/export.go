@@ -5,10 +5,11 @@ import "sync"
 // Export serves the checkouts of a Router to the file protocols, with file
 // ids that follow each entry for its whole life (see [Nodes]).
 type Export struct {
-	fs      *nodeFS
-	volume  string
-	rt      *Router
-	handles *handleGens
+	fs       *nodeFS
+	volume   string
+	rt       *Router
+	handles  *handleGens
+	watchers invalidations // see OnInvalidate
 }
 
 // New exports rt's checkouts; upperVolume is where overlay writes land,
@@ -18,7 +19,8 @@ func New(rt *Router, upperVolume string) *Export {
 }
 
 // Retire recalls clients' cached copies of checkout name, which held export
-// slot, and closes its retained files before the name can be reused. The
+// slot, closes its retained files before the name can be reused and tells
+// its OnInvalidate observers. The
 // registry calls it (checkout.Config.Retire) under its lock, so it must not
 // call back into the registry.
 func (e *Export) Retire(name string, slot uint16) {
@@ -27,6 +29,7 @@ func (e *Export) Retire(name string, slot uint16) {
 		(*fn)(Recall{First: first, Last: last, Path: name, Retired: true})
 	}
 	e.rt.retire(name)
+	e.watchers.notify(name)
 }
 
 // handleGens counts how often each file id's NFS handles were retired
