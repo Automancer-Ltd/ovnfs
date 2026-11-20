@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/stencil-hq/ovnfs/internal/ident"
+	"github.com/stencil-hq/ovnfs/internal/search/fsys"
 	"github.com/stencil-hq/ovnfs/overlay"
 )
 
@@ -384,6 +385,40 @@ func TestCachesAffectedBy(t *testing.T) {
 			t.Errorf("CachesAffectedBy(%q) = %v, want %v", p, got, want)
 		}
 	}
+}
+
+// BenchmarkCacheRootReadDir compares the cost of listing the same dependency
+// directory with native metadata alone and through the checkout's cache fence.
+func BenchmarkCacheRootReadDir(b *testing.B) {
+	repo, dir := repository(b)
+	const path = "target/debug/deps"
+	const count = 1024
+	dir = filepath.Join(dir, filepath.FromSlash(path))
+	for i := range count {
+		writeTestFile(b, filepath.Join(dir, fmt.Sprintf("libdependency-%05d.rmeta", i)), "x")
+	}
+	base, _ := createTestBase(b, repo, nil)
+	cache := base.TakeCaches("c1")
+	cache.Wait()
+	view := base.Bottom(cache)
+	b.Run("native", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			items, err := fsys.ReadDir(dir)
+			if err != nil || len(items) != count {
+				b.Fatalf("native listing: %d entries, %v", len(items), err)
+			}
+		}
+	})
+	b.Run("fenced", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			items, err := view.ReadDir(path)
+			if err != nil || len(items) != count {
+				b.Fatalf("fenced listing: %d entries, %v", len(items), err)
+			}
+		}
+	})
 }
 
 // BenchmarkCacheRootLstat measures Lstat of one entry below a cache root, in

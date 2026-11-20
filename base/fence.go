@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -170,10 +171,16 @@ func (v bottom) fencedDir(p string) ([]os.FileInfo, error) {
 			}
 			return nil, inView("readdir", p, err)
 		}
-		host := filepath.Join(dir, e.Name())
+		// Darwin's stat carries everything the fence and State identity
+		// need. Linux needs a path only for a directory's statx birth time;
+		// Windows needs it for junctions and deferred file identities.
+		var host string
+		if runtime.GOOS == "windows" || runtime.GOOS == "linux" && info.IsDir() {
+			host = filepath.Join(dir, e.Name())
+		}
 		if info = hostfile.Linked(info, host); f.shows(host, info) {
 			out = append(out, stateInfo(info, host))
-			v.c.locator.listed(info, p, e.Name())
+			v.c.locator.listed(info, p)
 		}
 	}
 	return out, nil

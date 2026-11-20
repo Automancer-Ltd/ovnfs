@@ -36,7 +36,7 @@ func (l *locator) seen(info os.FileInfo, p string) {
 
 // listed remembers nothing: fsgetpath finds a listed entry, and a listed
 // name of a file with several may be one the overlay shadows.
-func (*locator) listed(os.FileInfo, string, string) {}
+func (*locator) listed(os.FileInfo, string) {}
 
 // locate returns a view path of the entry with inode ino that the view
 // shows, as shown reports: a file of a local root, in the snapshot's tree, or

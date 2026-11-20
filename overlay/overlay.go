@@ -10,6 +10,7 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -497,13 +498,16 @@ func (f *FS) readDir(p string) ([]os.FileInfo, error) {
 				continue
 			}
 			ci := c.Info
-			if m := f.files[path.Join(p, n)]; upper && m != nil {
-				ci = m.info(n)
-			} else if upper {
-				var err error
-				ci, err = f.upperInfo(path.Join(p, n), c)
-				if err != nil {
-					return false, err
+			if upper {
+				child := path.Join(p, n)
+				if m := f.files[child]; m != nil {
+					ci = m.info(n)
+				} else {
+					var err error
+					ci, err = f.upperInfo(child, c)
+					if err != nil {
+						return false, err
+					}
 				}
 			}
 			out = append(out, ci)
@@ -532,7 +536,8 @@ func (f *FS) readDir(p string) ([]os.FileInfo, error) {
 			return nil, err
 		}
 		for _, item := range items {
-			if !seen[item.Name()] && !strings.HasPrefix(item.Name(), whPrefix) {
+			name := item.Name()
+			if !seen[name] && !strings.HasPrefix(name, whPrefix) {
 				out = append(out, item)
 			}
 		}
@@ -567,14 +572,13 @@ func visibleEntries(items []os.FileInfo) []os.FileInfo {
 	if items == nil {
 		return []os.FileInfo{}
 	}
-	out := items[:0]
-	for _, item := range items {
-		if !strings.HasPrefix(item.Name(), whPrefix) {
-			out = append(out, item)
-		}
+	// The bottom lists in name order, so all reserved names form one run.
+	first := sort.Search(len(items), func(i int) bool { return items[i].Name() >= whPrefix })
+	end := first
+	for end < len(items) && strings.HasPrefix(items[end].Name(), whPrefix) {
+		end++
 	}
-	clear(items[len(out):])
-	return out
+	return slices.Delete(items, first, end)
 }
 
 // Open opens name read-only from whichever level provides it.

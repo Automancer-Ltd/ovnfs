@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"syscall"
 	"testing"
 )
@@ -48,7 +49,7 @@ func TestReadDirBottomOnlyRejectsInvalidDirectories(t *testing.T) {
 
 func TestReadDirBottomOnlyFiltersWhiteoutNamesAndSorts(t *testing.T) {
 	bottom := t.TempDir()
-	for _, n := range []string{"b", "a", ".wh.x"} {
+	for _, n := range []string{"b", ".wh.x", ".wh0", ".wh-a", ".wh.y", "a"} {
 		if err := os.WriteFile(filepath.Join(bottom, n), nil, 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -61,8 +62,12 @@ func TestReadDirBottomOnlyFiltersWhiteoutNamesAndSorts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(items) != 2 || items[0].Name() != "a" || items[1].Name() != "b" {
-		t.Fatalf("got %v", items)
+	var names []string
+	for _, item := range items {
+		names = append(names, item.Name())
+	}
+	if !slices.Equal(names, []string{".wh-a", ".wh0", "a", "b"}) {
+		t.Fatalf("got %v", names)
 	}
 	empty := t.TempDir()
 	fsys, err = New(t.TempDir(), nil, dirBottom{empty}, nil)

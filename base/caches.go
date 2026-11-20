@@ -409,7 +409,7 @@ func (c *Caches) list(p string) ([]os.FileInfo, error) {
 		}
 		host := filepath.Join(dir, e.Name())
 		out = append(out, stateInfo(hostfile.Linked(info, host), host))
-		c.locator.listed(info, p, e.Name())
+		c.locator.listed(info, p)
 	}
 	return out, nil
 }

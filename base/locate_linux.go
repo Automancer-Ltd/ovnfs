@@ -23,11 +23,11 @@ func (l *locator) seen(info os.FileInfo, p string) {
 	}
 }
 
-// listed remembers the entry named name in a listing of view directory dir:
+// listed remembers the entry info describes in a listing of view directory dir:
 // a kernel that lists a directory names its entries by id afterwards.
-func (l *locator) listed(info os.FileInfo, dir, name string) {
+func (l *locator) listed(info os.FileInfo, dir string) {
 	if st, ok := info.Sys().(*syscall.Stat_t); ok {
-		l.memo.put(st.Ino, dir+"/"+name)
+		l.memo.put(st.Ino, dir+"/"+info.Name())
 	}
 }
 

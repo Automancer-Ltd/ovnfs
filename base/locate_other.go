@@ -12,7 +12,7 @@ type locator struct{}
 func (*locator) seen(os.FileInfo, string) {}
 
 // listed remembers nothing: see [locator].
-func (*locator) listed(os.FileInfo, string, string) {}
+func (*locator) listed(os.FileInfo, string) {}
 
 // locate reports false: see [locator].
 func (c *Caches) locate(*Base, uint64, func(string) bool) (string, bool) { return "", false }
