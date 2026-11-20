@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stencil-hq/ovnfs/internal/hostfile"
 	"github.com/stencil-hq/ovnfs/internal/ident"
 	"github.com/stencil-hq/ovnfs/internal/search/fsys"
 	"github.com/stencil-hq/ovnfs/overlay"
@@ -165,7 +166,7 @@ func TestFencedFileNeverChangesUnderAReader(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeTestFile(t, filepath.Join(dir, "target", "replaced.tmp"), "new")
-	if err := os.Rename(filepath.Join(dir, "target", "replaced.tmp"), filepath.Join(dir, "target", "replaced")); err != nil {
+	if err := hostfile.Rename(filepath.Join(dir, "target", "replaced.tmp"), filepath.Join(dir, "target", "replaced")); err != nil {
 		t.Fatal(err)
 	}
 
