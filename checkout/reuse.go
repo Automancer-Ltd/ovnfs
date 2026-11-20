@@ -470,7 +470,7 @@ func (r *Registry) openOnLocked(ctx context.Context, b *baseRecord, template git
 	if err := r.commitState(seq); err != nil {
 		r.mu.Lock()
 		if r.checkouts[name] == h {
-			delete(r.checkouts, name)
+			r.dropCheckoutLocked(name, h)
 			r.reserved[name] = true
 			r.moveRootLocked()
 		}

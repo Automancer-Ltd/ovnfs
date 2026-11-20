@@ -125,12 +125,13 @@ func TestFolderCreatesReuseUnchangedCapture(t *testing.T) {
 	if got := f.newCheckout(dir, "cache").Checkout.Base; got != first.Base {
 		t.Fatalf("an edit below a cache path forced a capture: base %s, want %s", got, first.Base)
 	}
-	// It took a new cache snapshot instead; the earlier checkouts keep theirs.
-	if got := f.read("cache", "build/out"); got != cached(t, "rebuilt") {
+	// It took a new cache snapshot instead, whose fence shows the rebuilt
+	// output; the earlier checkouts keep their fence, which hides it.
+	if got := f.read("cache", "build/out"); got != "rebuilt" {
 		t.Fatalf("checkout after a cache edit reads build/out = %q", got)
 	}
-	if got := f.read("first", "build/out"); got != cached(t, "o") {
-		t.Fatalf("earlier checkout reads build/out = %q after the folder rebuilt it", got)
+	if got := f.read("first", "build/out"); got != "<absent>" {
+		t.Fatalf("earlier checkout reads build/out = %q after the folder rebuilt it; want it gone, not rebuilt", got)
 	}
 	eventually(t, "the pool did not fill", func() bool { return f.poolFull(dir) })
 	write(t, filepath.Join(dir, "a.txt"), "two")

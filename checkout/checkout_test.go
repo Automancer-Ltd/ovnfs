@@ -17,6 +17,7 @@ import (
 
 	"github.com/stencil-hq/ovnfs/api"
 	"github.com/stencil-hq/ovnfs/overlay"
+	"github.com/stencil-hq/ovnfs/stats"
 	"github.com/stencil-hq/ovnfs/store"
 )
 
@@ -26,8 +27,9 @@ type fixture struct {
 	state, mount string
 	reg          *Registry
 	mu           sync.Mutex
-	invalidated  []invalidation // Config.Invalidate calls, in order
-	gitRemotes   bool           // Config.GitRemotes at the next open
+	invalidated  []invalidation  // Config.Invalidate calls, in order
+	gitRemotes   bool            // Config.GitRemotes at the next open
+	stats        *stats.Recorder // Config.Stats at the next open
 }
 
 // invalidation is one Config.Invalidate call; a "" tree covers the whole checkout.
@@ -80,7 +82,7 @@ func newFixture(t *testing.T) *fixture {
 
 // config is the registry configuration of the fixture's state.
 func (f *fixture) config() Config {
-	return Config{State: f.state, Mount: f.mount, Node: "n_" + filepath.Base(filepath.Dir(f.state)), Memory: overlay.NewMemory(64<<20, 1<<20, 0), BlobCache: 64 << 20, GitRemotes: f.gitRemotes,
+	return Config{State: f.state, Mount: f.mount, Node: "n_" + filepath.Base(filepath.Dir(f.state)), Memory: overlay.NewMemory(64<<20, 1<<20, 0), BlobCache: 64 << 20, GitRemotes: f.gitRemotes, Stats: f.stats,
 		Invalidate: func(checkout string, paths, trees []string) {
 			f.mu.Lock()
 			f.invalidated = append(f.invalidated, invalidation{checkout: checkout, paths: slices.Clone(paths), trees: slices.Clone(trees)})
@@ -262,7 +264,7 @@ func TestPlainFolderClasses(t *testing.T) {
 	if c := reply.Capture; c.Cache != 1 || c.Local != 3 || c.Hidden != 1 {
 		t.Fatalf("roots: cache %d local %d hidden %d", c.Cache, c.Local, c.Hidden)
 	}
-	for p, want := range map[string]string{"src/a.txt": "a", "node_modules/x/index.js": cached(t, "module"), ".env": "SECRET=1", ".DS_Store": "<absent>", "data/raw.bin": "raw", "notes/drop.log": "drop"} {
+	for p, want := range map[string]string{"src/a.txt": "a", "node_modules/x/index.js": "module", ".env": "SECRET=1", ".DS_Store": "<absent>", "data/raw.bin": "raw", "notes/drop.log": "drop"} {
 		if got := f.read("plain", p); got != want {
 			t.Errorf("%s = %q, want %q", p, got, want)
 		}

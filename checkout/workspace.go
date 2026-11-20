@@ -112,8 +112,10 @@ func (r *Registry) forgetWorkspace(dir string) {
 }
 
 // removeCheckoutFiles forgets the jj workspace of the checkout whose
-// directories are named dir, then removes its upper and private git directory.
+// directories are named dir, then discards its upper and private git
+// directory: an upper may hold everything the checkout built, and deleting
+// that must hold up neither the removal nor the next checkout of that name.
 func (r *Registry) removeCheckoutFiles(dir string) error {
 	r.forgetWorkspace(r.upperPath(dir))
-	return errors.Join(removeTree(r.upperPath(dir)), removeTree(r.gitdirPath(dir)))
+	return errors.Join(r.discard(r.upperPath(dir), "uppers-"+dir), r.discard(r.gitdirPath(dir), "git-"+dir))
 }

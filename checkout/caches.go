@@ -8,14 +8,17 @@ import (
 	"github.com/stencil-hq/ovnfs/watch"
 )
 
-// A checkout of a local base reads the folder's cache and local roots from a
-// snapshot of them (base.Caches), never from the folder as it is now. A
-// checkout opened on a base uses the base's newest snapshot, and takes a new
-// one when there is none or the folder changed below those roots since the
-// newest began, as far as the folder watcher reported; without the watcher
-// covering the folder every checkout takes its own. Checkouts already open
-// keep theirs. A snapshot no checkout uses any more is deleted by
-// collectGarbage, and one on disk no checkout names by the next Open.
+// A checkout of a local base reads the folder's cache and local roots as its
+// cache snapshot (base.Caches) fixes them, never as the folder has them now:
+// the local roots are the snapshot's copies, the cache roots the folder's own
+// entries that did not change since the snapshot began. A checkout opened on
+// a base uses the base's newest snapshot, and takes a new one when there is
+// none or the folder changed at those roots since the newest began, as far
+// as the folder watcher reported; without the watcher covering the folder
+// every checkout takes its own. Checkouts already open keep theirs. A
+// snapshot costs its local roots, however large the cache roots are. One no
+// checkout uses any more is discarded by collectGarbage, and one on disk no
+// checkout names by the next Open.
 //
 // A checkout prepared on a warm capture (see prepareOnWarm) gets its snapshot
 // when it is named, so it sees the folder as of its create.
@@ -163,8 +166,8 @@ func (r *Registry) orphanCachesLocked() error {
 	return nil
 }
 
-// removeDeadCaches deletes the snapshots queued for removal; collectGarbage
-// calls it without registry locks, since a removal waits for a snapshot still
+// removeDeadCaches discards the snapshots queued for removal; collectGarbage
+// calls it without registry locks, since a release waits for a snapshot still
 // being taken.
 func (r *Registry) removeDeadCaches() {
 	r.cachesMu.Lock()
@@ -172,7 +175,7 @@ func (r *Registry) removeDeadCaches() {
 	r.deadCaches = nil
 	r.cachesMu.Unlock()
 	for _, d := range dead {
-		if err := d.view.RemoveCaches(d.id); err != nil {
+		if err := r.discard(d.view.ReleaseCaches(d.id), "caches-"+d.id); err != nil {
 			r.enqueueNotice(baseNotice{fault: "remove cache snapshot " + d.id + ": " + err.Error()})
 		}
 	}

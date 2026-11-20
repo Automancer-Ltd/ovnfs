@@ -360,7 +360,7 @@ func (r *Registry) publishBase(ctx context.Context, name, id string, b *baseReco
 			if err = r.persistLocked(); err == nil {
 				reply = api.NewReply{Checkout: r.checkoutLocked(h), Warnings: append([]string{}, warnings...)}
 			} else {
-				delete(r.checkouts, name)
+				r.dropCheckoutLocked(name, h)
 				r.releaseLocked(b, nil)
 				r.dropCaches(h)
 			}
@@ -918,7 +918,7 @@ func (r *Registry) createFromSnapshotLocked(ctx context.Context, name string, s 
 		if err = r.persistLocked(); err == nil {
 			return h, nil
 		}
-		delete(r.checkouts, name)
+		r.dropCheckoutLocked(name, h)
 		r.releaseLocked(s.base, s.stack)
 		r.dropCaches(h)
 	}
@@ -1435,7 +1435,7 @@ func (r *Registry) remove(ctx context.Context, name string, picked time.Time, st
 	repo := localRepo(h.base)
 	h.fs.Discard()
 	h.fs.CloseFiles()
-	delete(r.checkouts, name)
+	r.dropCheckoutLocked(name, h)
 	delete(r.bySlot, h.meta.Slot)
 	r.reserved[name] = true
 	r.dropCaches(h)

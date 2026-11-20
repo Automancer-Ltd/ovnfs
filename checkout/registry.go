@@ -26,6 +26,7 @@ import (
 	"github.com/stencil-hq/ovnfs/git"
 	"github.com/stencil-hq/ovnfs/manifest"
 	"github.com/stencil-hq/ovnfs/overlay"
+	"github.com/stencil-hq/ovnfs/stats"
 	"github.com/stencil-hq/ovnfs/store"
 	"github.com/stencil-hq/ovnfs/watch"
 )
@@ -38,10 +39,6 @@ var objectPattern = regexp.MustCompile(`^[bl]_[0-9a-f]{12}$`)
 
 // stateDirs are the registry's subdirectories below State.
 var stateDirs = []string{"bases", "layers", "uppers", "snapshots", "git", "sources", "jj", trashDir}
-
-// trashDir holds leftovers Open moved aside for a background removal, so a
-// start never waits for deleting them (see removeOrphansLocked).
-const trashDir = "trash"
 
 // lockFile holds a base's resolved manifest next to its capture.
 const lockFile = "lock.json"
@@ -119,7 +116,7 @@ func Open(c Config) (*Registry, error) {
 	if err != nil {
 		return nil, coded(err)
 	}
-	r := &Registry{config: c, store: st, checkouts: make(map[string]*checkoutRecord), snapshots: make(map[string]*snapRecord), lineage: make(map[string]*snapRecord), bases: make(map[string]*baseRecord), layers: make(map[string]*layerRecord), intents: make(map[string]diskIntent), reserved: make(map[string]bool), watched: make(map[string]bool), folders: make(map[string]*reuseFolder), roots: make(map[string]string), nextSnapshot: d.NextSnapshot, nextSlot: d.NextSlot, nextLife: d.NextLife, bySlot: make(map[uint16]*checkoutRecord), proto: d.Proto, port: d.Port, rootTime: time.Now().UTC(), gcWake: make(chan struct{}, 1), noticeWake: make(chan struct{}, 1), stop: make(chan struct{})}
+	r := &Registry{config: c, store: st, checkouts: make(map[string]*checkoutRecord), snapshots: make(map[string]*snapRecord), lineage: make(map[string]*snapRecord), bases: make(map[string]*baseRecord), layers: make(map[string]*layerRecord), intents: make(map[string]diskIntent), reserved: make(map[string]bool), watched: make(map[string]bool), folders: make(map[string]*reuseFolder), roots: make(map[string]string), nextSnapshot: d.NextSnapshot, nextSlot: d.NextSlot, nextLife: d.NextLife, bySlot: make(map[uint16]*checkoutRecord), proto: d.Proto, port: d.Port, rootTime: time.Now().UTC(), gcWake: make(chan struct{}, 1), noticeWake: make(chan struct{}, 1), trashWake: make(chan struct{}, 1), stop: make(chan struct{})}
 	r.commits.cond.L = &r.commits.mu
 	r.prepares = make(chan struct{}, prepareSlots)
 	r.resolving = make(map[string]chan struct{})
@@ -380,7 +377,15 @@ func (r *Registry) addCheckoutLocked(name string, h *checkoutRecord) error {
 	}
 	r.checkouts[name] = h
 	r.bySlot[h.meta.Slot] = h
+	h.calls = r.config.Stats.Timer("calls", name)
 	return nil
+}
+
+// dropCheckoutLocked unregisters h, checkout name: the reverse of addCheckoutLocked,
+// but for the slot, which stays h's until another checkout takes it.
+func (r *Registry) dropCheckoutLocked(name string, h *checkoutRecord) {
+	delete(r.checkouts, name)
+	h.calls.Retire()
 }
 
 // slotHeldLocked reports whether a registered checkout holds slot. bySlot may
@@ -453,10 +458,7 @@ func (r *Registry) EnterSlot(slot uint16, s *Session) (name string, life uint32,
 		h.freeze.RUnlock()
 		return "", 0, failure("not_found", "no checkout in slot %d", slot)
 	}
-	s.FS = h.fs
-	s.Gen = h.generation.Load()
-	s.record = h
-	s.done.Store(false)
+	s.pin(h)
 	return name, life, nil
 }
 
@@ -665,12 +667,13 @@ func (r *Registry) Enter(name string, s *Session) error {
 		h.freeze.RUnlock()
 		return failure("not_found", "no checkout %s", name)
 	}
-	s.FS = h.fs
-	s.Gen = h.generation.Load()
-	s.record = h
-	s.done.Store(false)
+	s.pin(h)
 	return nil
 }
+
+// Stats returns the recorder the registry was opened with (Config.Stats), for
+// the file servers to time their calls with; nil when it records nothing.
+func (r *Registry) Stats() *stats.Recorder { return r.config.Stats }
 
 // Gen returns a checkout generation without waiting for its freeze lock.
 func (r *Registry) Gen(name string) (uint64, bool) {
@@ -962,18 +965,22 @@ func (r *Registry) collectGarbage() {
 		roots := r.treeRootsLocked()
 		r.mu.Unlock()
 		for _, l := range deadLayers {
-			if err := removeTree(l.layer.Dir()); err != nil {
+			if err := r.discard(l.layer.Dir(), "layers-"+l.id); err != nil {
 				r.enqueueNotice(baseNotice{fault: "remove layer " + l.id + ": " + err.Error()})
 			}
 		}
 		for id, b := range deadBases {
+			job := r.config.Stats.Job("base.remove", id)
 			if err := b.view.Remove(); err != nil {
 				r.enqueueNotice(baseNotice{fault: "remove base " + id + ": " + err.Error()})
 			}
+			job.End()
 		}
+		job := r.config.Stats.Job("store.sweep", "")
 		if _, err := r.store.Sweep(roots, time.Now().Add(-gcGrace)); err != nil {
 			r.enqueueNotice(baseNotice{fault: "sweep store: " + err.Error()})
 		}
+		job.End()
 	}
 }
 
@@ -1129,7 +1136,7 @@ func (r *Registry) baseReservedLocked(id string) bool {
 
 // baseConfig supplies storage and nonblocking event callbacks to a base.
 func (r *Registry) baseConfig(id string) base.Config {
-	return base.Config{ID: id, StateDir: filepath.Join(r.config.State, "bases", id), Store: r.store, OnFault: func(message string) { r.enqueueNotice(baseNotice{base: id, fault: message}) }}
+	return base.Config{ID: id, StateDir: filepath.Join(r.config.State, "bases", id), Store: r.store, Stats: r.config.Stats, OnFault: func(message string) { r.enqueueNotice(baseNotice{base: id, fault: message}) }}
 }
 
 // enqueueNotice avoids taking registry locks inside base exposure locks.
@@ -1227,8 +1234,8 @@ func (r *Registry) emit(event Event) {
 }
 
 // removeOrphansLocked reclaims filesystem leftovers not named by the recovered
-// manifest: it moves each into the trash for emptyTrash, and removes it in place
-// only when it cannot be moved. A leftover that cannot be removed either is
+// manifest (see discard), so a leftover costs the start one rename however
+// many files it holds. A leftover that cannot be removed is
 // reported as a fault and kept for the next open: it is no reason to keep every
 // other checkout down. As after a failed Rm, a kept upper or git directory keeps
 // its name reserved, so no new checkout inherits its files.
@@ -1260,12 +1267,7 @@ func (r *Registry) removeOrphansLocked() error {
 				if kind == "uppers" || kind == "jj" {
 					r.forgetWorkspace(leftover)
 				}
-				// Moved aside, a leftover costs the start one rename however
-				// many files it holds; emptyTrash deletes it while serving.
-				if os.Rename(leftover, filepath.Join(r.config.State, trashDir, kind+"-"+name+"-"+rand.Text())) == nil {
-					continue
-				}
-				if err = removeTree(leftover); err != nil {
+				if err = r.discard(leftover, kind+"-"+name); err != nil {
 					if kind == "uppers" || kind == "git" {
 						r.reserved[name] = true
 					}
@@ -1275,20 +1277,4 @@ func (r *Registry) removeOrphansLocked() error {
 		}
 	}
 	return nil
-}
-
-// emptyTrash deletes the leftovers removeOrphansLocked moved aside, this
-// open's and any an earlier daemon stopped before deleting. Close does not
-// wait for it: what remains when the daemon exits is deleted at the next open.
-func (r *Registry) emptyTrash() {
-	dir := filepath.Join(r.config.State, trashDir)
-	entries, _ := os.ReadDir(dir)
-	for _, entry := range entries {
-		select {
-		case <-r.stop:
-			return
-		default:
-		}
-		removeTree(filepath.Join(dir, entry.Name()))
-	}
 }

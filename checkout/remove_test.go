@@ -81,7 +81,8 @@ func TestRemoveTreeUnlocksDirsWithoutLeavingTheTree(t *testing.T) {
 
 // TestRmRemovesUnwritableDirs checks that rm of a checkout whose upper holds an
 // unwritable directory with files removes the upper and succeeds, rather than
-// failing after the checkout left the manifest and leaving the upper an orphan.
+// failing after the checkout left the manifest and leaving the upper an orphan,
+// and that the upper is deleted for good while the registry serves.
 func TestRmRemovesUnwritableDirs(t *testing.T) {
 	enforcedPerms(t)
 	f := newFixture(t)
@@ -101,6 +102,7 @@ func TestRmRemovesUnwritableDirs(t *testing.T) {
 	if ls := f.ls(); len(ls.Checkouts) != 0 {
 		t.Fatalf("checkouts after rm = %+v", ls.Checkouts)
 	}
+	eventually(t, "the removed upper was never deleted", func() bool { return len(f.trashed()) == 0 })
 }
 
 // TestOpenReclaimsOrphanWithUnwritableDir checks that an orphaned upper holding

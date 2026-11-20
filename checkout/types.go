@@ -27,6 +27,7 @@ import (
 	"github.com/stencil-hq/ovnfs/manifest"
 	"github.com/stencil-hq/ovnfs/overlay"
 	"github.com/stencil-hq/ovnfs/rules"
+	"github.com/stencil-hq/ovnfs/stats"
 	"github.com/stencil-hq/ovnfs/store"
 	"github.com/stencil-hq/ovnfs/watch"
 )
@@ -158,6 +159,9 @@ type Config struct {
 	// Logf reports how long Open spent on each part of the state, so a slow
 	// start names its cause; nil is silent.
 	Logf func(format string, args ...any)
+	// Stats records what the registry's background work and each checkout's
+	// file calls cost (see package stats); nil records nothing.
+	Stats *stats.Recorder
 }
 
 // Registry owns the live checkout namespace and all retained snapshot objects.
@@ -187,6 +191,8 @@ type Registry struct {
 	hashes       sync.WaitGroup
 	hasher       *hasher
 	gcWake       chan struct{}
+	trashWake    chan struct{} // wakes emptyTrash after a discard
+	relieving    atomic.Bool   // a relieveTrash runs
 	noticeWake   chan struct{}
 	stop         chan struct{}
 	workers      sync.WaitGroup
@@ -231,6 +237,7 @@ type checkoutRecord struct {
 	git        gitCache     // stored files of the private git directory, for the next snapshot
 	wrote      atomic.Int64 // unix nanoseconds of the last change through the checkout's folder (see Session.Touch); 0 for none
 	caches     *base.Caches // the cache snapshot meta.Caches names; nil on remote bases and while prepared (see useCaches)
+	calls      *stats.Timer // the file calls made while registered (see Session); nil before, and without Config.Stats
 }
 
 // snapRecord retains its full stack until explicitly dropped.
@@ -283,7 +290,18 @@ type Session struct {
 	FS     *overlay.FS
 	Gen    uint64
 	record *checkoutRecord
+	began  stats.Tick // when Enter returned, for the checkout's call timer
 	done   atomic.Bool
+}
+
+// pin makes s a session of h, whose freeze lock the caller holds shared for
+// it, and starts timing the call.
+func (s *Session) pin(h *checkoutRecord) {
+	s.FS = h.fs
+	s.Gen = h.generation.Load()
+	s.record = h
+	s.began = h.calls.Start()
+	s.done.Store(false)
 }
 
 // Touch records that the call changed the checkout, for [api.Checkout.Touched].
@@ -293,6 +311,7 @@ func (s *Session) Touch() { s.record.wrote.Store(time.Now().UnixNano()) }
 // A nil or zero Session has nothing to release.
 func (s *Session) Done() {
 	if s != nil && s.record != nil && s.done.CompareAndSwap(false, true) {
+		s.record.calls.Since(s.began)
 		s.record.freeze.RUnlock()
 	}
 }
