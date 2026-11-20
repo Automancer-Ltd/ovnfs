@@ -780,18 +780,25 @@ func (cmd *linkCmd) Run(c *cli) error {
 	return err
 }
 
-// shareCmd prints the remote-fs socket of a checkout, starting its share if needed.
+// shareCmd prints the remote-fs or kernel-client socket of a checkout,
+// starting its share if needed.
 type shareCmd struct {
 	Checkout  string `arg:"" name:"CHECKOUT" help:"checkout to share" completion-predictor:"checkout"`
 	ReadWrite bool   `name:"rw" help:"let the client write"`
+	Kernel    bool   `name:"kernel" help:"serve the ovnfs guest kernel client (vmon vmm --ovnfs SOCK) instead of remote-fs"`
 }
 
+// Run starts the share and prints its socket, then the VMM flag that uses it.
 func (cmd *shareCmd) Run(c *cli) error {
-	reply, err := call[api.ShareReply](c, "share", api.ShareArgs{Checkout: cmd.Checkout, Writable: cmd.ReadWrite})
+	reply, err := call[api.ShareReply](c, "share", api.ShareArgs{Checkout: cmd.Checkout, Writable: cmd.ReadWrite, Kernel: cmd.Kernel})
 	if err != nil || c.json {
 		return err
 	}
 	fmt.Fprintln(stdout, reply.Socket)
+	if cmd.Kernel {
+		fmt.Fprintf(stderr, "%s %s\n", paint(stderr, styleAccent, "vmon vmm --ovnfs"), paint(stderr, styleDim, reply.Socket))
+		return nil
+	}
 	mode := ""
 	if reply.Writable {
 		mode = ":rw"

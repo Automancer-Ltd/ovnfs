@@ -140,3 +140,18 @@ checkouts show; edits made here after the attach still need another `attach`.
 `ovnfs share CHECKOUT [--rw]` serves a checkout over remote-fs on a Unix
 socket, the protocol a vibevmm VM's `home` device speaks
 (`vmon --remote-fs home:SOCK[:rw]`).
+
+`ovnfs share CHECKOUT [--rw] --kernel` serves it instead to a VM's ovnfs guest
+kernel client (`vmon vmm --ovnfs SOCK`; the guest mounts it with
+`mount -t ovnfs ovnfs DIR`), on a socket of its own in
+`STATE/shares/kernel/`, beside any remote-fs share of the same checkout. Each
+guest CPU gets its own connection, and requests name files by their ovnfs file
+ids, which follow files through renames (`kmod/ovnfs_wire.h` defines the
+protocol). Writes are not synced until the guest's `fsync`, as for an NFS
+client's unstable writes. Every reply carries an epoch that changes when the
+daemon changes the checkout behind the guest (a pull, a reattach, removal) or
+restarts, and only then: the guest may keep anything it cached until it
+changes. Changes made through another frontend of the same checkout (the
+host's NFS or FUSE mount, a remote-fs share, a second VM on the same socket)
+do not change it, so a guest does not see them while it holds its cached copy.
+Removing the checkout closes the socket.

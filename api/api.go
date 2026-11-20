@@ -409,10 +409,13 @@ type Pushed struct {
 }
 
 // ShareArgs serves one checkout over remote-fs on a Unix socket, for a VM's `home`
-// device or a peer. Sharing again replaces the previous share of the checkout.
+// device or a peer, or with Kernel to a VM's ovnfs guest kernel client
+// (`vmon vmm --ovnfs SOCK`) on a socket of its own. A checkout can have one
+// share of each kind; sharing again replaces the previous share of that kind.
 type ShareArgs struct {
 	Checkout string `json:"checkout"`
 	Writable bool   `json:"writable,omitempty"`
+	Kernel   bool   `json:"kernel,omitempty"`
 }
 
 // ShareReply names the socket; it lives until the checkout is removed or the daemon stops.
