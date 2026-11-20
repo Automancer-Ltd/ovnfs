@@ -33,8 +33,10 @@ func TestWireLayout(t *testing.T) {
 		"ovnfs_readdir_rep": {ReaddirRepSize, 8},
 		"ovnfs_read_req":    {ReadReqSize, 16},
 		"ovnfs_write_req":   {WriteReqSize, 16},
-		"ovnfs_create_req":  {CreateReqSize, 8},
-		"ovnfs_mkdir_req":   {MkdirReqSize, 8},
+		"ovnfs_create_req":  {CreateReqSize, 32},
+		"ovnfs_mkdir_req":   {MkdirReqSize, 24},
+		"ovnfs_alloc_req":   {AllocReqSize, 8},
+		"ovnfs_alloc_rep":   {AllocRepSize, 16},
 		"ovnfs_mknod_req":   {MknodReqSize, 8},
 		"ovnfs_symlink_req": {SymlinkReqSize, 8},
 		"ovnfs_link_req":    {LinkReqSize, 8},
@@ -45,6 +47,28 @@ func TestWireLayout(t *testing.T) {
 		if s[0] != s[1] {
 			t.Errorf("sizeof %s = %d, header says %d", name, s[0], s[1])
 		}
+	}
+	cr := CreateReq{Mode: 0o644, Flags: CreateExcl, NewID: 0x0102030405060708, MtimeNs: 0x1112131415161718, DataLen: 0x21222324, NameLen: 0x3132}
+	wantCreate := make([]byte, 32)
+	layout(wantCreate, 0, 4, 0o644)
+	layout(wantCreate, 4, 4, uint64(CreateExcl))
+	layout(wantCreate, 8, 8, 0x0102030405060708)
+	layout(wantCreate, 16, 8, 0x1112131415161718)
+	layout(wantCreate, 24, 4, 0x21222324)
+	layout(wantCreate, 28, 2, 0x3132)
+	if got := cr.append(nil); !bytes.Equal(got, wantCreate) {
+		t.Errorf("ovnfs_create_req\n got %x\nwant %x", got, wantCreate)
+	}
+	mr := MkdirReq{Mode: 0o755, NewID: 0x0102030405060708, MtimeNs: 0x1112131415161718}
+	wantMkdir := make([]byte, 24)
+	layout(wantMkdir, 0, 4, 0o755)
+	layout(wantMkdir, 8, 8, 0x0102030405060708)
+	layout(wantMkdir, 16, 8, 0x1112131415161718)
+	if got := mr.append(nil); !bytes.Equal(got, wantMkdir) {
+		t.Errorf("ovnfs_mkdir_req\n got %x\nwant %x", got, wantMkdir)
+	}
+	if OpRename != 19 || OpCompound != 20 || OpAllocIDs != 21 {
+		t.Errorf("ops: rename %d, compound %d", OpRename, OpCompound)
 	}
 	if MaxIO != 1<<20 || MaxFrame != 1<<20+4096 || RootID != 1 || NameMax != 255 {
 		t.Errorf("limits %d %d %d %d", MaxIO, MaxFrame, RootID, NameMax)

@@ -94,20 +94,36 @@ func (c *conn) run(req *Req, b []byte) error {
 		}
 		return c.fsync(req.ID)
 	case OpCreate:
-		mode, flags := d.u32(), d.u32()
-		name, err := d.name()
+		var cr CreateReq
+		if err := cr.decode(d.take(CreateReqSize)); err != nil {
+			return EINVAL
+		}
+		name, err := nameOf(d.take(int(cr.NameLen)))
 		if err != nil {
 			return err
 		}
-		return c.create(req.ID, name, mode, flags)
+		data := d.take(int(cr.DataLen))
+		if err := d.end(); err != nil {
+			return err
+		}
+		return c.create(req.ID, name, &cr, data)
 	case OpMkdir:
-		mode := d.u32()
-		d.u32()
+		var mr MkdirReq
+		if err := mr.decode(d.take(MkdirReqSize)); err != nil {
+			return EINVAL
+		}
 		name, err := d.name()
 		if err != nil {
 			return err
 		}
-		return c.mkdir(req.ID, name, mode)
+		return c.mkdir(req.ID, name, &mr)
+	case OpAllocIDs:
+		count := d.u32()
+		d.u32()
+		if err := d.end(); err != nil {
+			return err
+		}
+		return c.allocIDs(count)
 	case OpMknod:
 		mode := d.u32()
 		d.u32() // rdev: only FIFOs and sockets are made
@@ -697,9 +713,16 @@ func (c *conn) setattr(id uint64, sa *SetattrReq) error {
 // existing one unless CreateExcl. It tries the exclusive create first, so a
 // new name costs one resolution, one open and one stat of the open file;
 // the overlay refuses a directory id that is not one.
-func (c *conn) create(dirID uint64, name string, mode, flags uint32) error {
+func (c *conn) create(dirID uint64, name string, cr *CreateReq, data []byte) error {
+	mode, flags := cr.Mode, cr.Flags
 	if flags&^(CreateExcl|CreateTrunc) != 0 {
 		return EINVAL
+	}
+	if cr.NewID != 0 {
+		return c.createWithID(dirID, name, cr, data)
+	}
+	if len(data) != 0 {
+		return EINVAL // content comes with a guest's id only
 	}
 	dir, err := c.path(dirID)
 	if err != nil {
@@ -790,7 +813,11 @@ func (c *conn) newName(dirID uint64, name string) (string, error) {
 }
 
 // mkdir answers MKDIR.
-func (c *conn) mkdir(dirID uint64, name string, mode uint32) error {
+func (c *conn) mkdir(dirID uint64, name string, mr *MkdirReq) error {
+	mode := mr.Mode
+	if mr.NewID != 0 {
+		return c.mkdirWithID(dirID, name, mr)
+	}
 	p, err := c.newName(dirID, name)
 	if err != nil {
 		return err
@@ -1037,4 +1064,58 @@ func (c *conn) readList(id uint64, p string, changes uint64) (*listing, error) {
 	}
 	slices.SortFunc(l.entries, func(a, b Dirent) int { return strings.Compare(a.Name, b.Name) })
 	return l, nil
+}
+
+// createWithID answers a CREATE that names the id the guest chose for the
+// new file (ALLOC_IDS): it needs CREATE_EXCL, and the file gets the id, the
+// guest's mtime and the content that came with the request in one step.
+func (c *conn) createWithID(dirID uint64, name string, cr *CreateReq, data []byte) error {
+	if cr.Flags != CreateExcl || cr.MtimeNs > math.MaxInt64 || len(data) > MaxIO {
+		return EINVAL
+	}
+	dir, err := c.path(dirID)
+	if err != nil {
+		return err
+	}
+	info, err := c.nodes.CreateWithID(dir+"/"+name, fileMode(cr.Mode), cr.NewID, time.Unix(0, int64(cr.MtimeNs)), data)
+	if err != nil {
+		return err
+	}
+	c.putAttr(cr.NewID, info)
+	return nil
+}
+
+// mkdirWithID answers a MKDIR that names the id the guest chose for the new
+// directory, which gets it and the guest's mtime.
+func (c *conn) mkdirWithID(dirID uint64, name string, mr *MkdirReq) error {
+	if mr.MtimeNs > math.MaxInt64 {
+		return EINVAL
+	}
+	dir, err := c.path(dirID)
+	if err != nil {
+		return err
+	}
+	info, err := c.nodes.MkdirWithID(dir+"/"+name, fileMode(mr.Mode), mr.NewID, time.Unix(0, int64(mr.MtimeNs)))
+	if err != nil {
+		return err
+	}
+	c.putAttr(mr.NewID, info)
+	return nil
+}
+
+// allocIDs answers ALLOC_IDS with a run of ids for the guest's own creates.
+func (c *conn) allocIDs(count uint32) error {
+	if count == 0 {
+		return EINVAL
+	}
+	if !c.share.Writable {
+		return EROFS
+	}
+	first, got, err := c.nodes.AllocIDs(c.share.Checkout, uint64(count))
+	if err != nil {
+		return err
+	}
+	rep := AllocRep{First: first, Count: uint32(got)}
+	c.out = rep.append(c.out)
+	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"time"
 )
 
 // Client is a synchronous kernel-protocol client over one connection, as
@@ -205,12 +206,43 @@ func (c *Client) Fsync(id uint64) error {
 
 // Create creates or opens regular file name in directory dir.
 func (c *Client) Create(dir uint64, name string, mode, flags uint32) (Attr, error) {
-	return c.attrCall(OpCreate, dir, le.AppendUint32(le.AppendUint32(nil, mode), flags), []byte(name))
+	return c.attrCall(OpCreate, dir, c.CreateBody(name, mode, flags, 0, 0, nil)...)
+}
+
+// CreateWithID creates regular file name in directory dir with id, from
+// AllocIDs, mtime and contents data, exclusively.
+func (c *Client) CreateWithID(dir uint64, name string, mode uint32, id uint64, mtime time.Time, data []byte) (Attr, error) {
+	return c.attrCall(OpCreate, dir, c.CreateBody(name, mode, CreateExcl, id, uint64(mtime.UnixNano()), data)...)
+}
+
+// CreateBody encodes a CREATE body in parts, for Call or Request.
+func (c *Client) CreateBody(name string, mode, flags uint32, id, mtimeNs uint64, data []byte) [][]byte {
+	cr := CreateReq{Mode: mode, Flags: flags, NewID: id, MtimeNs: mtimeNs, DataLen: uint32(len(data)), NameLen: uint16(len(name))}
+	return [][]byte{cr.append(nil), []byte(name), data}
+}
+
+// MkdirWithID creates directory name in directory dir with id, from
+// AllocIDs, and mtime.
+func (c *Client) MkdirWithID(dir uint64, name string, mode uint32, id uint64, mtime time.Time) (Attr, error) {
+	mr := MkdirReq{Mode: mode, NewID: id, MtimeNs: uint64(mtime.UnixNano())}
+	return c.attrCall(OpMkdir, dir, mr.append(nil), []byte(name))
+}
+
+// AllocIDs reserves up to count ids for files and directories the client
+// creates with them, returning the first and how many there are.
+func (c *Client) AllocIDs(count uint32) (first uint64, got uint32, err error) {
+	res, err := c.Call(OpAllocIDs, RootID, le.AppendUint32(le.AppendUint32(nil, count), 0))
+	if err != nil {
+		return 0, 0, err
+	}
+	var a AllocRep
+	return a.First, a.Count, a.decode(res)
 }
 
 // Mkdir creates directory name in directory dir.
 func (c *Client) Mkdir(dir uint64, name string, mode uint32) (Attr, error) {
-	return c.attrCall(OpMkdir, dir, le.AppendUint32(le.AppendUint32(nil, mode), 0), []byte(name))
+	mr := MkdirReq{Mode: mode}
+	return c.attrCall(OpMkdir, dir, mr.append(nil), []byte(name))
 }
 
 // Mknod creates a FIFO or socket name in directory dir; mode carries its type.
@@ -248,4 +280,61 @@ func (c *Client) Rename(oldDir uint64, oldName string, newDir uint64, newName st
 	r := RenameReq{NewDir: newDir, Flags: flags, OldLen: uint16(len(oldName)), NewLen: uint16(len(newName))}
 	_, err := c.Call(OpRename, oldDir, r.append(nil), []byte(oldName), []byte(newName))
 	return err
+}
+
+// Request encodes a request for [Client.Compound]: op on file id with body
+// parts after the header, as the client's caller.
+func (c *Client) Request(op Op, id uint64, body ...[]byte) []byte {
+	req := Req{Op: op, UID: c.UID, GID: c.GID, ID: id}
+	b := req.append(nil)
+	for _, part := range body {
+		b = append(b, part...)
+	}
+	return b
+}
+
+// SubReply is the reply to one request of a COMPOUND.
+type SubReply struct {
+	// Err is the request's error; nil when it succeeded.
+	Err error
+	// Epoch is the reply's epoch.
+	Epoch uint64
+	// Result is the request's result, valid until the client's next call.
+	Result []byte
+}
+
+// Compound sends reqs (see [Client.Request]) as one COMPOUND and returns
+// their replies in order. The error is the compound's own: a malformed
+// compound, which ran none of reqs, or a transport failure.
+func (c *Client) Compound(reqs ...[]byte) ([]SubReply, error) {
+	parts := make([][]byte, 0, 2*len(reqs))
+	for _, r := range reqs {
+		parts = append(parts, le.AppendUint32(nil, uint32(len(r))), r)
+	}
+	res, err := c.Call(OpCompound, 0, parts...)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SubReply, 0, len(reqs))
+	for len(res) > 0 {
+		if len(res) < subHeader {
+			return nil, errShort
+		}
+		n := int(le.Uint32(res))
+		res = res[subHeader:]
+		if n > len(res) {
+			return nil, errShort
+		}
+		var rep Rep
+		if err := rep.decode(res[:n]); err != nil {
+			return nil, err
+		}
+		sub := SubReply{Epoch: rep.Epoch, Result: res[RepSize:n]}
+		if rep.Error != 0 {
+			sub.Err = Errno(rep.Error)
+		}
+		out = append(out, sub)
+		res = res[n:]
+	}
+	return out, nil
 }

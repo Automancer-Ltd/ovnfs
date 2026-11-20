@@ -49,6 +49,8 @@ const (
 	OpUnlink   Op = 17
 	OpRmdir    Op = 18
 	OpRename   Op = 19
+	OpCompound Op = 20
+	OpAllocIDs Op = 21
 )
 
 // Flags.
@@ -96,8 +98,10 @@ const (
 	DirentHeader   = AttrSize + 2
 	ReadReqSize    = 16
 	WriteReqSize   = 16
-	CreateReqSize  = 8
-	MkdirReqSize   = 8
+	CreateReqSize  = 32
+	MkdirReqSize   = 24
+	AllocReqSize   = 8
+	AllocRepSize   = 16
 	MknodReqSize   = 8
 	SymlinkReqSize = 8
 	LinkReqSize    = 8
@@ -422,4 +426,88 @@ func (d *body) u64() uint64 {
 		return le.Uint64(v)
 	}
 	return 0
+}
+
+// CreateReq is struct ovnfs_create_req; the name and content follow it.
+type CreateReq struct {
+	Mode    uint32
+	Flags   uint32
+	NewID   uint64 // the id the guest chose (ALLOC_IDS); 0: the daemon's
+	MtimeNs uint64 // with NewID
+	DataLen uint32 // with NewID
+	NameLen uint16
+}
+
+// append encodes c.
+func (c *CreateReq) append(b []byte) []byte {
+	b = le.AppendUint32(b, c.Mode)
+	b = le.AppendUint32(b, c.Flags)
+	b = le.AppendUint64(b, c.NewID)
+	b = le.AppendUint64(b, c.MtimeNs)
+	b = le.AppendUint32(b, c.DataLen)
+	b = le.AppendUint16(b, c.NameLen)
+	return le.AppendUint16(b, 0)
+}
+
+// decode reads c from the start of b.
+func (c *CreateReq) decode(b []byte) error {
+	if len(b) < CreateReqSize {
+		return errShort
+	}
+	c.Mode = le.Uint32(b)
+	c.Flags = le.Uint32(b[4:])
+	c.NewID = le.Uint64(b[8:])
+	c.MtimeNs = le.Uint64(b[16:])
+	c.DataLen = le.Uint32(b[24:])
+	c.NameLen = le.Uint16(b[28:])
+	return nil
+}
+
+// MkdirReq is struct ovnfs_mkdir_req; the name follows it.
+type MkdirReq struct {
+	Mode    uint32
+	NewID   uint64 // as for CREATE
+	MtimeNs uint64 // with NewID
+}
+
+// append encodes m.
+func (m *MkdirReq) append(b []byte) []byte {
+	b = le.AppendUint32(b, m.Mode)
+	b = le.AppendUint32(b, 0)
+	b = le.AppendUint64(b, m.NewID)
+	return le.AppendUint64(b, m.MtimeNs)
+}
+
+// decode reads m from the start of b.
+func (m *MkdirReq) decode(b []byte) error {
+	if len(b) < MkdirReqSize {
+		return errShort
+	}
+	m.Mode = le.Uint32(b)
+	m.NewID = le.Uint64(b[8:])
+	m.MtimeNs = le.Uint64(b[16:])
+	return nil
+}
+
+// AllocRep is struct ovnfs_alloc_ids_rep.
+type AllocRep struct {
+	First uint64
+	Count uint32
+}
+
+// append encodes a.
+func (a *AllocRep) append(b []byte) []byte {
+	b = le.AppendUint64(b, a.First)
+	b = le.AppendUint32(b, a.Count)
+	return le.AppendUint32(b, 0)
+}
+
+// decode reads a from the start of b.
+func (a *AllocRep) decode(b []byte) error {
+	if len(b) < AllocRepSize {
+		return errShort
+	}
+	a.First = le.Uint64(b)
+	a.Count = le.Uint32(b[8:])
+	return nil
 }

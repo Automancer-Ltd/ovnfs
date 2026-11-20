@@ -56,6 +56,10 @@ type server struct {
 	share Share
 	opts  Options
 	nodes *export.Nodes
+	// names orders the checkout's renames and removes against the
+	// operations that resolve an id to a path and then act on the path
+	// (namesOf).
+	names *sync.RWMutex
 	// syncer commits files as an NFS COMMIT does (nfs.Backend.SyncFile).
 	syncer nfs.Backend
 	// base is this run's random epoch origin, so a restart or another share
@@ -91,6 +95,7 @@ func Serve(l net.Listener, share Share, opts Options) error {
 		share:  share,
 		opts:   opts,
 		nodes:  share.Export.Quiet(),
+		names:  namesOf(share.Checkout),
 		syncer: share.Export.NFS(),
 		base:   le.Uint64(seed[:]),
 		files:  kept.Cache[fileKey]{Max: keptMax},
@@ -157,15 +162,15 @@ func (s *server) logf(format string, args ...any) {
 // conn is one connection's buffers and listing.
 type conn struct {
 	*server
-	in  frames // request frames
-	out []byte // the reply frame: byte count, ovnfs_rep, result
-	gen uint64 // s.gen when the request arrived
+	in frames // request frames
+	// quiesced is set while a COMPOUND holds the write-cache barrier for all
+	// its sub-requests (Options.Quiesce).
+	quiesced bool
+	out      []byte // the reply frame: byte count, ovnfs_rep, result
+	gen      uint64 // s.gen when the request arrived
 	// list is the connection's last directory listing (see readdir).
 	list *listing
 }
-
-// replyStart is where a reply's result starts in conn.out.
-const replyStart = frameHeader + RepSize
 
 // serveConn answers frames in order until the peer closes or sends a frame
 // that breaks framing. A WRITE's payload is read from the socket straight
@@ -173,9 +178,10 @@ const replyStart = frameHeader + RepSize
 // reply, a READ's data included, is built in one buffer and leaves in one
 // write.
 func (s *server) serveConn(nc net.Conn) error {
-	c := &conn{server: s, out: make([]byte, replyStart, frameStart)}
+	c := &conn{server: s, out: make([]byte, frameHeader, frameStart)}
+	sc := newSpinConn(nc)
 	for {
-		frame, err := c.in.read(nc)
+		frame, err := c.in.read(sc)
 		if err != nil {
 			if err == io.EOF || errors.Is(err, net.ErrClosed) {
 				return nil
@@ -183,25 +189,45 @@ func (s *server) serveConn(nc net.Conn) error {
 			return fmt.Errorf("read frame: %w", err)
 		}
 		c.handle(frame)
-		if _, err := nc.Write(c.out); err != nil {
+		if _, err := sc.Write(c.out); err != nil {
 			return fmt.Errorf("write reply: %w", err)
 		}
 	}
 }
 
-// handle runs one request and leaves its reply frame in c.out. The epoch is
-// read before the request touches the tree: a daemon-side change that lands
-// meanwhile then shows in the next reply's epoch, never only in this one's.
+// handle runs one request and leaves its reply frame in c.out.
 func (c *conn) handle(frame []byte) {
-	c.gen = c.server.gen.Load()
-	c.out = c.out[:replyStart]
-	err := c.dispatch(frame)
-	if err != nil {
-		c.out = c.out[:replyStart]
+	c.out = c.out[:frameHeader]
+	if op, ok := opOf(frame); ok && op == OpCompound {
+		c.compound(frame)
+	} else {
+		c.reply(frame)
 	}
 	le.PutUint32(c.out, uint32(len(c.out)-frameHeader))
+}
+
+// opOf returns the op of request req; false when req is too short to have one.
+func opOf(req []byte) (Op, bool) {
+	if len(req) < ReqSize {
+		return 0, false
+	}
+	return Op(le.Uint16(req)), true
+}
+
+// reply runs one request that is no COMPOUND and appends its reply,
+// ovnfs_rep and result, to c.out. The epoch is read before the request
+// touches the tree: a daemon-side change that lands meanwhile then shows in
+// the next reply's epoch, never only in this one's.
+func (c *conn) reply(req []byte) {
+	c.gen = c.server.gen.Load()
+	at := len(c.out)
+	c.out = append(c.out, make([]byte, RepSize)...)
+	err := c.dispatch(req)
+	if err != nil {
+		c.out = c.out[:at+RepSize]
+	}
 	rep := Rep{Error: uint32(errnoOf(err)), Epoch: c.base + c.gen}
-	rep.put(c.out[frameHeader:])
+	rep.put(c.out[at:])
 }
 
 // dispatch decodes the request header, refuses mutations of a read-only
@@ -218,14 +244,41 @@ func (c *conn) dispatch(frame []byte) error {
 		// Bumped after the change, so a listing read before it is dropped.
 		defer c.changes.Add(1)
 	}
-	if c.opts.Quiesce != nil {
+	if c.opts.Quiesce != nil && !c.quiesced {
 		release, err := c.opts.Quiesce(context.Background())
 		if err != nil {
 			return err
 		}
 		defer release()
 	}
+	switch req.Op {
+	case OpHello, OpPoll, OpStatfs, OpAllocIDs, OpCompound:
+		// Resolve no id; a compound's sub-requests lock one by one.
+	case OpRename, OpUnlink, OpRmdir:
+		c.names.Lock()
+		defer c.names.Unlock()
+	default:
+		c.names.RLock()
+		defer c.names.RUnlock()
+	}
 	return c.run(&req, frame[ReqSize:])
+}
+
+// checkoutNames holds each checkout's lock of [namesOf].
+var checkoutNames sync.Map // checkout name -> *sync.RWMutex
+
+// namesOf returns the lock that makes an operation by id atomic against the
+// kernel shares' renames and removes of checkout co, for every share and
+// connection of it: an operation resolves the id to a path and then acts on
+// the path in separate export calls, and a rename between the two (of the
+// file, a directory above it, or another file onto its name) would make it
+// fail with ENOENT or act on another file. Renames and removes, the only
+// requests that change what an existing name refers to, hold it
+// exclusively; every other request that resolves an id holds it shared.
+// Changes through the checkout's other frontends do not take it.
+func namesOf(co string) *sync.RWMutex {
+	mu, _ := checkoutNames.LoadOrStore(co, new(sync.RWMutex))
+	return mu.(*sync.RWMutex)
 }
 
 // mutates reports whether op changes the tree.

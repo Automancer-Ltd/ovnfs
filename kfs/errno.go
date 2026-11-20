@@ -32,6 +32,7 @@ const (
 	ENAMETOOLONG Errno = 36
 	ENOTEMPTY    Errno = 39
 	ELOOP        Errno = 40
+	EILSEQ       Errno = 84
 	EOPNOTSUPP   Errno = 95
 	ESTALE       Errno = 116
 	EDQUOT       Errno = 122
@@ -43,7 +44,8 @@ var errnoNames = map[Errno]string{
 	EBUSY: "EBUSY", EEXIST: "EEXIST", EXDEV: "EXDEV", ENOTDIR: "ENOTDIR", EISDIR: "EISDIR",
 	EINVAL: "EINVAL", ETXTBSY: "ETXTBSY", EFBIG: "EFBIG", ENOSPC: "ENOSPC", EROFS: "EROFS",
 	EMLINK: "EMLINK", ENAMETOOLONG: "ENAMETOOLONG", ENOTEMPTY: "ENOTEMPTY", ELOOP: "ELOOP",
-	EOPNOTSUPP: "EOPNOTSUPP", ESTALE: "ESTALE", EDQUOT: "EDQUOT",
+	EILSEQ:     "EILSEQ",
+	EOPNOTSUPP: "EOPNOTSUPP", ESTALE: "ESTALE", EDQUOT: "EDQUOT", EMSGSIZE: "EMSGSIZE",
 }
 
 // Error names the errno.
@@ -90,6 +92,8 @@ func errnoOf(err error) Errno {
 		return ENAMETOOLONG
 	case errors.Is(err, syscall.ELOOP):
 		return ELOOP
+	case errors.Is(err, syscall.EILSEQ):
+		return EILSEQ
 	case errors.Is(err, syscall.EMLINK):
 		return EMLINK
 	case errors.Is(err, syscall.ENOSPC):
