@@ -59,10 +59,34 @@ func (v *revisionView) ReadFile(p string) ([]byte, error) {
 	return v.objects.Blob(string(f.ID))
 }
 
+// inheritedView classifies an untracked entry retained from the folder. Its
+// type and marker files are the folder's, but its ignore files are REV's.
+type inheritedView struct {
+	source.Dir
+	revision *revisionView
+}
+
+func (v inheritedView) ReadFile(p string) ([]byte, error) { return v.revision.ReadFile(p) }
+
 type revisionProjection struct {
 	hidden  map[string]int       // deciding root -> rule position
 	skipped map[string]bool      // omitted index entries, including gitlinks
 	ignores map[string]store.OID // hidden .gitignore blobs still used to classify takes
+}
+
+func (pr *revisionProjection) match(set rules.Set, p string, facts rules.Facts) rules.Class {
+	i := set.MatchIndex(p, facts)
+	if i < 0 {
+		return rules.Source
+	}
+	class := set.Rules[i].Class
+	if class == rules.Hidden {
+		if pr.hidden == nil {
+			pr.hidden = map[string]int{}
+		}
+		pr.hidden[p] = i
+	}
+	return class
 }
 
 // project honors first-match and ancestor precedence without re-evaluating each
@@ -70,18 +94,7 @@ type revisionProjection struct {
 func (v *revisionView) project(set rules.Set, domains *source.Domains) revisionProjection {
 	var projection revisionProjection
 	match := func(p string) rules.Class {
-		i := set.MatchIndex(p, domains.Facts(v, p, nil))
-		if i < 0 {
-			return rules.Source
-		}
-		class := set.Rules[i].Class
-		if class == rules.Hidden {
-			if projection.hidden == nil {
-				projection.hidden, projection.skipped = map[string]int{}, map[string]bool{}
-			}
-			projection.hidden[p] = i
-		}
-		return class
+		return projection.match(set, p, domains.Facts(v, p, nil))
 	}
 	var classifyDir func(string) rules.Class
 	classifyDir = func(p string) rules.Class {
@@ -105,6 +118,9 @@ func (v *revisionView) project(set rules.Set, domains *source.Domains) revisionP
 			class = match(p)
 		}
 		if class == rules.Hidden {
+			if projection.skipped == nil {
+				projection.skipped = map[string]bool{}
+			}
 			projection.skipped[p] = true
 			continue
 		}
@@ -185,8 +201,61 @@ func reviseCapture(ctx context.Context, c Config, res *source.Result, revision *
 		return domains.Facts(view, p, capturedInfo{mode: mode}).Ignored()
 	}
 	roots := map[string]rules.Class{}
-	for p := range projection.hidden {
-		roots[p] = rules.Hidden
+	folder := inheritedView{Dir: source.Dir(res.Root), revision: view}
+	matchInherited := func(p string, info os.FileInfo) rules.Class {
+		return projection.match(set, p, domains.Facts(folder, p, info))
+	}
+	// Tracked ancestors already have REV's decision. Classify each remaining
+	// folder directory once, stopping at the first non-source ancestor.
+	dirClasses := map[string]rules.Class{}
+	var dirClass func(string) rules.Class
+	dirClass = func(p string) rules.Class {
+		if p == "." {
+			return rules.Source
+		}
+		if dir, ok := view.dirs[p]; ok {
+			return dir.class
+		}
+		if _, leaf := files[p]; leaf {
+			return rules.Hidden // a revision leaf cannot hold inherited entries
+		}
+		if class, ok := dirClasses[p]; ok {
+			return class
+		}
+		class := dirClass(path.Dir(p))
+		if class == rules.Source {
+			class = matchInherited(p, capturedInfo{mode: os.ModeDir})
+		}
+		dirClasses[p] = class
+		return class
+	}
+	dirs, parents := map[string]bool{}, map[string]bool{}
+	keepDir := func(dir string) {
+		if dir != "." {
+			dirs[dir] = true
+			for p := path.Dir(dir); p != "." && !parents[p]; p = path.Dir(p) {
+				parents[p] = true
+			}
+		}
+	}
+	// A retained ignored directory that REV explicitly classifies as source
+	// cannot pass through wholesale: a child may have its own hidden rule.
+	retain := func(p string, dir bool, info os.FileInfo, fallback rules.Class) bool {
+		var class rules.Class
+		if dir {
+			class = dirClass(p)
+		} else if class = dirClass(path.Dir(p)); class == rules.Source {
+			class = matchInherited(p, info)
+		}
+		if class == rules.Hidden {
+			return true
+		}
+		if dir && class == rules.Source && fallback != rules.Hidden {
+			keepDir(p)
+			return false
+		}
+		roots[p] = fallback
+		return true
 	}
 	// Ignored roots remain live and copy-on-write, and hidden ones absent, just
 	// as in an ordinary checkout. Nonignored roots can contain ignored
@@ -215,8 +284,7 @@ func reviseCapture(ctx context.Context, c Config, res *source.Result, revision *
 				return nil
 			}
 			if !view.tracked(rel) && ignored(rel, entry.IsDir()) {
-				roots[rel] = class
-				if entry.IsDir() {
+				if retain(rel, entry.IsDir(), nil, class) && entry.IsDir() {
 					return filepath.SkipDir
 				}
 			}
@@ -242,24 +310,23 @@ func reviseCapture(ctx context.Context, c Config, res *source.Result, revision *
 	}
 	for p, f := range res.Files {
 		if !view.tracked(p) && !blocked(p) && ignored(p, f.Mode == store.ModeDir) {
-			roots[p] = rules.Local
+			var mode os.FileMode
+			if f.Mode == store.ModeSymlink {
+				mode = os.ModeSymlink
+			}
+			retain(p, f.Mode == store.ModeDir, capturedInfo{mode: mode, size: res.Info[p].Size}, rules.Local)
 		}
+	}
+	for p := range projection.hidden {
+		roots[p] = rules.Hidden
 	}
 	// Preserve the source directories of inherited roots and projected children.
 	// Only the deepest directories without visible leaves need empty tree entries.
-	dirs, parents := map[string]bool{}, map[string]bool{}
 	for p, class := range roots {
-		if _, projected := projection.hidden[p]; class == rules.Hidden && !projected {
+		if class == rules.Hidden && !view.tracked(p) {
 			continue // a hidden root from the folder cannot create a directory in REV
 		}
-		dir := path.Dir(p)
-		if dir == "." {
-			continue
-		}
-		dirs[dir] = true
-		for p := path.Dir(dir); p != "." && !parents[p]; p = path.Dir(p) {
-			parents[p] = true
-		}
+		keepDir(path.Dir(p))
 	}
 	for dir := range dirs {
 		if _, leaf := files[dir]; !leaf && !view.dirs[dir].visible && !parents[dir] {

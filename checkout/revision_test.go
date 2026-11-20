@@ -458,3 +458,42 @@ func TestCheckoutMarkersAndMigration(t *testing.T) {
 		t.Fatalf("reopened checkout marker = %q", got)
 	}
 }
+
+// A revision can ignore paths that the dirty folder does not. Both captured
+// source files and files beneath a captured local root can then survive from
+// the folder, but neither may bypass the revision's hidden rules.
+func TestRevisionHiddenInheritedPaths(t *testing.T) {
+	f := newFixture(t)
+	dir := revisionRepo(t)
+	write(t, filepath.Join(dir, ".gitignore"), "*.out\n")
+	write(t, filepath.Join(dir, ".o2/ovnfs.yml"), `rules: |
+  source mixed.out/ & ignored
+  hidden ignored & (*.out | private.txt)
+  local local.out/ | local-root/ | mixed.out/
+`)
+	gitRun(t, dir, "add", "--all")
+	gitRun(t, dir, "commit", "-qm", "ignore output in revision")
+	write(t, filepath.Join(dir, ".gitignore"), "")
+	for _, p := range []string{"captured.out", "elsewhere.out/output", "local.out/output", "local-root/nested.out", "mixed.out/private.txt", "mixed.out/kept.txt"} {
+		write(t, filepath.Join(dir, p), "folder output\n")
+	}
+	write(t, filepath.Join(dir, "retain.log"), "folder log\n")
+	if _, err := f.reg.New(context.Background(), api.NewArgs{Dir: dir, Name: "revision", Rev: "HEAD"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"captured.out", "elsewhere.out/output", "local.out/output", "mixed.out/private.txt"} {
+		if got := f.read("revision", p); got != "<absent>" {
+			t.Errorf("%s = %q, want hidden by revision", p, got)
+		}
+	}
+	// The local-root/ directory decision precedes any decision for nested.out.
+	if got := f.read("revision", "local-root/nested.out"); got != "folder output\n" {
+		t.Errorf("ignored file below a local root = %q", got)
+	}
+	if got := f.read("revision", "mixed.out/kept.txt"); got != "folder output\n" {
+		t.Errorf("visible sibling of hidden ignored file = %q", got)
+	}
+	if got := f.read("revision", "retain.log"); got != "<absent>" {
+		t.Errorf("file not ignored by REV = %q", got)
+	}
+}
