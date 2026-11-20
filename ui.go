@@ -70,6 +70,13 @@ func paintIf(w io.Writer, cond bool, style lipgloss.Style, s string) string {
 	return paint(w, style, s)
 }
 
+// labelled prints rows of a dim label and its value, the values aligned.
+func labelled(w io.Writer, rows [][2]string) {
+	for _, row := range rows {
+		fmt.Fprintf(w, "%s%s%s\n", paint(w, styleDim, row[0]), strings.Repeat(" ", max(2, 12-len(row[0]))), row[1])
+	}
+}
+
 // table prints rows as columns separated by two spaces, padded by each cell's
 // visible width so styled cells stay aligned. The first row is the header. With
 // colour off it reproduces text/tabwriter's output byte for byte.
