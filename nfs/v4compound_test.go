@@ -281,25 +281,47 @@ func TestV4RenameKeepsHandle(t *testing.T) {
 	r.end()
 }
 
-// TestV4AccessAndSecInfo checks ACCESS grants what is asked and SECINFO
-// offers AUTH_SYS and AUTH_NONE.
+// TestV4AccessAndSecInfo checks ACCESS grants the rights the file's mode
+// permits and SECINFO offers AUTH_SYS and AUTH_NONE.
 func TestV4AccessAndSecInfo(t *testing.T) {
 	fs := newTestFS(t)
 	v4write(t, fs, "f", "x")
+	if err := os.Chmod(fs.host("f"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	_, addr := v4serve(t, fs, nil)
 	c := v4dial(t, addr)
+	rootInfo, err := os.Lstat(fs.host(""))
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, want := range []uint32{access4All, access4Read, access4Modify | access4Extend, 0xff} {
 		r := c.run(v4Root(), v4Access(want))
 		r.skip(op4PutRootFH)
 		d := r.next(op4Access, stOK)
-		if supported, access := d.u32(), d.u32(); supported != access4All || access != want&access4All {
-			t.Errorf("ACCESS %#x: supported %#x access %#x", want, supported, access)
+		granted := accessOf(rootInfo.Mode(), want)
+		if supported, access := d.u32(), d.u32(); supported != access4All || access != granted {
+			t.Errorf("ACCESS %#x: supported %#x access %#x, want %#x", want, supported, access, granted)
 		}
 		r.end()
 	}
-	r := c.run(v4Root(), v4NameOp(op4SecInfo, "f"))
+	// A 0644 file is readable and writable, not executable (#77).
+	fInfo, err := os.Lstat(fs.host("f"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := c.run(v4Root(), v4Look("f"), v4Access(access4All))
 	r.skip(op4PutRootFH)
-	d := r.next(op4SecInfo, stOK)
+	r.next(op4Lookup, stOK)
+	d := r.next(op4Access, stOK)
+	want := accessOf(fInfo.Mode(), access4All)
+	if supported, access := d.u32(), d.u32(); supported != access4All || access != want || access&access4Execute != 0 {
+		t.Errorf("ACCESS 0644 file: supported %#x access %#x, want %#x", supported, access, want)
+	}
+	r.end()
+	r = c.run(v4Root(), v4NameOp(op4SecInfo, "f"))
+	r.skip(op4PutRootFH)
+	d = r.next(op4SecInfo, stOK)
 	if n, a, b := d.u32(), d.u32(), d.u32(); n != 2 || a != auth4Sys || b != auth4None {
 		t.Fatalf("SECINFO %d: %d, %d", n, a, b)
 	}

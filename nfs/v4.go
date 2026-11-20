@@ -496,18 +496,23 @@ func (x *v4compound) lookupp() status {
 	return stOK
 }
 
-// access answers ACCESS with every right asked for: the backend checks
-// permissions when the operation comes.
+// access answers ACCESS with the rights the current file's mode permits
+// (accessOf). supported is every bit this server can grant.
 func (x *v4compound) access() status {
 	want := x.d.u32()
 	if x.d.err != nil {
 		return stBadXDR
 	}
-	if _, st := x.current(); st != stOK {
+	cur, st := x.current()
+	if st != stOK {
 		return st
 	}
+	info, err := x.s.FS.Lstat(cur.path)
+	if err != nil {
+		return statusOf(err)
+	}
 	x.e.u32(access4All)
-	x.e.u32(want & access4All)
+	x.e.u32(accessOf(info.Mode(), want))
 	return stOK
 }
 

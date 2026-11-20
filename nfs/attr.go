@@ -140,6 +140,31 @@ func goMode(v uint32) os.FileMode {
 	return m
 }
 
+// accessOf returns the ACCESS bits (RFC 1813 section 3.3.4, RFC 7530
+// section 16.1) the file's mode permits, of those asked for in want.
+// Credentials are not checked; the bits follow the permission GETATTR
+// already reports. LOOKUP and DELETE apply only to directories.
+func accessOf(mode os.FileMode, want uint32) uint32 {
+	perm := mode.Perm()
+	var have uint32
+	if perm&0o444 != 0 {
+		have |= access4Read
+	}
+	if perm&0o222 != 0 {
+		have |= access4Modify | access4Extend
+		if mode.IsDir() {
+			have |= access4Delete
+		}
+	}
+	if perm&0o111 != 0 {
+		have |= access4Execute
+		if mode.IsDir() {
+			have |= access4Lookup
+		}
+	}
+	return have & want & access4All
+}
+
 // fhSize is the length of every file handle this server issues: the file id,
 // then the generation Backend.Generation tagged it with, both big-endian.
 const fhSize = 16
