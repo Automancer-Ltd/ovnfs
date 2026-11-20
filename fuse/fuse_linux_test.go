@@ -511,7 +511,24 @@ func TestChangesUnderneathShowWithinTTL(t *testing.T) {
 // TestOpenFileOutlivesItsName checks POSIX unlinked-but-open behavior and
 // listings longer than one READDIR reply.
 func TestOpenFileOutlivesItsName(t *testing.T) {
-	f := newFixture(t, nil)
+	f := newFixture(t, map[string]string{".gitignore": "target/\n", "target/artifact": "built"})
+	cache := f.path("alpha/target/artifact")
+	lower, err := os.Open(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lower.Close()
+	if err := os.Remove(cache); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := lower.Stat(); err != nil || info.Size() != 5 {
+		t.Fatalf("fstat of unlinked cache file = %v, %v", info, err)
+	}
+	var built [5]byte
+	if _, err := lower.ReadAt(built[:], 0); err != nil || string(built[:]) != "built" {
+		t.Fatalf("read of unlinked cache file = %q, %v", built, err)
+	}
+
 	fh, err := os.Create(f.path("alpha/tmp"))
 	if err != nil {
 		t.Fatal(err)
