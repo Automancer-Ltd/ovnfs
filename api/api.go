@@ -44,6 +44,7 @@ type Snapshot struct {
 	Label    string    `json:"label,omitempty"`
 	Created  time.Time `json:"created"`
 	Tree     string    `json:"tree,omitempty"`
+	Orphan   bool      `json:"orphan,omitempty"` // ls found no live checkout known to own this snapshot
 }
 
 // Rule is one `<class> <predicate>` line and where it came from.

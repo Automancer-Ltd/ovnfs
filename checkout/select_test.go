@@ -204,29 +204,49 @@ func TestRemovalKeepsEarlierCheckoutSnapshots(t *testing.T) {
 					t.Fatal(err)
 				}
 				if legacy {
-					if err := f.reg.Close(); err != nil {
+					// Even a same-name inherited parent is not owned by this checkout.
+					if _, err := f.reg.New(ctx, api.NewArgs{Name: "probe", Snapshot: id}); err != nil {
 						t.Fatal(err)
 					}
+				} else {
+					f.newCheckout(dir, "probe")
+				}
+				f.put("probe", "a", "discarded")
+				current, err := f.reg.Snap(ctx, api.SnapArgs{Checkout: "probe", Wait: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				fork, err := f.reg.Fork(ctx, api.ForkArgs{Checkout: "probe", Name: "child", Label: "branch point"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := f.reg.Rm(ctx, api.RmArgs{Checkout: "child"}); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.reg.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if legacy {
 					d := readDisk(t, f.state)
-					// Older state files did not record a snapshot's checkout life.
 					for i := range d.Snapshots {
 						d.Snapshots[i].Life = 0
 					}
 					if err := writeState(f.state, d); err != nil {
 						t.Fatal(err)
 					}
-					f.open()
-				}
-
-				f.newCheckout(dir, "probe")
-				f.put("probe", "a", "discarded")
-				if _, err := f.reg.Snap(ctx, api.SnapArgs{Checkout: "probe", Wait: true}); err != nil {
-					t.Fatal(err)
-				}
-				if err := f.reg.Close(); err != nil {
-					t.Fatal(err)
 				}
 				f.open()
+				selected, err := f.reg.Ls(ctx, api.LsArgs{Select: api.Select{Dir: dir}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				snaps := selected.Snapshots
+				if len(snaps) != 2 || snaps[0].ID != current.Snapshot.ID || snaps[1].ID != fork.Snapshot.ID || snaps[1].Label != "branch point" {
+					t.Fatalf("selected snapshots = %+v, want %s and %s", snaps, current.Snapshot.ID, fork.Snapshot.ID)
+				}
+				if all := f.ls().Snapshots; len(all) != 3 || all[0].ID != id || !all[0].Orphan || all[1].Orphan || all[2].Orphan {
+					t.Fatalf("all snapshots = %+v, want only %s orphaned", all, id)
+				}
 
 				if prune {
 					_, err = f.reg.Prune(ctx, api.PruneArgs{Select: api.Select{Dir: dir}})

@@ -172,7 +172,9 @@ func Open(c Config) (*Registry, error) {
 		return nil, coded(err)
 	}
 	phase(fmt.Sprintf("%d checkouts", len(d.Checkouts)))
+	var missingLives bool
 	for _, disk := range d.Snapshots {
+		missingLives = missingLives || disk.Life == 0
 		b := r.bases[disk.Base]
 		if b == nil {
 			cleanup()
@@ -197,6 +199,9 @@ func Open(c Config) (*Registry, error) {
 		if n, ok := snapshotNumber(disk.ID); ok && n > r.nextSnapshot {
 			r.nextSnapshot = n
 		}
+	}
+	if missingLives {
+		r.restoreSnapshotLives()
 	}
 	phase(fmt.Sprintf("%d snapshots", len(d.Snapshots)))
 	if err = r.removeOrphansLocked(); err != nil {
@@ -720,20 +725,24 @@ func (r *Registry) Ls(ctx context.Context, args api.LsArgs) (api.LsReply, error)
 		return api.LsReply{}, err
 	}
 	defer resume()
-	checkouts, err := r.pick(ctx, args.Select)
+	picked, err := r.pick(ctx, args.Select)
 	if err != nil {
 		return api.LsReply{}, err
 	}
 	all := args.Select == (api.Select{})
-	listed := make(map[string]bool, len(checkouts))
-	for _, c := range checkouts {
-		listed[c.Name] = true
+	listed := make(map[string]uint32, len(picked))
+	reply := api.LsReply{Checkouts: make([]api.Checkout, 0, len(picked)), Snapshots: []api.Snapshot{}}
+	for _, c := range picked {
+		listed[c.Name] = c.life
+		reply.Checkouts = append(reply.Checkouts, c.Checkout)
 	}
-	reply := api.LsReply{Checkouts: checkouts, Snapshots: []api.Snapshot{}}
 	r.mu.RLock()
 	for _, s := range r.snapshots {
-		if all || listed[s.meta.Checkout] {
-			reply.Snapshots = append(reply.Snapshots, snapshotOf(s.meta))
+		owned := s.meta.Life != 0 && listed[s.meta.Checkout] == s.meta.Life
+		if all || owned {
+			snap := snapshotOf(s.meta)
+			snap.Orphan = !owned
+			reply.Snapshots = append(reply.Snapshots, snap)
 		}
 	}
 	r.mu.RUnlock()

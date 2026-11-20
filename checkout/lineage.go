@@ -13,6 +13,24 @@ func checkoutSnapshot(h checkoutMeta) string {
 	return ""
 }
 
+// restoreSnapshotLives upgrades snapshots written without a checkout life.
+// Head and its predecessors down to (but excluding) Parent were frozen by
+// this checkout. Parent was inherited, possibly from an earlier checkout
+// with the same name. Nothing establishes ownership of detached snapshots.
+func (r *Registry) restoreSnapshotLives() {
+	for _, h := range r.checkouts {
+		parent := deref(h.meta.Parent)
+		for id := deref(h.meta.Head); id != "" && id != parent; {
+			s := r.lineage[id]
+			if s == nil || s.meta.Checkout != h.meta.Name || (s.meta.Life != 0 && s.meta.Life != h.meta.Life) {
+				break
+			}
+			s.meta.Life = h.meta.Life
+			id = s.stackParent
+		}
+	}
+}
+
 // retainedLineageLocked finds the ancestry needed by live checkouts and retained snapshots.
 func (r *Registry) retainedLineageLocked() map[string]*snapRecord {
 	retained := make(map[string]*snapRecord, len(r.lineage))

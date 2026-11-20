@@ -201,9 +201,10 @@ checkout started from, however the folder and the checkout have changed since:
 an untouched baseline to build or test beside it. `rm` removes a checkout and
 its snapshots unless another checkout or snapshot uses them.
 `rm --sticky-snapshots` keeps them, even if a later checkout reuses the name.
-Both `rm` and `prune` keep older snapshots whose checkout instance was not
-recorded. Use `drop` to release a snapshot explicitly. Nothing replaces the
-content of a live folder: rollback means a new checkout from a snapshot.
+When upgrading older state, snapshots a live checkout made since it opened
+still belong to it. Both `rm` and `prune` keep older snapshots whose owner
+cannot be established. Use `drop` to release a snapshot explicitly. Nothing
+replaces the content of a live folder: rollback means a new checkout from a snapshot.
 
 `rm` discards whatever the checkout holds that was not applied, without
 asking, and prints `removed NAME`. The one thing it refuses to discard is a
@@ -238,7 +239,9 @@ to its private git directory, else its creation. `ls DIR` lists only the
 checkouts of DIR: those opened on the folder, on a folder inside it, or on the
 folder holding it; inside the mount, those sharing the source of the checkout
 DIR is in. DIR needs a path spelling (`.`, `..`, a slash), since a bare word
-names a checkout, whose snapshots `ls NAME` lists.
+names a checkout, whose snapshots `ls NAME` lists. When no checkout has that
+name, `ls NAME` lists the retained snapshots made under it. Plain `ls` lists
+snapshots without a known live owner separately, even if their name was reused.
 
 `prune [DIR] [--idle DUR] [--no-diff]` removes, as `rm` does, every checkout
 matching all the criteria given: of DIR, untouched for DUR (`90m`, `12h`, `7d`,

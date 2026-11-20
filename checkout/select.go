@@ -43,13 +43,19 @@ func (r *Registry) Prune(ctx context.Context, args api.PruneArgs) (api.PruneRepl
 				continue
 			}
 		}
-		reply.Removed = append(reply.Removed, c)
+		reply.Removed = append(reply.Removed, c.Checkout)
 	}
 	return reply, nil
 }
 
+type pickedCheckout struct {
+	api.Checkout
+	h    *checkoutRecord
+	life uint32
+}
+
 // pick returns the live checkouts sel picks (see api.Select) in name order.
-func (r *Registry) pick(ctx context.Context, sel api.Select) ([]api.Checkout, error) {
+func (r *Registry) pick(ctx context.Context, sel api.Select) ([]pickedCheckout, error) {
 	// dir is a folder outside the mount; family the checkout a folder inside it
 	// (spelled so, or through symlinks) is in, never resolved through the daemon's
 	// own mount. The mount itself picks all.
@@ -72,11 +78,7 @@ func (r *Registry) pick(ctx context.Context, sel api.Select) ([]api.Checkout, er
 			family, _, _ = strings.Cut(filepath.ToSlash(rel), "/")
 		}
 	}
-	type candidate struct {
-		c api.Checkout
-		h *checkoutRecord
-	}
-	var found []candidate
+	var found []pickedCheckout
 	now := time.Now()
 	idle := time.Duration(sel.Idle * float64(time.Second))
 	r.mu.RLock()
@@ -101,26 +103,26 @@ func (r *Registry) pick(ctx context.Context, sel api.Select) ([]api.Checkout, er
 		}
 		c := r.checkoutLocked(h)
 		if sel.Idle == 0 || now.Sub(c.Touched) >= idle {
-			found = append(found, candidate{c, h})
+			found = append(found, pickedCheckout{c, h, h.meta.Life})
 		}
 	}
 	r.mu.RUnlock()
-	picked := []api.Checkout{}
-	bases := map[*baseRecord]map[string]store.File{}
-	for _, f := range found {
-		if sel.NoDiff {
+	picked := found
+	if sel.NoDiff {
+		picked = found[:0]
+		bases := map[*baseRecord]map[string]store.File{}
+		for _, f := range found {
 			if err := checkContext(ctx); err != nil {
 				return nil, err
 			}
 			same, err := r.unchanged(f.h, bases)
 			if err != nil {
-				return nil, coded(fmt.Errorf("checkout %s: %w", f.c.Name, err))
+				return nil, coded(fmt.Errorf("checkout %s: %w", f.Name, err))
 			}
-			if !same {
-				continue
+			if same {
+				picked = append(picked, f)
 			}
 		}
-		picked = append(picked, f.c)
 	}
 	sort.Slice(picked, func(i, j int) bool { return picked[i].Name < picked[j].Name })
 	return picked, nil

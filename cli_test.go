@@ -17,11 +17,11 @@ import (
 func TestPrintCheckoutsOrphanSnapshots(t *testing.T) {
 	for _, live := range []bool{false, true} {
 		r := api.LsReply{Snapshots: []api.Snapshot{
-			{ID: "orphan-id", Checkout: "removed", Label: "saved"},
+			{ID: "orphan-id", Checkout: "removed", Label: "saved", Orphan: true},
 		}}
 		if live {
-			r.Checkouts = []api.Checkout{{Name: "active"}}
-			r.Snapshots = append(r.Snapshots, api.Snapshot{ID: "live-id", Checkout: "active"})
+			r.Checkouts = []api.Checkout{{Name: "removed", Source: "/current"}}
+			r.Snapshots = append(r.Snapshots, api.Snapshot{ID: "live-id", Checkout: "removed"})
 		}
 		var out strings.Builder
 		printCheckouts(&out, r)
@@ -29,8 +29,8 @@ func TestPrintCheckoutsOrphanSnapshots(t *testing.T) {
 		if !strings.Contains(got, "ORPHAN SNAPSHOT") || !hasRow(got, "orphan-id", "removed", "saved") {
 			t.Fatalf("orphan missing from %q", got)
 		}
-		if strings.Contains(got, "live-id") || live && strings.Count(got, "active") != 1 {
-			t.Fatalf("live checkout duplicated in %q", got)
+		if strings.Contains(got, "live-id") || live && !hasRow(got, "removed", "/current", "1", "no") {
+			t.Fatalf("wrong snapshot count for reused name in %q", got)
 		}
 	}
 }
@@ -229,6 +229,7 @@ func TestScopeLsReply(t *testing.T) {
 		Snapshots: []api.Snapshot{
 			{ID: "s1", Checkout: "x", Label: "one"},
 			{ID: "s2", Checkout: "y", Label: "two"},
+			{ID: "s0", Checkout: "x", Label: "old", Orphan: true},
 		},
 	}
 	got := scopeLsReply(r, "x")
@@ -272,7 +273,7 @@ func TestScopeLsReply(t *testing.T) {
 
 	orphans := scopeLsReply(api.LsReply{
 		Checkouts: []api.Checkout{{Name: "y"}},
-		Snapshots: []api.Snapshot{{ID: "s3", Checkout: "gone"}},
+		Snapshots: []api.Snapshot{{ID: "s3", Checkout: "gone", Orphan: true}},
 	}, "gone")
 	if len(orphans.Checkouts) != 0 || len(orphans.Snapshots) != 1 || orphans.Snapshots[0].ID != "s3" {
 		t.Fatalf("orphan scope = %+v", orphans)

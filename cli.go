@@ -92,19 +92,26 @@ func (cmd *lsCmd) Run(c *cli) error {
 		}
 		a.Dir = dir
 	}
-	if name != "" && c.json {
-		raw, callErr := c.call("ls", a)
-		r, err := decodeReply[api.LsReply]("ls", raw, callErr)
-		if err != nil {
-			return err
+	if name == "" {
+		r, err := call[api.LsReply](c, "ls", a)
+		if err == nil && !c.json {
+			printCheckouts(stdout, r)
 		}
-		r = scopeLsReply(r, name)
-		if len(r.Checkouts) == 0 && len(r.Snapshots) == 0 {
-			if isDirArg(name) {
-				return fmt.Errorf("ls: no checkout %s; for the folder, ls ./%s", name, name)
-			}
-			return fmt.Errorf("ls: no checkout %s", name)
+		return err
+	}
+	raw, callErr := c.call("ls", a)
+	r, err := decodeReply[api.LsReply]("ls", raw, callErr)
+	if err != nil {
+		return err
+	}
+	r = scopeLsReply(r, name)
+	if len(r.Checkouts) == 0 && len(r.Snapshots) == 0 {
+		if isDirArg(name) {
+			return fmt.Errorf("ls: no checkout %s; for the folder, ls ./%s", name, name)
 		}
+		return fmt.Errorf("ls: no checkout %s", name)
+	}
+	if c.json {
 		out, err := json.Marshal(r)
 		if err != nil {
 			return fmt.Errorf("ls: encoding reply: %w", err)
@@ -112,38 +119,19 @@ func (cmd *lsCmd) Run(c *cli) error {
 		fmt.Println(string(out))
 		return nil
 	}
-	r, err := call[api.LsReply](c, "ls", a)
-	if err != nil || c.json {
-		return err
-	}
-	if name == "" {
-		printCheckouts(stdout, r)
+	if len(r.Snapshots) == 0 {
 		return nil
 	}
 	rows := [][]string{{paint(stdout, styleBold, "ID"), paint(stdout, styleBold, "LABEL"), paint(stdout, styleBold, "CREATED"), paint(stdout, styleBold, "TREE")}}
-	header := false
 	for _, s := range r.Snapshots {
-		if s.Checkout != name {
-			continue
-		}
-		header = true
 		rows = append(rows, []string{paint(stdout, styleAccent, s.ID), s.Label, paint(stdout, styleDim, stamp(s.Created)), treeCell(stdout, s.Tree)})
 	}
-	if header {
-		table(stdout, rows)
-	}
-	if !header && !slices.ContainsFunc(r.Checkouts, func(h api.Checkout) bool { return h.Name == name }) {
-		if isDirArg(name) {
-			return fmt.Errorf("ls: no checkout %s; for the folder, ls ./%s", name, name)
-		}
-		return fmt.Errorf("ls: no checkout %s", name)
-	}
+	table(stdout, rows)
 	return nil
 }
 
-// scopeLsReply keeps only the named checkout and its snapshots, the same
-// scope the human table for `ls NAME` applies. The daemon lists everything;
-// the JSON path used to print that unfiltered reply.
+// scopeLsReply lists snapshots of the current checkout or, when its name is
+// no longer in use, retained snapshots made under that name.
 func scopeLsReply(r api.LsReply, name string) api.LsReply {
 	out := api.LsReply{Checkouts: []api.Checkout{}, Snapshots: []api.Snapshot{}}
 	for _, h := range r.Checkouts {
@@ -152,7 +140,7 @@ func scopeLsReply(r api.LsReply, name string) api.LsReply {
 		}
 	}
 	for _, s := range r.Snapshots {
-		if s.Checkout == name {
+		if s.Checkout == name && (!s.Orphan || len(out.Checkouts) == 0) {
 			out.Snapshots = append(out.Snapshots, s)
 		}
 	}
@@ -164,7 +152,9 @@ func printCheckouts(w io.Writer, r api.LsReply) {
 	snaps := make(map[string]int)
 	live := make(map[string]bool)
 	for _, s := range r.Snapshots {
-		snaps[s.Checkout]++
+		if !s.Orphan {
+			snaps[s.Checkout]++
+		}
 	}
 	if len(r.Checkouts) > 0 {
 		rows := [][]string{{paint(w, styleBold, "CHECKOUT"), paint(w, styleBold, "SOURCE"), paint(w, styleBold, "SNAPS"), paint(w, styleBold, "CHANGED"), paint(w, styleBold, "TOUCHED"), paint(w, styleBold, "PATH")}}
@@ -183,7 +173,7 @@ func printCheckouts(w io.Writer, r api.LsReply) {
 	}
 	var orphans [][]string
 	for _, s := range r.Snapshots {
-		if live[s.Checkout] {
+		if !s.Orphan && live[s.Checkout] {
 			continue
 		}
 		if len(orphans) == 0 {
