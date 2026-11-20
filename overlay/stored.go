@@ -162,7 +162,7 @@ func (l *Layer) open(p, name string, flag int) (billy.File, error) {
 		if err != nil {
 			return nil, err
 		}
-		return wrapContent(c, name, handleID(e.Info)), nil
+		return wrapContent(c, name, e.Info), nil
 	}
 	if l.blobs != nil && e.Kind == KindDir {
 		return nil, &fs.PathError{Op: "open", Path: name, Err: syscall.EISDIR}

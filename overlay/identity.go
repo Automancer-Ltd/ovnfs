@@ -444,3 +444,21 @@ func inherited(s source, info os.FileInfo) ident.ID {
 	id, _ := ident.Of(info)
 	return id
 }
+
+// inherit is [inherited] for a copy made at upper name p, which leaves the
+// identity where an upper file at another name holds it already. Two names
+// of one bottom file share its inode's identity (a folder's build artifact
+// that cargo links into deps/ and beside it): the first one copied up takes
+// the identity along, so a handle a client holds follows the file through a
+// rename or a write, and a second copy is a file of its own, as the first
+// is by then. The caller holds f.mu with the index loaded.
+func (f *FS) inherit(s source, p string, info os.FileInfo) ident.ID {
+	id := inherited(s, info)
+	if id == 0 || s.layer != nil || info.IsDir() || hardLinks(info) < 2 {
+		return id
+	}
+	if holder, held := f.paths[id]; held && holder != p {
+		return 0
+	}
+	return id
+}

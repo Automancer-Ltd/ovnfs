@@ -394,7 +394,7 @@ func (f *FS) copyUpMem(s source, p string, info os.FileInfo) (bool, error) {
 	if err != nil || int64(len(data)) > f.mem.fileMax {
 		return false, err
 	}
-	return f.addMem(p, info.Mode(), info.ModTime(), data, inherited(s, info)) != nil, nil
+	return f.addMem(p, info.Mode(), info.ModTime(), data, f.inherit(s, p, info)) != nil, nil
 }
 
 // readBounded reads r, sized for about size bytes, stopping once it holds more

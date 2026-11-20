@@ -603,7 +603,7 @@ func (f *FS) openLower(name string, flag int) (h billy.File, ok bool, err error)
 	if err != nil {
 		return nil, true, err
 	}
-	return wrapContent(c, p, handleID(info)), true, nil
+	return wrapContent(c, p, info), true, nil
 }
 
 // Create creates or truncates a file in the writable upper.
@@ -703,7 +703,7 @@ retry:
 		if err != nil {
 			return nil, err
 		}
-		return wrapContent(fh, original, handleID(info)), nil
+		return wrapContent(fh, original, info), nil
 	}
 	if p == "" || reserved(p) {
 		return nil, &fs.PathError{Op: "open", Path: name, Err: syscall.EPERM}
@@ -727,7 +727,7 @@ retry:
 					return nil, err
 				}
 				// The replacement keeps the identity of the file it truncates.
-				id := inherited(s, info)
+				id := f.inherit(s, p, info)
 				if m := startMem(info.Mode().Perm(), id); m != nil {
 					return f.openMem(m, original, flag)
 				}
@@ -1495,7 +1495,7 @@ func (f *FS) preserveDirTime(d string, fn func() error) error {
 // resolve the name again if another operation changed its source.
 func (f *FS) copyUpBottomForOpen(p string, info os.FileInfo) (bool, error) {
 	bottom, epoch, ids := f.bottom, f.bottomEpoch, f.ids
-	id := inherited(source{}, info)
+	id := f.inherit(source{}, p, info)
 	inMemory := f.mem != nil && info.Size() <= f.mem.fileMax
 	for {
 		var tmp string
@@ -1585,7 +1585,7 @@ func (f *FS) copyUp(p string) error {
 		err = f.bottom.CopyTo(p, tmp)
 	}
 	if err == nil {
-		err = f.ids.persist(tmp, inherited(s, info))
+		err = f.ids.persist(tmp, f.inherit(s, p, info))
 	}
 	if err == nil && info.Mode()&os.ModeSymlink == 0 {
 		err = keepMode(tmp, info.Mode())

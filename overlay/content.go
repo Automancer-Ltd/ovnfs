@@ -32,14 +32,17 @@ func (byteContent) Close() error { return nil }
 type contentFile struct {
 	Content
 	name string
-	id   ident.ID
+	info os.FileInfo
 }
 
 // Name returns the overlay-relative name.
 func (c *contentFile) Name() string { return c.name }
 
 // Identity returns the identity of the entry the file was opened as.
-func (c *contentFile) Identity() ident.ID { return c.id }
+func (c *contentFile) Identity() ident.ID { return handleID(c.info) }
+
+// Stat describes the immutable entry opened, even after its name is unlinked.
+func (c *contentFile) Stat() (os.FileInfo, error) { return c.info, nil }
 
 // Write fails like a write to a read-only descriptor.
 func (c *contentFile) Write([]byte) (int, error) { return 0, c.badDescriptor("write") }
@@ -59,11 +62,11 @@ func (c *contentFile) badDescriptor(op string) error {
 }
 
 // wrapContent keeps host files on the ordinary descriptor path so locks and
-// descriptor-level calls still reach the OS; id is the identity of the entry
-// opened.
-func wrapContent(c Content, name string, id ident.ID) billy.File {
+// descriptor-level calls still reach the OS. Other content keeps the opened
+// entry's metadata so fstat does not need a path back to it.
+func wrapContent(c Content, name string, info os.FileInfo) billy.File {
 	if f, ok := c.(*os.File); ok {
-		return &file{File: f, name: name, id: id}
+		return &file{File: f, name: name, id: handleID(info)}
 	}
-	return &contentFile{Content: c, name: name, id: id}
+	return &contentFile{Content: c, name: name, info: info}
 }
