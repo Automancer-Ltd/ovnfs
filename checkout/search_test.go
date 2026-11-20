@@ -94,23 +94,42 @@ func TestSearchIgnoreRulesAndSnapshotPaths(t *testing.T) {
 	}
 }
 
-// TestSearchGitEntries finds nested repositories only when asked to (#81).
-func TestSearchGitEntries(t *testing.T) {
+func TestSearchGitMarkers(t *testing.T) {
 	f := newFixture(t)
-	dir := folder(t, map[string]string{"sub/nested/.git/HEAD": "ref: refs/heads/main\n", "sub/nested/n.txt": "n\n"})
+	dir := folder(t, map[string]string{".gitignore": "ignored/\n"})
 	f.newCheckout(dir, "search")
-	for _, root := range []api.SearchArgs{{Checkout: "search"}, {Dir: dir}} {
-		for pattern, want := range map[string]string{"**/.git": "sub/nested/.git", "**/.git/HEAD": "sub/nested/.git/HEAD"} {
-			root.Hidden, root.NoIgnore, root.Git = true, true, false
-			defaults, err := f.reg.Glob(t.Context(), api.GlobArgs{SearchArgs: root, Pattern: pattern})
-			if err != nil || len(defaults.Matches) != 0 {
-				t.Fatalf("%+v: %s without Git: %+v, %v", root, pattern, defaults, err)
+	gitdir := folder(t, map[string]string{"objects/external": "outside search root"})
+	for p, text := range map[string]string{
+		"ignored/nested/.git/objects/ab/blob": "inside object store",
+		"linked/.git":                         "gitdir: " + gitdir + "\n",
+	} {
+		write(t, filepath.Join(dir, p), text)
+		f.put("search", p, text)
+	}
+	for _, root := range []api.SearchArgs{{Dir: dir}, {Checkout: "search"}, {Dir: filepath.Join(f.mount, "search")}} {
+		root.Hidden, root.NoIgnore = true, true
+		a := api.GlobArgs{SearchArgs: root, Pattern: "**/.git"}
+		check := func(want ...string) {
+			t.Helper()
+			r, err := f.reg.Glob(t.Context(), a)
+			if err != nil || !slices.Equal(globPaths(r), want) {
+				t.Fatalf("glob %+v: %+v, %v; want %v", a, r, err, want)
 			}
-			root.Git = true
-			got, err := f.reg.Glob(t.Context(), api.GlobArgs{SearchArgs: root, Pattern: pattern})
-			if err != nil || !slices.Equal(globPaths(got), []string{want}) {
-				t.Fatalf("%+v: %s with Git: %+v, %v", root, pattern, got, err)
-			}
+		}
+		check()
+		a.GitMarkers = true
+		check("ignored/nested/.git", "linked/.git")
+		a.NoIgnore = false
+		check("linked/.git")
+		a.Hidden = false
+		check()
+
+		// A match-all glob would expose any descent into the object store or gitfile target.
+		a.Hidden, a.NoIgnore, a.Pattern = true, true, "*"
+		check(".gitignore", "ignored", "ignored/nested", "ignored/nested/.git", "linked", "linked/.git")
+		r, err := f.reg.Grep(t.Context(), api.GrepArgs{SearchArgs: root, Pattern: "^gitdir:|inside object store"})
+		if err != nil || len(r.Matches) != 0 {
+			t.Fatalf("grep %+v searched git metadata: %+v, %v", root, r, err)
 		}
 	}
 }

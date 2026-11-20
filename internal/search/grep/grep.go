@@ -24,7 +24,7 @@
 //		Pattern: `impl\s+\w+ for`,
 //		Glob:    "*.rs",
 //		Before:  1, After: 1,
-//		Walk:    walk.Options{Gitignore: true, SkipGit: true, SkipNodeModules: true},
+//		Walk:    walk.Options{Gitignore: true, Git: walk.SkipGit, SkipNodeModules: true},
 //	})
 package grep
 

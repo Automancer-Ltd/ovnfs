@@ -6,7 +6,7 @@
 // semantics of the `ignore` crate; and path-ordered collection, while minimising
 // syscalls per directory and spreading directories over worker goroutines:
 //
-//	err := walk.Walk(ctx, root, walk.Options{Gitignore: true, SkipGit: true},
+//	err := walk.Walk(ctx, root, walk.Options{Gitignore: true, Git: walk.SkipGit},
 //		func(w *walk.Worker, e *walk.Entry) walk.Action {
 //			if e.Type == fsys.File {
 //				counts[w.ID()]++
@@ -36,6 +36,15 @@ import (
 	"github.com/stencil-hq/ovnfs/internal/search/fsys"
 )
 
+// GitMode controls how a walk treats entries named ".git".
+type GitMode uint8
+
+const (
+	WalkGit GitMode = iota // treat .git like any other dot-prefixed entry
+	SkipGit                // omit the entry and its contents
+	ListGit                // report the entry without visiting its contents
+)
+
 // Options configures a walk. The zero value walks the native filesystem,
 // skipping dot-prefixed entries and honouring no ignore files.
 type Options struct {
@@ -51,8 +60,8 @@ type Options struct {
 	// Gitignore honours .ignore, .gitignore, .git/info/exclude, and git's
 	// global excludes file with the precedence documented in ignore.go.
 	Gitignore bool
-	// SkipGit prunes entries named ".git".
-	SkipGit bool
+	// Git controls .git entries; Hidden and ignore rules still apply.
+	Git GitMode
 	// SkipNodeModules prunes entries named "node_modules".
 	SkipNodeModules bool
 	// FollowLinks reports symlinks as their targets (type, size, mtime) and
@@ -766,7 +775,14 @@ func (wk *Worker) emit(j *dirJob, ls *fsys.Listing, ign *ignoreState, self **dir
 		if name[0] == '.' && !opts.Hidden {
 			continue
 		}
-		if (opts.SkipGit && string(name) == ".git") || (opts.SkipNodeModules && string(name) == "node_modules") {
+		canDescend := descend
+		if opts.Git != WalkGit && string(name) == ".git" {
+			if opts.Git == SkipGit {
+				continue
+			}
+			canDescend = false
+		}
+		if opts.SkipNodeModules && string(name) == "node_modules" {
 			continue
 		}
 		typ, size, mtime := re.Type, re.Size, re.Mtime
@@ -782,7 +798,7 @@ func (wk *Worker) emit(j *dirJob, ls *fsys.Listing, ign *ignoreState, self **dir
 		}
 		isDir := typ == fsys.Dir
 		var rel string
-		if w.visit == nil || (isDir && descend) {
+		if w.visit == nil || (isDir && canDescend) {
 			rel = wk.path(j.rel, name)
 		} else {
 			if j.rel == "" {
@@ -832,7 +848,7 @@ func (wk *Worker) emit(j *dirJob, ls *fsys.Listing, ign *ignoreState, self **dir
 			}
 			collected++
 		}
-		if !isDir || !descend {
+		if !isDir || !canDescend {
 			continue
 		}
 		child := jobPool.Get().(*dirJob)

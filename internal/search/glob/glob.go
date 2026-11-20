@@ -9,7 +9,7 @@
 //	res, err := glob.Glob(ctx, "/repo", glob.Options{
 //		Pattern: "*.go",
 //		Limit:   100,
-//		Walk:    walk.Options{Gitignore: true, SkipGit: true, SkipNodeModules: true},
+//		Walk:    walk.Options{Gitignore: true, Git: walk.SkipGit, SkipNodeModules: true},
 //	})
 package glob
 

@@ -113,8 +113,10 @@ func TestPruningOptions(t *testing.T) {
 		"node_modules/m/i.js", "src/main.go", "src/node_modules", "src/.git")
 	wantPaths(t, paths(t, root, Options{}),
 		"a.txt", "node_modules", "node_modules/m", "node_modules/m/i.js", "src", "src/main.go", "src/node_modules")
-	wantPaths(t, paths(t, root, Options{Hidden: true, SkipGit: true, SkipNodeModules: true}),
+	wantPaths(t, paths(t, root, Options{Hidden: true, Git: SkipGit, SkipNodeModules: true}),
 		".env", ".hidden", ".hidden/x.txt", "a.txt", "src", "src/main.go")
+	wantPaths(t, paths(t, root, Options{Hidden: true, Git: ListGit, SkipNodeModules: true}),
+		".env", ".git", ".hidden", ".hidden/x.txt", "a.txt", "src", "src/.git", "src/main.go")
 	wantPaths(t, paths(t, root, Options{Hidden: true, MaxDepth: 1}),
 		".env", ".git", ".hidden", "a.txt", "node_modules", "src")
 }

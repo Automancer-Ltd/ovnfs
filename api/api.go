@@ -19,9 +19,9 @@ var Ops = []string{"status", "ls", "new", "fork", "snap", "diff", "grep", "glob"
 // "apply.atomic" (ApplyArgs.Atomic), "rm.keep_commits" (RmArgs.KeepCommits),
 // "diff.paths" (DiffArgs.Paths), "diff.stat" (DiffArgs.Stat),
 // "new.base_checkout" (NewArgs.Base takes a checkout's name), and
-// "search.git" (SearchArgs.Git).
+// "glob.git_markers" (GlobArgs.GitMarkers).
 var Features = []string{"new.base", "diff.binary", "ls.select", "rm.sticky_snapshots", "prune.sticky_snapshots", "stop.keep_mount",
-	"pull.folder", "apply.atomic", "rm.keep_commits", "diff.paths", "diff.stat", "new.base_checkout", "search.git"}
+	"pull.folder", "apply.atomic", "rm.keep_commits", "diff.paths", "diff.stat", "new.base_checkout", "glob.git_markers"}
 
 // Checkout is an isolated, copy-on-write copy of a source folder that an agent works in.
 type Checkout struct {
