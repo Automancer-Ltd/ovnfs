@@ -14,6 +14,7 @@ import (
 	"runtime/debug"
 	"syscall"
 
+	"github.com/stencil-hq/ovnfs/internal/dataless"
 	"github.com/stencil-hq/ovnfs/manifest"
 )
 
@@ -56,6 +57,10 @@ func (e exitCode) Error() string { return fmt.Sprintf("exit status %d", int(e)) 
 
 // main dispatches one verb and maps its error onto the exit status.
 func main() {
+	// Before the daemon starts: it inherits the policy, and serves checkouts of
+	// folders whose files may be cloud-only. Best effort: without it such reads
+	// fail with EDEADLK, as they did before.
+	_ = dataless.Materialize()
 	err := run(os.Args[1:])
 	var code exitCode
 	switch {
