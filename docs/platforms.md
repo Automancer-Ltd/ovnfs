@@ -264,18 +264,22 @@ as a local disk, 1.2 s as a network volume, which Defender scans less, and
 (`Add-MpPreference -ExclusionProcess`) cut an open and close from 400 µs to
 49 µs, against SMB's 53 µs.
 
-## Cache snapshots and metadata
+## Cache and local roots and metadata
 
-A cache snapshot takes a cache or local root only while each of its ancestors
-in the folder is a real directory, not a symlink, and a lookup below a root
-proves the same of the snapshot's directories once, since a snapshot never
-changes; snapshot directory listings take their entries' metadata from the
-listing itself. A checkout's own files are described from its in-memory
-index, which every change made through ovnfs refreshes; only a file open for
-writing is looked up on the host.
+A cache snapshot takes a local root, and a checkout reads below a cache
+root, only while each ancestor in the folder is a real directory, not a
+symlink. Below a local root a lookup proves that of the snapshot's
+directories once, since its copies never change; below a cache root a proof
+of the folder's directories lasts a second, as long as the kernels'
+attribute caches. Directory listings take their entries' metadata, the
+change time included, from the listing itself; only on Linux a listed
+directory costs a `statx` for its birth time. A checkout's own files are
+described from its in-memory index, which every change made through ovnfs
+refreshes; only a file open for writing is looked up on the host.
 
-A symlink in a snapshot whose absolute target lies inside the folder reads as
-the same path relative to the link, so in a checkout it names the checkout's
-copy: Bun on Windows links workspace packages in `node_modules` by absolute
-path. Absolute targets outside the folder stay as stored. Windows junctions,
-in snapshots and in source alike, read as the directory symlinks they act as.
+A symlink below a cache or local root whose absolute target lies inside the
+folder reads as the same path relative to the link, so in a checkout it names
+the checkout's copy: Bun on Windows links workspace packages in
+`node_modules` by absolute path. Absolute targets outside the folder stay as
+stored. Windows junctions, below roots and in source alike, read as the
+directory symlinks they act as.

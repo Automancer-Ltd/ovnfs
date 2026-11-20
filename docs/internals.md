@@ -64,6 +64,11 @@ base64 pprof bytes in its reply; `cpu`, `block` and `mutex` sample over a window
 (`--seconds`, default 30), the rest are snapshots. `ovnfs profile cpu -o cpu.pb.gz`
 writes the decoded bytes, which `go tool pprof cpu.pb.gz` reads.
 
+`stats` totals what the daemon spent a period on (`--since`, default 1h) from
+the record it keeps itself; see [Statistics](#statistics). A profile shows
+where the time goes while it samples, the statistics where it went before
+anyone looked.
+
 Frames are limited to 16 MiB. An oversized reply returns error code
 `too_large` without closing the connection; search clients can reduce their
 result count, file filters or reported line width.
@@ -98,14 +103,15 @@ a crash forgets the writes since.
 
 | path under state | holds |
 | --- | --- |
-| `bases/<id>/` | a capture (`capture.idx`: every captured path with its mode, blob id, stat data, root class, tracking repository and whether it is a Git LFS pointer, memory-mapped read-only; a start replaces the `capture.bin` or `capture.json` of a base from an older build with one), its lock, index copies, the git objects its checkouts commit, `git-template/`, the private git directory its prepared checkouts copy, `lfs/`, the Git LFS objects `git lfs smudge` produced for it, and `caches/<id>/`, the cache snapshots its checkouts read cache and local roots from (`tree/`, the roots at their folder paths; `roots.json`, written once complete) |
+| `bases/<id>/` | a capture (`capture.idx`: every captured path with its mode, blob id, stat data, root class, tracking repository and whether it is a Git LFS pointer, memory-mapped read-only; a start replaces the `capture.bin` or `capture.json` of a base from an older build with one), its lock, index copies, the git objects its checkouts commit, `git-template/`, the private git directory its prepared checkouts copy, `lfs/`, the Git LFS objects `git lfs smudge` produced for it, and `caches/<id>/`, the cache snapshots that fix what its checkouts see of cache and local roots (`tree/`, its copies of the local roots at their folder paths; `fence`, where its view of the cache roots ends; `roots.json`, written once complete) |
 | `layers/` | frozen uppers until hashed, then only their non-source files and, above 1 KiB, the layer's compressed manifest; smaller manifests live in `state.json`, so such a stored-only layer needs no file or directory |
 | `uppers/` | each checkout's writable copy-on-write layer, named after the checkout, or `_p<id>` for one prepared before it had a name |
 | `git/` | private git directories, named like the uppers; a snapshot keeps its checkout's as a store tree, so an unchanged index costs nothing per snapshot |
 | `jj/` | jj workspaces made for checkouts being created, until their `.jj` moves into the checkout's upper |
 | `store/` | git-format objects in append-only `packs/<n>.pack` (a full pack also gets a sorted index, `<n>.idx`, and every eight of those are merged into one `<g>.midx`); large blobs use content-defined chunks, or plain files under `objects/` when reflinks work |
 | `sources/` | each source folder's stat cache: which files still match the blob ids of its last capture's tree |
-| `trash/` | leftovers a start found no checkout, snapshot or base naming (a removal a crash interrupted, a create it rolled back): each is moved here with one rename and deleted while the daemon serves, so a start never waits on deleting files |
+| `trash/` | trees given up, until they are deleted: the uppers and git directories of removed checkouts, the layers and cache snapshots garbage collection released, and leftovers a start found no checkout, snapshot or base naming (a removal a crash interrupted, a create it rolled back). Each is moved here with one rename and deleted by a low-priority thread while the daemon serves, so no removal, start or collection waits on deleting files |
+| `stats/` | what the daemon spent its time on, a JSON-lines file a day (see [Statistics](#statistics)) |
 | `mirror.git/` | shallow commits fetched from git upstreams of attached checkouts (see [remote](remote.md#committed-content-from-the-git-upstream)) |
 | `node_id` | this daemon's random id; attach offers carry it so the remote tells this daemon's folders apart from other machines' |
 
@@ -148,6 +154,17 @@ Copy-up and Git hashing still process whole changed files; chunking reduces
 retained history, not the work of computing a Git SHA-1.
 
 Unreferenced layers, bases and store objects are collected in the background.
+A layer or cache snapshot that goes is not deleted there, nor is the upper of
+a removed checkout by `rm`: each is moved into `trash/` with one rename, and
+one thread deletes what the trash holds at
+the lowest priority the OS offers (background QoS on macOS, so efficiency
+cores; nice 19 and idle I/O on Linux; background mode on Windows). Deleting
+is an unlink per entry (about 45 µs each on APFS, 130 µs on an efficiency
+core), so a layer holding a build's 500,000 files is a minute of CPU that no
+longer competes with the builds the daemon serves. That thread gets what
+nothing else wants, and on a saturated machine little: once more than 16
+trees wait, a second goroutine deletes the excess at normal priority, so the
+trash stays bounded.
 Captures read the source once: files over 1 MiB are cloned where the filesystem
 shares blocks (APFS `clonefile`, Linux `FICLONE` reflinks on btrfs, XFS and
 bcachefs, ReFS and Dev Drive block cloning on Windows), otherwise staged and
@@ -225,7 +242,8 @@ number) comes from what backs the file, never from its path:
 - **Identity** (`internal/ident`). A base entry is numbered by its
   `capture.idx` node (space `Capture`), whether its bytes come from the
   source folder or a blob. A file or directory on the state volume (uppers,
-  frozen layers, cache snapshots) is numbered by its inode (space `State`).
+  frozen layers, cache snapshots, and the folder's own files below a cache
+  root) is numbered by its inode (space `State`).
   Anything without a usable inode, such as a file held in memory, takes a
   per-checkout counter (space `Synthetic`), whose high-water mark the upper
   root records. Copy-up, spill, freeze and rename carry the entry's identity
@@ -271,32 +289,132 @@ upgrade keeps working and looks everything below the root up again.
 Builds that kept a node id table left `STATE/nodes.log*` behind; the daemon
 deletes those files in the background when it starts.
 
-## Cache snapshots
+## Cache and local roots
 
-Checkouts never read the folder's cache and local roots as they are now (a
-host build rewriting `target/` changed every checkout's view, and each folder
-event made the daemon drop and relist its listings in every checkout). A
-checkout reads a snapshot of them instead (`base.Caches`), below its base's
-`caches/<id>/tree/`, taken with one `clonefile(2)` per root on APFS (about
-18 µs an entry) and a reflink per file elsewhere, never with byte copies of a
-cache root. It is taken in the background when a checkout opens and the base
-has no snapshot, or the folder watcher reported a change at, below or above a
-root since the newest began; checkouts opened meanwhile share the newest. The
-checkout records the snapshot's id in `state.json` (`caches`). The snapshot
-first records which roots exist and takes those that are no directory, then
-clones the directory roots. A root directory presents the folder's metadata
-of when the snapshot began and its capture node's identity, so listing its
-parent waits only for the first step; anything below a root waits until the
-snapshot is complete, before the overlay takes its lock (`overlay.Awaiter`).
-Below a root, entries are snapshot files with `State` identities, which
-`Locate` maps back to paths with `fsgetpath(2)` on macOS. On macOS and Linux
-a snapshot holds its `tree/` open and resolves lookups relative to it
-(`fstatat`, `openat`, `readlinkat`), so the kernel does not walk the dozen
-components of the snapshot's absolute path each time: a lookup in a
-30,000-entry directory fell from about 2.6 µs to 1.9 µs. A snapshot no
-checkout uses is deleted by garbage collection, and one on disk no checkout
-names by the next start; one a stop interrupted is taken again when its
-checkout reopens. Folder events never invalidate a checkout.
+Checkouts never read the folder's cache and local roots as they are now: a
+host build rewriting `target/` would hand them output newer than their
+sources. A cache snapshot (`base.Caches`) fixes both. One is taken when a
+checkout opens and the base has none, or the folder watcher reported a change
+at, below or above a root since the newest began; checkouts opened meanwhile
+share the newest, and a checkout records its snapshot's id in `state.json`
+(`caches`). A snapshot no checkout uses is moved to the trash by garbage
+collection, and one on disk no checkout names by the next start.
+
+**Local roots are copied** below the base's `caches/<id>/tree/`, in the
+background: with `clonefile(2)` on APFS, a reflink per file where the volume
+has them, bytes elsewhere; first the roots that are no directory, then the
+directories. `roots.json`, written last, marks the snapshot complete; one a
+stop interrupted is taken again when its checkout reopens. A root directory
+presents the folder's metadata of when the snapshot began and its capture
+node's identity, so listing its parent waits only for the first step;
+anything below a local root waits for the copy, before the overlay takes its
+lock (`overlay.Awaiter`). The copies are snapshot files with `State`
+identities. On macOS and Linux a snapshot holds its `tree/` open and resolves
+lookups relative to it (`fstatat`, `openat`, `readlinkat`), so the kernel
+does not walk the dozen components of the snapshot's absolute path each time.
+
+**Cache roots are not copied.** A clone of one is cheap to make and dear to
+unmake: `clonefile(2)` takes 10 µs an entry and the unlink that undoes it 45
+µs, per entry of every root, for every snapshot, whatever its checkouts read
+(of two live snapshots of 810,000 and 540,000 files, they had read 14% and
+0.01%); and only APFS clones a tree in one call. A snapshot holds one number
+for the cache roots instead, its *fence*: the change time the state volume
+gives a file made when the snapshot begins (file `fence`). It is read off
+that volume's own clock, which also stamps the folder's entries and may tick
+behind the daemon's (a jiffy on Linux, 15 ms on NTFS), and taking it waits
+for that clock's next tick, 20 ms at most, so that everything the folder
+held before the checkout opened is before the fence. The view below a cache
+root is then a function of the folder and the fence, computed at every
+lookup (`base/fence.go`):
+
+- a file, symlink or special file is shown while its change time is before
+  the fence. Content, metadata and renames move a change time, and no tool
+  sets it back, as installers do with mtimes;
+- a directory is shown unless it was made after the fence, where the
+  filesystem records birth times (APFS, ext4, XFS, Btrfs, NTFS): entries
+  coming and going move a directory's change time, which therefore says
+  nothing;
+- an entry on another volume, such as a mount point below a root, is not
+  shown;
+- every directory above an entry must be a real directory of the folder,
+  checked within the last second. This avoids a path walk per lookup; it is
+  not a containment boundary against concurrent folder changes.
+
+An entry the folder changes after the fence thus leaves the view and never
+changes in it. Each read checks the open inode's change time before handing
+back bytes, even if a writer restored the mtime. A host rewrite, unlink or
+replacement that advances that inode's change time makes the descriptor
+stale (`ESTALE`); NFSv3, which has no open, sees the name gone at its next
+`READ`. Removing a name in the checkout does not change the host inode.
+There is no persistent per-entry state: nothing to build when a checkout
+opens and nothing to delete when it goes. A lookup
+below a cache root costs an `lstat` of the folder: 1.8 µs in a 30,000-entry
+directory, against 2.0 µs for the clone it replaced.
+
+A shown file is the folder's own inode, so that inode is its identity
+(`State`; the root itself keeps its capture node's). That space numbers the
+state volume's inodes, which is why the view needs the folder on that volume
+and cache roots are empty directories elsewhere. A reused inode number
+cannot name two entries: its new holder was made after the fence, which
+hides it (a directory, where the filesystem records birth times). `Locate`
+maps an identity back to its path with `fsgetpath(2)` on
+macOS. Linux has no such call: there a snapshot remembers the paths of the
+last 32,768 identities it handed out, and one it forgot is stale to the
+kernel, which looks the name up again. Windows frontends name files by path.
+
+Two names of one folder file, as cargo links an artifact into `deps/` and
+beside it, share that identity, where a clone gave each name a file of its
+own. While both are the folder's they are one file to a client, as hard
+links are. The first name a checkout copies up takes the identity along, so
+a handle held on the file follows it through a rename or a write; a second
+name copied up is another file by then and gets an identity of its own
+(`overlay.FS.inherit`). In between, the name not yet copied still reads the
+folder's content by path, while a handle on it reads the copy: visible only
+to a tool that rewrites a linked artifact in place instead of replacing it.
+`fsgetpath` names one path of such a file, not always one the checkout still
+shows, so macOS also remembers where files with several names were looked up
+and tries that first.
+
+A snapshot taken by a build that cloned cache roots still holds those clones,
+unread, until it goes; its fence is when it was complete.
+
+## Statistics
+
+The daemon records what it spends its time on below `STATE/stats/`
+(package `stats`), so a busy hour can be explained after it passed:
+
+- a **sample** of the process per interval: user and kernel CPU time and
+  the goroutine count;
+- **timers**, the count and total duration of repeated work per interval:
+  each checkout's file calls (group `calls`, every call a file server makes
+  into a checkout, from pinning it to releasing it), each NFSv3 procedure and
+  NFSv4 `COMPOUND` (`nfs`), each admin operation (`admin`);
+- **jobs**, one line per run of background work, with what it worked on:
+  `snapshot.take` (a cache snapshot: its id and folder), `trash.empty` (one
+  tree deleted by the low-priority thread, with the CPU time its thread
+  used) and `trash.relieve` (one deleted at normal priority because the
+  trash was over its backlog), `base.remove`, `store.sweep`.
+
+Recording costs the caller two atomic additions and two clock reads (30 ns
+on a file call that takes microseconds); a job takes a mutex twice. Nothing
+is written on those paths. Once a minute, and at a stop, the recorder
+appends the interval as one batch of JSON lines to the day's segment,
+`stats/2026-11-20.jsonl` (UTC), unsynced: a crash loses that minute, and a
+torn last line is skipped. Segments older than 14 days are deleted. An
+active checkout adds about a line a minute per kind of call it makes.
+
+    {"t":1795167282,"kind":"sample","dt":53.77,"user_us":186869,"sys_us":2801107,"goroutines":7}
+    {"t":1795167282,"kind":"timer","dt":53.77,"group":"nfs","name":"READDIRPLUS","n":1645,"us":182961}
+    {"t":1795167374,"kind":"job","name":"trash.empty","subject":"caches-c_6b12972204a0","us":69940139,"cpu_us":21665336}
+
+`t` is the Unix time the interval or job ended, `dt` the seconds an
+interval covers, and durations are microseconds. `ovnfs stats --since 2h`
+totals a period, including the interval not yet written and the jobs still
+running; the files are there for anything else:
+
+```sh
+jq -c 'select(.kind == "job" and .us > 10e6)' "$STATE"/stats/*.jsonl   # jobs over 10 s
+```
 
 ## Fast creates
 

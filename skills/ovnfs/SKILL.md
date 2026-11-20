@@ -42,7 +42,9 @@ ovnfs rm fix-auth                   # remove the checkout and unused snapshots
 - Any verb starts the daemon if it isn't running. `ovnfs status` and
   `ovnfs stop` manage it, and `ovnfs restart` replaces it with one from the
   current binary without unmounting (NFS, SMB), so shells inside checkouts
-  carry on; its log is `serve.log` in the state directory.
+  carry on; its log is `serve.log` in the state directory. `ovnfs stats`
+  totals what it spent the last hour on (`--since 10m`, `--since 2d`): CPU,
+  background jobs, file calls per checkout.
 
 ## Choosing what the checkout starts from
 
@@ -131,8 +133,8 @@ is always pruned.
 | Class | In the checkout | Seen by `diff`/`apply`/snapshots |
 | --- | --- | --- |
 | `source` | as captured at open | yes |
-| `cache` (ignored dirs, `node_modules`, ...) | a copy-on-write snapshot of the folder's, taken when the checkout opens; later host builds do not change it; writes go to the checkout only | no |
-| `local` (ignored files, secrets, files over 100 MB) | a copy-on-write snapshot of the folder's, as for `cache`; writes go to the checkout only | no |
+| `cache` (ignored dirs, `node_modules`, ...) | the folder's own files as of the checkout's open: one the folder rewrites or removes later disappears from the checkout (rebuild or reinstall it there), none changes, nothing newer appears; writes go to the checkout only | no |
+| `local` (ignored files, secrets, files over 100 MB) | a copy of the folder's, taken when the checkout opens; writes go to the checkout only | no |
 | `hidden` (`.DS_Store`, Python environments, ...) | absent | no |
 
 - Build outputs and dependency installs inside a checkout never reach the

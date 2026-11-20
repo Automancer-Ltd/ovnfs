@@ -253,8 +253,8 @@ checkouts just opened, before their first write; add `--idle` to spare them.
 `grep PATTERN [DIR|CHECKOUT]` searches contents; `glob PATTERN [DIR|CHECKOUT]`
 lists matching paths. Both run in the daemon. A named checkout, its mounted
 path, or a directory below that path reads the merged overlay directly,
-including memory-resident writes, frozen layers and the cache snapshot's
-cache/local paths.
+including memory-resident writes, frozen layers and the cache and local
+paths as the checkout's cache snapshot fixes them.
 There is no recursive traversal through NFS, FUSE or SMB. Other folders use
 the daemon's native filesystem. Omit the target to search the current directory.
 

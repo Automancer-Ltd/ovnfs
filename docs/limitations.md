@@ -2,14 +2,19 @@
 
 - This is not a sandbox: absolute paths and symlinks can reach the host.
 - The view is best effort, not a frozen snapshot: a source file the user
-  rewrites while the agent is reading it can show either version. Cache and
-  local paths come from a snapshot of them taken in the background after the
-  checkout opens: an edit the folder makes in the moments before the snapshot
-  starts, or before the folder watcher reports one made earlier, can show.
-- Where the state cannot share the folder's blocks (another volume, a
-  filesystem without cloning) cache directories start empty in checkouts, and
-  local paths are copied whole into each snapshot (see
-  [configuration](configuration.md#classes)).
+  rewrites while the agent is reading it can show either version. Local
+  paths are copied in the background after the checkout opens: an edit the
+  folder makes in the moments before, or before the folder watcher reports
+  one made earlier, can show.
+- Cache paths (build output, `node_modules`) are the folder's own files,
+  shown while the folder has not changed them since the checkout opened. One
+  the folder rewrites or removes later disappears from the checkout: a build
+  in the folder can take an artifact away under a build running in a
+  checkout, which then fails to open it and rebuilds it when run again, and
+  a dependency install in the folder removes the replaced packages from the
+  checkouts already open (see [configuration](configuration.md#classes)).
+- A folder on another volume than the state gets its cache directories empty
+  in checkouts, and its local paths copied whole into each snapshot.
 - A tracked file the user changes after open is read from the repository's
   objects; pruning those objects can make it unreadable.
 - Files from git (`--rev`, `--take` from the index or a revision) go through

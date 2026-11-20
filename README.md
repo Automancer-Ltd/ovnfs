@@ -73,6 +73,7 @@ ovnfs grep 'TODO' app          # search in the daemon, without traversing the mo
 ovnfs glob '*.go' app          # matching paths, recursively and ignore-aware
 ovnfs ls .                     # the checkouts of this folder
 ovnfs prune . --idle 7d        # remove those untouched for a week (--dry-run first)
+ovnfs stats --since 2h         # what the daemon spent its time on: CPU, background jobs, calls per checkout
 ovnfs bench                   # compare mounted ovnfs and disk I/O in under 30 seconds
 ovnfs tune                    # try isolated mount configs; ask before applying a balanced winner
 ```
@@ -91,10 +92,13 @@ fails while something uses the mount; a second `stop` forces the unmount.
 
 Opening a folder sorts every path into a class. `source` paths are captured:
 they are what `diff`, `apply` and snapshots see, and the only bytes that leave
-the machine. `cache` and `local` paths (build outputs, ignored files, secrets)
-come from a copy-on-write snapshot of the folder's, taken when the checkout
-opens: a host build changes no checkout, and a path the checkout writes or
-deletes stays its own, and `apply` never carries it back.
+the machine. `cache` paths (build output, `node_modules`) are the folder's
+own files, read in place and shown while the folder has not changed them
+since the checkout opened: nothing is copied however large they are, and a
+host build never hands a checkout newer output, only takes away what it
+rewrote. `local` paths (ignored files, secrets) are copied when the checkout
+opens. A path the checkout writes or deletes stays its own, and `apply`
+never carries it back.
 `hidden` paths are absent. Built-in rules
 handle the common cases; `.o2/ovnfs.yml` and `--rule` override them, and
 `ovnfs explain PATH` says which rule decided.
