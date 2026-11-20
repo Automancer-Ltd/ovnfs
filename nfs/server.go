@@ -24,6 +24,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/stencil-hq/ovnfs/stats"
 )
 
 // Limits both NFS versions advertise.
@@ -45,6 +47,8 @@ type Server struct {
 	// or one answers them one at a time, in order.
 	Concurrency int
 	Logf        func(format string, args ...any)
+	// Stats times the calls answered, by procedure (group "nfs"); nil times none.
+	Stats *stats.Recorder
 
 	once sync.Once
 	// verf is this instance's write verifier: it changes when the server
@@ -58,6 +62,12 @@ type Server struct {
 	resumes resumeCache
 	v3      v3State
 	v4      v4State
+	// timers are the Stats timers of the NFSv3 procedures by number, and of
+	// the NFSv4 COMPOUND, set by start; nil without Stats.
+	timers struct {
+		v3       [v3Count]*stats.Timer
+		compound *stats.Timer
+	}
 }
 
 // Serve accepts connections until the listener fails, and closes it.
@@ -92,6 +102,12 @@ func (s *Server) start() {
 	s.once.Do(func() {
 		_, _ = rand.Read(s.verf[:])
 		s.v4.start(s)
+		for proc, p := range v3procs {
+			if p.run != nil {
+				s.timers.v3[proc] = s.Stats.Timer("nfs", p.name)
+			}
+		}
+		s.timers.compound = s.Stats.Timer("nfs", "COMPOUND")
 	})
 }
 

@@ -124,6 +124,7 @@ func (s *Server) nfs4(c *call, res *encoder) acceptStat {
 		return rpcSuccess
 	case proc4Compound:
 		defer s.changes.Add(1)
+		defer s.timers.compound.Since(s.timers.compound.Start())
 		return s.compound4(c, res)
 	}
 	return rpcProcUnavail

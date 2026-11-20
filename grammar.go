@@ -137,6 +137,7 @@ type verbs struct {
 	Subscribe   subscribeCmd              `cmd:"" group:"daemon" help:"stream daemon events as JSON lines until interrupted"`
 	Ctl         ctlCmd                    `cmd:"" group:"daemon" help:"send one raw admin request and print the raw reply"`
 	Profile     profileCmd                `cmd:"" group:"daemon" help:"capture a runtime profile from the daemon (cpu, heap, allocs, goroutine, block, mutex, threadcreate)"`
+	Stats       statsCmd                  `cmd:"" group:"daemon" help:"total what the daemon spent its time on: CPU, background jobs, file calls per checkout, NFS procedures"`
 	Bench       benchCmd                  `cmd:"" group:"daemon" help:"compare mounted ovnfs and disk I/O in under 30 seconds"`
 	BenchIO     benchIOCmd                `cmd:"" name:"bench-io" hidden:"" help:"internal benchmark I/O worker"`
 	Tune        tuneCmd                   `cmd:"" group:"daemon" help:"compare isolated mount configurations and optionally apply a balanced winner"`

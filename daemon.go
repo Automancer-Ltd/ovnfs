@@ -428,9 +428,7 @@ func (cmd *statusCmd) Run(c *cli) error {
 // printStatus prints a status reply's rows and warns, without failing, when
 // the daemon runs a different build than this CLI.
 func printStatus(out, warnings io.Writer, st *api.Status, clientVersion string) {
-	for _, row := range statusRows(*st, clientVersion) {
-		fmt.Fprintf(out, "%s%s%s\n", paint(out, styleDim, row[0]), strings.Repeat(" ", max(2, 12-len(row[0]))), row[1])
-	}
+	labelled(out, statusRows(*st, clientVersion))
 	if st.BuildVersion != "" && st.BuildVersion != "(devel)" &&
 		clientVersion != "" && clientVersion != "(devel)" && st.BuildVersion != clientVersion {
 		fmt.Fprintf(warnings, "%s daemon %s differs from CLI %s; "+

@@ -29,6 +29,7 @@ import (
 	"github.com/stencil-hq/ovnfs/manifest"
 	"github.com/stencil-hq/ovnfs/overlay"
 	"github.com/stencil-hq/ovnfs/smb"
+	"github.com/stencil-hq/ovnfs/stats"
 	"github.com/stencil-hq/ovnfs/winfsp"
 )
 
@@ -232,8 +233,15 @@ func (cmd *serveCmd) Run(c *cli) (err error) {
 	if err != nil {
 		return fmt.Errorf("node id: %w", err)
 	}
+	// The record of what the daemon spends its time on is a diagnostic: the
+	// daemon serves without it.
+	rec, err := stats.Open(filepath.Join(state, "stats"), log.Printf)
+	if err != nil {
+		log.Printf("recording no statistics: %v", err)
+	}
+	defer rec.Close() // after the registry's, whose final work it records
 	reg, err := checkout.Open(checkout.Config{State: state, Mount: mount, UserHome: userHome, Node: node, Emit: hub.emit, Fetch: lk.fetch, Search: lk.search,
-		Memory: mem, BlobCache: int64(cmd.BlobCache), GitRemotes: cmd.GitRemotes, Logf: log.Printf,
+		Memory: mem, BlobCache: int64(cmd.BlobCache), GitRemotes: cmd.GitRemotes, Logf: log.Printf, Stats: rec,
 		Quiesce: func(ctx context.Context) (func(), error) {
 			if s := smbServer.Load(); s != nil {
 				return s.Quiesce(ctx)
@@ -324,7 +332,7 @@ func (cmd *serveCmd) Run(c *cli) (err error) {
 	go lk.listen(linkListener)
 	stops := make(chan stopRequest)
 	welcome := admin.Welcome{Version: protocolVersion, Ops: api.Ops, Features: api.Features, Proto: proto, Port: port, Mount: mount, State: state}
-	handler := &opsHandler{reg: reg, shares: checkoutShares, links: lk, welcome: welcome, started: time.Now(), stop: func(ctx context.Context, a api.StopArgs) error {
+	handler := &opsHandler{reg: reg, shares: checkoutShares, links: lk, stats: rec, welcome: welcome, started: time.Now(), stop: func(ctx context.Context, a api.StopArgs) error {
 		done := make(chan error, 1)
 		select {
 		case stops <- stopRequest{keepMount: a.KeepMount, ctx: ctx, done: done}:
@@ -601,7 +609,7 @@ func listenAndMount(reg *checkout.Registry, e *export.Export, proto, address, st
 		smbStarted(s)
 		go func() { served <- fmt.Errorf("smb serve: %w", s.Serve(files)) }()
 	} else {
-		go func() { served <- fmt.Errorf("nfs serve: %w", serveNFS(files, e)) }()
+		go func() { served <- fmt.Errorf("nfs serve: %w", serveNFS(files, e, reg.Stats())) }()
 	}
 	if err = attach(proto, listener.Addr(), mount, user, password, settings); err != nil {
 		files.cut()
@@ -624,7 +632,7 @@ func mountLocal(reg *checkout.Registry, e *export.Export, state, mount string, s
 		return nil, fmt.Errorf("persist listen: %w", err)
 	}
 	stopped := make(chan error, 1)
-	go func() { stopped <- serveNFS(files, e) }()
+	go func() { stopped <- serveNFS(files, e, reg.Stats()) }()
 	if err = attach("nfs", l.Addr(), mount, "", "", settings); err != nil {
 		files.cut()
 		<-stopped

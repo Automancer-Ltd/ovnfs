@@ -8,7 +8,7 @@ package api
 import "time"
 
 // Ops lists every operation the daemon serves, in CLI help order.
-var Ops = []string{"status", "ls", "new", "fork", "snap", "diff", "grep", "glob", "apply", "land", "pull", "rm", "prune", "drop", "explain", "plan", "profile", "attach", "push", "share", "subscribe", "stop"}
+var Ops = []string{"status", "ls", "new", "fork", "snap", "diff", "grep", "glob", "apply", "land", "pull", "rm", "prune", "drop", "explain", "plan", "profile", "stats", "attach", "push", "share", "subscribe", "stop"}
 
 // Features names optional request fields this daemon honors, so clients can rely on
 // them without a new protocol generation: "new.base" (NewArgs.Base),
@@ -493,4 +493,57 @@ type ProfileReply struct {
 	Seconds float64 `json:"seconds"` // sampling window; 0 for a snapshot
 	Bytes   int     `json:"bytes"`   // decoded profile size
 	Data    string  `json:"data"`    // base64 pprof bytes
+}
+
+// StatsArgs selects the period stats totals.
+type StatsArgs struct {
+	Since float64 `json:"since_s,omitempty"` // seconds back from now; an hour when 0
+}
+
+// StatsReply totals what the daemon spent a period on, from the record it
+// keeps below STATE/stats (package stats): the process's CPU time, its
+// background jobs, and the repeated work it timed.
+type StatsReply struct {
+	From     time.Time    `json:"from"`
+	To       time.Time    `json:"to"`
+	Recorded float64      `json:"recorded_s"` // seconds of the period a daemon ran and recorded
+	CPU      StatsCPU     `json:"cpu"`
+	Jobs     []StatsJob   `json:"jobs"`    // finished background work by kind, longest total first
+	Running  []StatsRun   `json:"running"` // background work in progress, longest first
+	Timers   []StatsTimer `json:"timers"`  // repeated work by group, then longest total first
+}
+
+// StatsCPU is the daemon's processor time over a period.
+type StatsCPU struct {
+	User   float64   `json:"user_s"`
+	Sys    float64   `json:"sys_s"`   // in the kernel: file system calls, mostly
+	Peak   float64   `json:"peak"`    // cores busy over the busiest recorded interval (a minute)
+	PeakAt time.Time `json:"peak_at"` // when that interval ended; zero without one
+}
+
+// StatsJob totals the finished runs of one kind of background work, such as
+// "snapshot.take" or "trash.empty".
+type StatsJob struct {
+	Name           string  `json:"name"`
+	Runs           int     `json:"runs"`
+	Seconds        float64 `json:"seconds"`         // from start to end, waiting included
+	CPU            float64 `json:"cpu_s,omitempty"` // processor time, for kinds that measure it
+	Longest        string  `json:"longest"`         // what the longest run worked on
+	LongestSeconds float64 `json:"longest_s"`
+}
+
+// StatsRun is background work in progress.
+type StatsRun struct {
+	Name    string  `json:"name"`
+	Subject string  `json:"subject"` // what it works on
+	Seconds float64 `json:"seconds"` // so far
+}
+
+// StatsTimer totals one kind of repeated work: group "calls" is a checkout's
+// file calls (Name), "nfs" an NFS procedure, "admin" an admin operation.
+type StatsTimer struct {
+	Group   string  `json:"group"`
+	Name    string  `json:"name"`
+	Count   int64   `json:"count"`
+	Seconds float64 `json:"seconds"`
 }

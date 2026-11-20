@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"time"
 
 	"github.com/stencil-hq/ovnfs/admin"
 	"github.com/stencil-hq/ovnfs/api"
 	"github.com/stencil-hq/ovnfs/checkout"
+	"github.com/stencil-hq/ovnfs/stats"
 )
 
 // protocolVersion is the admin protocol generation: one op per CLI verb, shapes in package api.
@@ -22,6 +24,7 @@ type opsHandler struct {
 	reg     *checkout.Registry
 	shares  *shares
 	links   *links
+	stats   *stats.Recorder // nil when the record could not be opened
 	welcome admin.Welcome
 	started time.Time
 	stop    func(context.Context, api.StopArgs) error // unmounts as asked, then has the server exit
@@ -57,8 +60,14 @@ func done[A any](fn func(context.Context, A) error) func(context.Context, A) (st
 	return func(ctx context.Context, a A) (struct{}, error) { return struct{}{}, fn(ctx, a) }
 }
 
-// Call dispatches one operation; see package api for argument and reply shapes.
+// Call dispatches one operation, timed as "admin" work; see package api for
+// argument and reply shapes.
 func (h *opsHandler) Call(ctx context.Context, op string, raw json.RawMessage) (any, error) {
+	// Only the daemon's own operations: a client names no timer of its own.
+	if slices.Contains(api.Ops, op) {
+		timer := h.stats.Timer("admin", op)
+		defer timer.Since(timer.Start())
+	}
 	switch op {
 	case "status":
 		return dispatch(ctx, raw, func(context.Context, struct{}) (api.Status, error) {
@@ -100,6 +109,8 @@ func (h *opsHandler) Call(ctx context.Context, op string, raw json.RawMessage) (
 		return dispatch(ctx, raw, h.reg.Plan)
 	case "profile":
 		return dispatch(ctx, raw, captureProfile)
+	case "stats":
+		return dispatch(ctx, raw, h.stats.Report)
 	case "attach":
 		return dispatch(ctx, raw, h.links.attach)
 	case "pull":

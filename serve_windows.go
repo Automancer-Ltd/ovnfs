@@ -5,12 +5,13 @@ package main
 import (
 	"fmt"
 	"github.com/stencil-hq/ovnfs/export"
+	"github.com/stencil-hq/ovnfs/stats"
 	"net"
 	"os"
 )
 
 // serveNFS rejects a protocol unavailable on Windows.
-func serveNFS(net.Listener, *export.Export) error {
+func serveNFS(net.Listener, *export.Export, *stats.Recorder) error {
 	return fmt.Errorf("NFS serving unsupported on Windows; use -proto smb")
 }
 

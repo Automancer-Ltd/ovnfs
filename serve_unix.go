@@ -13,13 +13,14 @@ import (
 
 	"github.com/stencil-hq/ovnfs/export"
 	"github.com/stencil-hq/ovnfs/nfs"
+	"github.com/stencil-hq/ovnfs/stats"
 )
 
 // serveNFS serves NFSv3 and NFSv4 on the persistent export. NFSv4 clients
 // get read delegations, recalled whenever the export reports a change made
 // behind their back.
-func serveNFS(l net.Listener, e *export.Export) error {
-	srv := &nfs.Server{FS: e.NFS(), Concurrency: 64}
+func serveNFS(l net.Listener, e *export.Export, rec *stats.Recorder) error {
+	srv := &nfs.Server{FS: e.NFS(), Concurrency: 64, Stats: rec}
 	if os.Getenv("LOG_LEVEL") != "" {
 		srv.Logf = log.Printf
 	}
