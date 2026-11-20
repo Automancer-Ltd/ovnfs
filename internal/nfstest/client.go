@@ -26,6 +26,8 @@ const (
 	Access uint32 = 13
 	Exist  uint32 = 17
 	XDev   uint32 = 18
+	IsDir  uint32 = 21
+	Inval  uint32 = 22
 	Stale  uint32 = 70
 )
 
@@ -177,13 +179,13 @@ func (c *Client) Write(handle []byte, offset uint64, data []byte, stable uint32)
 	return result.Count, result.Committed, status, err
 }
 
-// Commit flushes all buffered writes for handle.
-func (c *Client) Commit(handle []byte) (uint32, error) {
+// Commit requests a barrier for the range; a zero count means through EOF.
+func (c *Client) Commit(handle []byte, offset uint64, count uint32) (uint32, error) {
 	args := struct {
 		Handle []byte
 		Offset uint64
 		Count  uint32
-	}{Handle: handle}
+	}{handle, offset, count}
 	r, status, err := c.call(client.Nfs3Prog, client.NFSProc3Commit, args)
 	if err == nil && status == OK {
 		var result struct {

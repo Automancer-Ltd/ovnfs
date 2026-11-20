@@ -26,7 +26,8 @@ import (
 // the entries' identities.
 type testFS struct {
 	billy.Filesystem
-	root string
+	root  string
+	files billy.Basic // BoundOS returns syncable descriptors; ChrootOS wraps away Sync.
 	// cacheable is Backend.Cacheable; nil admits nothing.
 	cacheable func(p string) bool
 
@@ -46,6 +47,7 @@ func newTestFS(t testing.TB) *testFS {
 	}
 	return &testFS{
 		Filesystem: osfs.New(root),
+		files:      osfs.New(root, osfs.WithBoundOS()),
 		root:       root,
 		ids:        map[string]uint64{"": 1},
 		paths:      map[uint64]string{1: ""},
@@ -95,6 +97,10 @@ func (f *testFS) Path(id, gen uint64) (string, bool) {
 	defer f.mu.Unlock()
 	p, ok := f.paths[id]
 	return p, ok && f.gens[id] == gen
+}
+
+func (f *testFS) OpenFile(p string, flag int, perm os.FileMode) (billy.File, error) {
+	return f.files.OpenFile(p, flag, perm)
 }
 
 func (f *testFS) SyncFile(p string, id, gen uint64, writer billy.File) error {

@@ -261,6 +261,7 @@ func (s *Server) write3(d *decoder, res *encoder) status {
 	if count > math.MaxInt32 || off > math.MaxInt64 {
 		return stFBig
 	}
+	// The filehandle names the object to write, not a path to follow.
 	info, err := s.FS.Lstat(p)
 	if err != nil {
 		return statusOf(err)

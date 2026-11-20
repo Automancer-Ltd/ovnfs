@@ -122,7 +122,7 @@ type serveCmd struct {
 	Proto      string   `help:"File server protocol: nfs, smb, fuse or winfsp." default:"${default_proto}" enum:"nfs,smb,fuse,winfsp"`
 	Listen     string   `help:"File server address; defaults to a free local port or a Unix socket for NFS on macOS."`
 	Memory     byteSize `help:"Memory budget for small written files; 0 writes every file to disk." default:"${memory_default}"`
-	Fsync      bool     `help:"Spill and sync memory files on fsync (NFS does not forward fsync)." default:"${fsync_default}"`
+	Fsync      bool     `help:"Spill and sync memory files on handle fsync. NFS stable writes and COMMIT always flush." default:"${fsync_default}"`
 	BlobCache  byteSize `help:"Memory budget for small content-addressed blobs; 0 disables." default:"${blob_cache_default}"`
 	Atime      bool     `help:"Allow access time updates on the mount." default:"${atime_default}"`
 	NFSIOSize  byteSize `name:"nfs-io-size" help:"NFS read/write transfer size (power of two, 4K to 1M)." default:"${nfs_io_size_default}"`

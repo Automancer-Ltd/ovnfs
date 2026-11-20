@@ -1035,6 +1035,9 @@ func (b blobFiles) Open(id string) (overlay.Content, error) {
 	return c, nil
 }
 
+// SyncBlob flushes a stored file without copying it back into an upper.
+func (b blobFiles) SyncBlob(id string) error { return b.st.SyncBlob(store.OID(id)) }
+
 // CopyTo clones blob id to the new file dst.
 func (b blobFiles) CopyTo(id, dst string, perm os.FileMode) error {
 	return b.st.CloneBlob(store.OID(id), dst, perm)

@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"github.com/stencil-hq/ovnfs/internal/clone"
+	"github.com/stencil-hq/ovnfs/internal/durable"
 	"github.com/stencil-hq/ovnfs/internal/hostfile"
 )
 
@@ -300,6 +301,62 @@ func (s *Store) Open(id OID) (Reader, error) {
 		return nil, fmt.Errorf("open object %s: %w", id, err)
 	}
 	return f, nil
+}
+
+// SyncBlob flushes the backing of a blob, not the reader returned by Open
+// (which may just be a cache hit). A delta can depend on a loose base;
+// manifests and their chunks are packed. Only the active pack is unsealed.
+func (s *Store) SyncBlob(id OID) error {
+	if !id.Valid() {
+		return fmt.Errorf("sync object %q: malformed id", id)
+	}
+	s.mu.RLock() // no sweep may move the backing during the barrier
+	defer s.mu.RUnlock()
+	p := s.packs
+	p.appendMu.Lock()
+	defer p.appendMu.Unlock()
+
+	e, packed := p.lookup(rawOf(id))
+	looseID := id
+	if packed {
+		looseID = ""
+		if e.flags&frameDelta != 0 {
+			root, ok := p.chainRoot(e.base)
+			if !ok {
+				return errCorrupt
+			}
+			if _, ok := p.lookup(root); !ok {
+				looseID = root.oid()
+			}
+		}
+	}
+	if looseID != "" {
+		loose := s.objectPath(looseID)
+		f, err := hostfile.Open(loose)
+		if err != nil {
+			return err
+		}
+		if err := errors.Join(f.Sync(), f.Close()); err != nil {
+			return err
+		}
+		if err := durable.Dir(filepath.Dir(loose)); err != nil {
+			return err
+		}
+		if err := durable.Dir(s.objects); err != nil {
+			return err
+		}
+	}
+	if packed {
+		if p.active != nil {
+			if err := p.active.f.Sync(); err != nil {
+				return err
+			}
+		}
+		if err := durable.Dir(p.dir); err != nil {
+			return err
+		}
+	}
+	return durable.Dir(filepath.Dir(p.dir))
 }
 
 // Size returns the content length of stored object id without reading it, for

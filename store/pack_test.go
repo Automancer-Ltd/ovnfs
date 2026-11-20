@@ -111,6 +111,24 @@ func TestPackCompresses(t *testing.T) {
 	mustRead(t, s, empty, nil)
 }
 
+// A cached blob is not stable if its active pack cannot be flushed.
+func TestSyncBlobRequiresBackingPack(t *testing.T) {
+	s := openStore(t)
+	id, err := s.PutBytes([]byte("still cached"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SyncBlob(id); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.packs.active.f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SyncBlob(id); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("sync with closed backing pack: %v", err)
+	}
+}
+
 // TestPackTornTail drops an incomplete or garbled tail of the active pack at
 // Open, keeping every complete frame before it, and appends after the cut.
 func TestPackTornTail(t *testing.T) {

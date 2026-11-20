@@ -170,7 +170,12 @@ func (x *v4compound) commit() status {
 	if s != stOK {
 		return s
 	}
-	if err := x.s.FS.SyncFile(cur.path, cur.id, x.handleGen(cur), nil); err != nil {
+	var writer billy.File
+	if kept := x.s.v4.commitWriter(cur.id); kept != nil {
+		defer x.s.v4.release(kept)
+		writer = kept.f
+	}
+	if err := x.s.FS.SyncFile(cur.path, cur.id, x.handleGen(cur), writer); err != nil {
 		return statusOf(err)
 	}
 	x.e.fixed(x.s.verf[:])

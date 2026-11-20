@@ -356,9 +356,34 @@ func TestNFSWriteDurability(t *testing.T) {
 	status, err = c.Rename(dir, "buffered", dir, "moved")
 	nfsStatus(t, status, nfstest.OK, err)
 	checkBuffered("moved")
-	status, err = c.Commit(buffered)
+	status, err = c.Commit(buffered, 2, 3)
 	nfsStatus(t, status, nfstest.OK, err)
 	checkDisk("moved", "pending")
+
+	status, err = c.Commit(dir, 0, 0)
+	nfsStatus(t, status, nfstest.IsDir, err)
+	link, status, err := c.Symlink(dir, "link", "moved")
+	nfsStatus(t, status, nfstest.OK, err)
+	_, _, status, err = c.Write(link, 0, []byte("wrong!!"), nfstest.FileSync)
+	nfsStatus(t, status, nfstest.Inval, err)
+	checkDisk("moved", "pending")
+
+	// A snapshot between WRITE and COMMIT must not make an old cached
+	// writer sync a closed descriptor, or copy a frozen file back up.
+	if _, err := f.reg.Snap(t.Context(), api.SnapArgs{Checkout: "co", Wait: true}); err != nil {
+		t.Fatal(err)
+	}
+	status, err = c.Commit(buffered, 0, 0)
+	nfsStatus(t, status, nfstest.OK, err)
+	nfsRead(t, c, buffered, "pending")
+	if err := f.reg.Enter("co", &session); err != nil {
+		t.Fatal(err)
+	}
+	current := filepath.Join(session.FS.Upper(), "nested", "moved")
+	session.Done()
+	if _, err := os.Stat(current); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("COMMIT copied up a frozen file: %v", err)
+	}
 }
 
 func TestNFSWriteDurabilityFailure(t *testing.T) {
@@ -385,14 +410,14 @@ func TestNFSWriteDurabilityFailure(t *testing.T) {
 	})
 	_, _, status, err = c.Write(fh, 0, []byte("retry"), nfstest.FileSync)
 	nfsStatus(t, status, nfstest.NoEnt, err)
-	status, err = c.Commit(fh)
+	status, err = c.Commit(fh, 0, 0)
 	nfsStatus(t, status, nfstest.NoEnt, err)
 	nfsRead(t, c, fh, "retry")
 
 	if err := os.Rename(work+".saved", work); err != nil {
 		t.Fatal(err)
 	}
-	status, err = c.Commit(fh)
+	status, err = c.Commit(fh, 0, 0)
 	nfsStatus(t, status, nfstest.OK, err)
 	got, err := os.ReadFile(filepath.Join(upper, "file"))
 	if err != nil || string(got) != "retry" {

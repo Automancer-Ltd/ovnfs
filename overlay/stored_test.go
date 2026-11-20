@@ -32,6 +32,9 @@ func (b memBlobs) Open(id string) (Content, error) {
 	return ByteContent(data), nil
 }
 
+// memBlobs has no stable storage.
+func (b memBlobs) SyncBlob(string) error { return errors.ErrUnsupported }
+
 // CopyTo writes blob id to the new file dst.
 func (b memBlobs) CopyTo(id, dst string, perm os.FileMode) error {
 	data, ok := b[id]

@@ -424,7 +424,19 @@ func (st *v4State) kept(id v4StateID, file uint64) *v4Kept {
 	return nil
 }
 
-// release lets go of a reference keptLocked took; nil is none.
+// commitWriter borrows the file's retained writer, if any. COMMIT carries
+// no stateid and may follow a chmod that now forbids opening the file.
+func (st *v4State) commitWriter(file uint64) *v4Kept {
+	st.mu.Lock()
+	defer st.unlock()
+	if f := st.files[file]; f != nil && f.kept != nil {
+		f.kept.refs++
+		return f.kept
+	}
+	return nil
+}
+
+// release lets go of a borrowed reference; nil is none.
 func (st *v4State) release(k *v4Kept) {
 	if k == nil {
 		return

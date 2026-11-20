@@ -29,6 +29,8 @@ import (
 type Blobs interface {
 	// Open returns blob id's bytes: a file's content or a symlink's target.
 	Open(id string) (Content, error)
+	// SyncBlob flushes the storage needed to read blob id after a crash.
+	SyncBlob(id string) error
 	// CopyTo writes blob id to the new regular file dst with permissions perm.
 	CopyTo(id, dst string, perm os.FileMode) error
 }

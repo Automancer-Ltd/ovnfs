@@ -419,12 +419,15 @@ func TestV4WriteUnderLockStateIDAfterChmod(t *testing.T) {
 	o := c.mustOpen("o", "f", share4AccessAll, true)
 	r := c.run(v4Root(), v4Look("f"),
 		v4Lock(v4lockArgs{typ: lock4Write, length: length4EOF, fresh: true, open: o.id, owner: c.owner("l")}),
-		v4SetAttr(stateid4Anon, v4Mode(0o444)))
+		v4SetAttr(stateid4Anon, v4Mode(0)))
 	r.skip(op4PutRootFH, op4Lookup)
 	lock := getStateID4(r.next(op4Lock, stOK))
 	r.next(op4SetAttr, stOK)
-	if s := c.run(v4Root(), v4Look("f"), v4Write(lock, 0, "data")).status; s != stOK {
-		t.Fatalf("WRITE under the lock stateid: status %d", s)
+	if s := c.run(v4Root(), v4Look("f"), v4WriteHow(lock, 0, "data", stable4Unstable), v4Commit()).status; s != stOK {
+		t.Fatalf("WRITE under the lock stateid and COMMIT after chmod: status %d", s)
+	}
+	if err := os.Chmod(fs.host("f"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	if data, _ := os.ReadFile(fs.host("f")); string(data) != "data" {
 		t.Fatalf("f = %q", data)

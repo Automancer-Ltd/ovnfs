@@ -227,8 +227,9 @@ listens, and a client whose daemon fails its load quotes the daemon's log.
 Metadata uses `fsync(2)`, not `F_FULLFSYNC`: it survives server crashes, not
 power loss. `state.json` is synced after its rename, so a kernel crash during
 that sync can leave it empty on filesystems that do not order data before
-renames (ext4's defaults do). Store objects are synced only when a full pack is
-sealed or a pack is rewritten. `snap --wait` waits for hashing, not an object
+renames (ext4's defaults do). Store objects are normally synced when a full
+pack is sealed or a pack is rewritten; an NFS COMMIT of a file already in
+the store also syncs its backing. `snap --wait` waits for hashing, not an object
 durability barrier: a kernel crash or power loss can lose active-pack appends
 even when snapshot metadata was synced.
 
@@ -514,8 +515,8 @@ per file written in the last 2 s; files deleted sooner never reach the disk.
 Directories, symlinks and whiteouts always live in the upper. A deleted name
 keeps its whiteout on disk until the new memory file at that name spills.
 On FUSE, SMB and WinFsp a handle sync spills memory files only with `--fsync`.
-NFS stable writes and COMMIT spill and sync their file and its directory
-metadata regardless of the flag; unstable writes can stay in memory.
+[NFS stable writes and COMMIT](platforms.md#nfs) spill and sync their file
+regardless of the flag; unstable writes can stay in memory.
 
 When a file's write to disk fails (a full disk, say), the file stays in memory
 and the daemon retries it every second. While any file waits, new files go to

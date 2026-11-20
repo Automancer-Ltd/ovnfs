@@ -80,9 +80,18 @@ Cached writers are keyed by file id and path, so renames reopen at the current
 path; the export's generation-aware handles preserve snapshot isolation.
 
 NFSv3 and NFSv4 mark `UNSTABLE` writes as buffered. `DATA_SYNC`, `FILE_SYNC`
-and `COMMIT` spill the addressed file if needed and sync its data and the
-directories needed to recover its name before acknowledging success. A
-failed sync returns an error. This does not require `serve --fsync`.
+and `COMMIT` (including a byte-range `COMMIT`) flush the whole addressed file,
+not every buffered file. For a live upper this spills a memory file and
+syncs its data, identity metadata and the directories on its current path
+before replying. A failed barrier returns an NFS error, regardless of
+`serve --fsync`.
+
+A client can implement `fsync` of dirty data with these requests; NFS has
+no standalone file or directory `fsync` RPC. An application `fsync` that
+sends no WRITE or COMMIT cannot force an empty create, rename or other
+metadata-only change to disk. This is not a transaction over an old and
+new pathname, a snapshot durability barrier, or a general power-loss
+guarantee for the checkout; see [persistence](internals.md#persistence).
 
 Calls on one file keep their arrival order wherever replies show it. WRITE
 and SETATTR run one at a time per file, each reporting the attributes from

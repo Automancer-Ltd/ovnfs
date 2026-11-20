@@ -21,7 +21,7 @@ func (f *FS) SyncFile(name string, id ident.ID, opened billy.File) error {
 	f.await(p)
 	f.mu.RLock()
 	p, src, err := f.syncSource(p, id)
-	if err == nil && f.files[p] != nil {
+	for err == nil && f.files[p] != nil {
 		f.mu.RUnlock()
 		p, err = f.spillForSync(p, id)
 		if err != nil {
@@ -51,7 +51,8 @@ func (f *FS) SyncFile(name string, id ident.ID, opened billy.File) error {
 	if src.layer != nil {
 		return src.layer.Content(p, func(_, blob string) error {
 			if blob != "" {
-				return nil // The store durably published this content.
+				// A completed snapshot may still live in an unsynced pack.
+				return src.layer.blobs.SyncBlob(blob)
 			}
 			return syncHostFile(src.layer.dir, p, nil)
 		})
@@ -115,6 +116,15 @@ func syncHostFile(root, p string, fd *os.File) (err error) {
 				err = closeErr
 			}
 		}()
+	}
+	// Where xattrs are unavailable, the handle's identity lives in a log,
+	// not on the data inode. Directory fsync alone does not flush that log.
+	table, err := hostfile.OpenFile(filepath.Join(root, tableName), os.O_RDWR, 0)
+	if err == nil {
+		err = errors.Join(durable.Sync(table), table.Close())
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	// A spill can publish a new name below copied-up directories. Sync the
 	// names before the file's final sync (F_FULLFSYNC on Darwin).
