@@ -59,6 +59,7 @@ type runner struct {
 // before the workload's rounds and returns the function running one round.
 var workloads = map[string]func(*runner) (func(round int) error, error){
 	wire.Net:    (*runner).netRounds,
+	wire.Trap:   (*runner).trapRounds,
 	wire.Walk:   (*runner).walkRounds,
 	wire.Git:    (*runner).gitRounds,
 	wire.Rg:     (*runner).rgRounds,

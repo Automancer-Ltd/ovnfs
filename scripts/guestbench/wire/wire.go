@@ -168,6 +168,9 @@ type Event struct {
 const (
 	// Net calibrates the VM's network against the host's echo server.
 	Net = "net"
+	// Trap measures one uncached round trip to whatever serves the tree: a
+	// statfs of the tree's root, which no client answers from a cache.
+	Trap = "trap"
 	// Walk lstats every entry of the tree.
 	Walk = "walk"
 	// Git runs `git status --porcelain` in the tree.
@@ -190,20 +193,21 @@ const (
 )
 
 // Workloads lists every workload in the order the runner runs them.
-var Workloads = []string{Net, Walk, Git, Rg, Fio, Small, Replay, Cargo, Verify}
+var Workloads = []string{Net, Trap, Walk, Git, Rg, Fio, Small, Replay, Cargo, Verify}
 
 // Phases lists each workload's phases in run order. A ".cold" phase starts
 // with the tree remounted (except KindLocal) and the guest's caches dropped.
 var Phases = map[string][]string{
 	Net:    {"net.rr", "net.up", "net.down"},
+	Trap:   {"trap.one", "trap.par"},
 	Walk:   {"walk.cold", "walk.warm"},
 	Git:    {"git.cold", "git.warm"},
 	Rg:     {"rg.cold", "rg.warm"},
 	Fio:    {"fio.seq-write", "fio.seq-read", "fio.rand-write", "fio.rand-read"},
-	Small:  {"small.create", "small.stat", "small.rename", "small.unlink"},
+	Small:  {"small.create", "small.sync", "small.stat", "small.rename", "small.unlink", "small.settle"},
 	Replay: {"replay.cold", "replay.no-op", "replay.touch", "replay.clean"},
 	Cargo:  {"cargo.cold", "cargo.no-op", "cargo.touch"},
-	Verify: {"verify.tree", "verify.data"},
+	Verify: {"verify.tree", "verify.data", "verify.churn"},
 }
 
 // Modes of the calibration server, sent as the first byte of a connection.

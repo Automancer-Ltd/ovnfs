@@ -25,8 +25,10 @@ const mib = 1 << 20
 
 // verifyRounds checks, in the first round only, that the tree returns the
 // bytes git recorded for every tracked file and the bytes the guest writes
-// through a range of write patterns. Both phases read after a cold reset,
-// so the bytes come from the filesystem rather than the guest's caches.
+// through a range of write patterns, then that random operation sequences
+// behave as POSIX requires (see churnPhase). The first two phases read
+// after a cold reset, so the bytes come from the filesystem rather than the
+// guest's caches.
 func (r *runner) verifyRounds() (func(round int) error, error) {
 	var blobs []blob
 	listBlobs := func() (err error) {
@@ -58,6 +60,7 @@ func (r *runner) verifyRounds() (func(round int) error, error) {
 		if err := r.phases(round, []phase{
 			{name: "verify.tree", before: listBlobs, cold: true, body: checkTree},
 			{name: "verify.data", before: write, cold: true, body: checkData},
+			r.churnPhase(),
 		}); err != nil {
 			return err
 		}

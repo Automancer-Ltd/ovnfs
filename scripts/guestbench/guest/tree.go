@@ -367,6 +367,21 @@ func moduleCalls() string {
 	return string(data)
 }
 
+// syncTree writes back everything pending on the tree's filesystem with
+// syncfs(2) and waits for it, without flushing the guest's other
+// filesystems as sync would.
+func (r *runner) syncTree() error {
+	f, err := os.Open(r.root)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := unix.Syncfs(int(f.Fd())); err != nil {
+		return fmt.Errorf("syncfs %s: %w", r.root, err)
+	}
+	return nil
+}
+
 // target is the tree's cargo target directory.
 func (r *runner) target() string { return filepath.Join(r.root, "target") }
 

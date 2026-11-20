@@ -107,6 +107,9 @@ type smallSet struct {
 
 // smallRounds times creating, stat'ing, renaming and unlinking many small
 // files in the tree's scratch directory, which each round removes again.
+// A syncfs after the creates and another after the unlinks time the work
+// those phases left undone: ext4's writeback, a network client's flush, the
+// module's journal.
 func (r *runner) smallRounds() (func(round int) error, error) {
 	var s smallSet
 	for d := range smallDirs {
@@ -168,12 +171,15 @@ func (r *runner) smallRounds() (func(round int) error, error) {
 		}
 		return os.Remove(s.dirs[d])
 	}
+	settle := func() (result, error) { return result{ops: smallFiles}, r.syncTree() }
 	return func(round int) error {
 		if err := r.phases(round, []phase{
 			{name: "small.create", before: fresh, body: each(create)},
+			{name: "small.sync", body: settle},
 			{name: "small.stat", body: each(stat)},
 			{name: "small.rename", body: each(rename)},
 			{name: "small.unlink", body: each(unlink)},
+			{name: "small.settle", body: settle},
 		}); err != nil {
 			return err
 		}
