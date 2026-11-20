@@ -198,10 +198,12 @@ diverge. `new --from SNAP` opens a checkout on any snapshot, and
 `new --base CHECKOUT` on what a live checkout started from (its capture, which
 `--base` also takes by the id `ls --json` shows), with the git state that
 checkout started from, however the folder and the checkout have changed since:
-an untouched baseline to build or test beside it. `rm` removes a checkout and its snapshots
-unless another checkout or snapshot uses them. `rm --sticky-snapshots` keeps
-them; `drop` releases one explicitly. Nothing replaces the content of a live
-folder: rollback means a new checkout from a snapshot.
+an untouched baseline to build or test beside it. `rm` removes a checkout and
+its snapshots unless another checkout or snapshot uses them.
+`rm --sticky-snapshots` keeps them, even if a later checkout reuses the name.
+Both `rm` and `prune` keep older snapshots whose checkout instance was not
+recorded. Use `drop` to release a snapshot explicitly. Nothing replaces the
+content of a live folder: rollback means a new checkout from a snapshot.
 
 `rm` discards whatever the checkout holds that was not applied, without
 asking, and prints `removed NAME`. The one thing it refuses to discard is a
