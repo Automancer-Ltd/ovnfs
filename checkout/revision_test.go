@@ -138,6 +138,108 @@ func TestNewRevisionDirtyFolder(t *testing.T) {
 	assertDiff("other.txt")
 }
 
+func TestNewRevisionHiddenRules(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	dir := folder(t, map[string]string{"public/a.txt": "before\n", "private/s.txt": "private\n"})
+	gitRun(t, dir, "init", "-q", "-b", "main")
+	gitRun(t, dir, "add", "--all")
+	gitRun(t, dir, "commit", "-qm", "initial")
+	const name = "revision"
+	if _, err := f.reg.New(ctx, api.NewArgs{Dir: dir, Name: name, Rev: "main", Rules: []string{"hidden private/"}}); err != nil {
+		t.Fatal(err)
+	}
+	work := f.export(name)
+	if _, err := os.Stat(filepath.Join(work, "private")); !os.IsNotExist(err) {
+		t.Fatalf("exported hidden directory: %v", err)
+	}
+	if got := gitRun(t, work, "status", "--porcelain"); got != "" {
+		t.Fatalf("initial git status = %q", got)
+	}
+	if diff, err := f.reg.Diff(ctx, api.DiffArgs{Checkout: name}); err != nil || len(diff.Changes) != 0 {
+		t.Fatalf("initial revision diff = %+v, %v", diff, err)
+	}
+	if got := strings.Join(f.snapFiles(name), " "); got != "public/a.txt" {
+		t.Fatalf("snapshot contains %q", got)
+	}
+	fork, err := f.reg.Fork(ctx, api.ForkArgs{Checkout: name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.reg.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.open()
+	for _, checkout := range []string{name, fork.Checkout.Name} {
+		if got := f.read(checkout, "private/s.txt"); got != "<absent>" {
+			t.Errorf("%s reopened hidden file: %q", checkout, got)
+		}
+		reply, err := f.reg.Explain(ctx, api.ExplainArgs{Checkout: checkout, Path: "private/s.txt"})
+		if err != nil || reply.Exists || reply.Class != "hidden" || reply.At != "private" || reply.Rule.Text != "private/" {
+			t.Errorf("%s explain = %+v, %v", checkout, reply, err)
+		}
+	}
+	dst := newFixture(t)
+	_, remote := offerFixture(t, f, dst, name)
+	if got := dst.read(remote.Name, "private/s.txt"); got != "<absent>" {
+		t.Errorf("remote hidden file = %q", got)
+	}
+
+	f.put(name, "public/a.txt", "edited\n")
+	applied, err := f.reg.Apply(ctx, api.ApplyArgs{Checkout: name, DryRun: true})
+	if err != nil || len(applied.Conflicts) != 0 || len(applied.Applied) != 1 || applied.Applied[0].Path != "public/a.txt" {
+		t.Fatalf("apply = %+v, %v", applied, err)
+	}
+	work = f.export(name)
+	gitRun(t, work, "add", "--all")
+	if got := gitRun(t, work, "diff", "--cached", "--name-only"); got != "public/a.txt" {
+		t.Fatalf("staged paths = %q", got)
+	}
+	gitRun(t, work, "commit", "-qm", "edit public file")
+	landed, err := f.reg.Land(ctx, api.LandArgs{Checkout: name})
+	if err != nil || landed.Refused || len(landed.Applied) != 1 || landed.Applied[0].Path != "public/a.txt" ||
+		landed.Commit != gitRun(t, work, "rev-parse", "HEAD") {
+		t.Fatalf("land = %+v, %v", landed, err)
+	}
+	if got := gitRun(t, dir, "show", "HEAD:private/s.txt"); got != "private" {
+		t.Errorf("landed commit's hidden file = %q", got)
+	}
+	if got, err := os.ReadFile(filepath.Join(dir, "private", "s.txt")); err != nil || string(got) != "private\n" {
+		t.Errorf("source's hidden file = %q, %v", got, err)
+	}
+}
+
+func TestHistoricalRevisionHiddenRules(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	dir := folder(t, map[string]string{
+		"public/a.txt": "public\n", "public/big.txt": "large in REV\n", "private/s.txt": "private\n",
+	})
+	gitRun(t, dir, "init", "-q", "-b", "main")
+	gitRun(t, dir, "add", "--all")
+	gitRun(t, dir, "commit", "-qm", "historical")
+	gitRun(t, dir, "rm", "-qr", "private")
+	write(t, filepath.Join(dir, "private"), "now a regular file\n")
+	write(t, filepath.Join(dir, "public", "big.txt"), "x\n")
+	gitRun(t, dir, "add", "--all")
+	gitRun(t, dir, "commit", "-qm", "directory replaced by a file")
+	for i, rule := range []string{"hidden private/ & tracked", "hidden !(public | public/**)"} {
+		name := fmt.Sprintf("historical-%d", i)
+		rules := []string{rule, "hidden big.txt & size > 8B"}
+		if _, err := f.reg.New(ctx, api.NewArgs{Dir: dir, Name: name, Rev: "HEAD~1", Rules: rules}); err != nil {
+			t.Fatal(err)
+		}
+		if got := f.read(name, "public/a.txt"); got != "public\n" {
+			t.Errorf("%s removed an allowed file: %q", rule, got)
+		}
+		for _, p := range []string{"private/s.txt", "public/big.txt"} {
+			if got := f.read(name, p); got != "<absent>" {
+				t.Errorf("%s kept %s: %q", rule, p, got)
+			}
+		}
+	}
+}
+
 // TestRevisionLFSObjectsCompareAsPointers compares content with a revision's
 // LFS files as git's clean filter does: an object rewritten unchanged is no
 // change, and a folder holding the object still counts as unchanged, so apply

@@ -74,6 +74,17 @@ func (r *Registry) Explain(ctx context.Context, args api.ExplainArgs) (api.Expla
 		}
 		dec, exists = source.Explain(overlayView{s.FS}, h.base.view.Domains(), set, p)
 		s.Done()
+		if !exists && len(args.Rules) == 0 {
+			// Missing revision paths no longer have the facts that hid them.
+			hidden := h.base.view.Meta().RevisionHidden
+			for at := p; hidden != nil && at != "."; at = path.Dir(at) {
+				if i, ok := hidden[at]; ok && i >= 0 && i < len(set.Rules) {
+					rule := set.Rules[i]
+					dec = rules.Decision{Class: rule.Class, Rule: rule, At: at}
+					break
+				}
+			}
+		}
 	} else {
 		root, m, domains, err := r.folder(args.Dir, args.Rules)
 		if err != nil {

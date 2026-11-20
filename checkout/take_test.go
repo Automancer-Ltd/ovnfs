@@ -69,6 +69,28 @@ func TestTakeIndexIsBaseNotPrivateIndex(t *testing.T) {
 	}
 }
 
+func TestRevisionTakeRespectsHiddenGitignore(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	dir := revisionRepo(t)
+	write(t, filepath.Join(dir, "artifact"), "old build output\n")
+	gitRun(t, dir, "add", "artifact")
+	gitRun(t, dir, "commit", "-qm", "add artifact")
+	gitRun(t, dir, "rm", "-q", "artifact")
+	write(t, filepath.Join(dir, ".gitignore"), "artifact\n")
+	gitRun(t, dir, "add", ".gitignore")
+	gitRun(t, dir, "commit", "-qm", "ignore artifact")
+	if _, err := f.reg.New(ctx, api.NewArgs{Dir: dir, Name: "revision", Rev: "HEAD",
+		Rules: []string{"hidden .gitignore"}, Take: []string{"HEAD~1:"}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{".gitignore", "artifact"} {
+		if got := f.read("revision", p); got != "<absent>" {
+			t.Errorf("%s = %q, want absent", p, got)
+		}
+	}
+}
+
 func TestTakeWorkingSubtree(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)

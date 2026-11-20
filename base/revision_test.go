@@ -268,10 +268,8 @@ func TestRevisionServesLFSObjects(t *testing.T) {
 	}
 }
 
-// TestRevisionHiddenRootsStayHidden keeps a hidden root absent from a --rev
-// checkout, where ignored content otherwise comes from the cache snapshot: built-in hidden names
-// and a `hidden tmp/` scratch tree alike. REV's tracked files below a hidden
-// root still appear, without the ignored remainder.
+// TestRevisionHiddenRootsStayHidden keeps hidden roots out of a --rev view,
+// including tracked paths a take would otherwise bring back.
 func TestRevisionHiddenRootsStayHidden(t *testing.T) {
 	ctx := context.Background()
 	repo, dir := repository(t)
@@ -302,8 +300,8 @@ func TestRevisionHiddenRootsStayHidden(t *testing.T) {
 		cached map[string]string
 	}{
 		{name: "builtins", cached: map[string]string{"tmp/copy/repo/file.txt": "scratch copy\n", "vendor/build.log": "ignored log\n"}},
-		{name: "hidden", rules: []string{"hidden tmp/", "hidden vendor/"}, absent: []string{"tmp", "vendor/build.log"}},
-		{name: "hidden with take", rules: []string{"hidden tmp/", "hidden vendor/"}, takes: []Take{{Source: ".", Path: "src"}}, absent: []string{"tmp", "vendor/build.log"}},
+		{name: "hidden", rules: []string{"hidden tmp/", "hidden vendor/"}, absent: []string{"tmp", "vendor", "vendor/lib.txt", "vendor/build.log"}},
+		{name: "hidden with take", rules: []string{"hidden tmp/", "hidden vendor/"}, takes: []Take{{Source: "HEAD", Revision: revision}}, absent: []string{"tmp", "vendor", "vendor/lib.txt", "vendor/build.log"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st, err := store.Open(filepath.Join(t.TempDir(), "store"), 64<<20)
@@ -330,8 +328,8 @@ func TestRevisionHiddenRootsStayHidden(t *testing.T) {
 					t.Errorf("%s = %q, want %q", p, got, want)
 				}
 			}
-			if got := readBase(t, b, "vendor/lib.txt"); got != "vendored\n" {
-				t.Errorf("tracked file below a hidden root = %q", got)
+			if tc.cached != nil && readBase(t, b, "vendor/lib.txt") != "vendored\n" {
+				t.Error("tracked file without a hidden rule did not survive")
 			}
 			list, err := b.Bottom(b.TakeCaches("c1")).ReadDir("")
 			if err != nil {
@@ -341,7 +339,7 @@ func TestRevisionHiddenRootsStayHidden(t *testing.T) {
 			for _, info := range list {
 				names = append(names, info.Name())
 			}
-			wantNames := []string{".gitignore", "source.txt", "src", "vendor"}
+			wantNames := []string{".gitignore", "source.txt", "src"}
 			if tc.cached != nil {
 				wantNames = []string{".gitignore", "source.txt", "src", "tmp", "vendor"}
 			}
@@ -349,8 +347,13 @@ func TestRevisionHiddenRootsStayHidden(t *testing.T) {
 				t.Errorf("root lists %v, want %v", names, wantNames)
 			}
 			if tc.cached == nil {
-				if class, _ := b.Class("tmp"); class != rules.Hidden {
-					t.Errorf("tmp recorded as %q, want a hidden root", class)
+				for _, p := range []string{"tmp", "vendor"} {
+					if class, _ := b.Class(p); class != rules.Hidden {
+						t.Errorf("%s recorded as %q, want a hidden root", p, class)
+					}
+				}
+				if !b.Domains().Facts(source.Dir(dir), "vendor/lib.txt", nil).Tracked() {
+					t.Error("hidden revision file lost its tracked status")
 				}
 			}
 		})

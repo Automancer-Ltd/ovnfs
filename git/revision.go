@@ -59,9 +59,10 @@ type IndexStat struct {
 // name, a private index; it never checks out or copies files. An entry whose
 // path is in stat records that stat data, so git's first refresh trusts the file
 // instead of reading it; the caller must present exactly the revision's blob and
-// mode there. Other entries keep zero stat data, which git always reads. Entries
-// whose mtime is in or after the second of the write are smudged as racily clean.
-func (v *Revision) WriteIndex(ctx context.Context, name string, stat map[string]IndexStat) error {
+// mode there. Paths in skipped keep their entries but are marked skip-worktree.
+// Other entries keep zero stat data, which git always reads. Entries whose
+// mtime is in or after the second of the write are smudged as racily clean.
+func (v *Revision) WriteIndex(ctx context.Context, name string, stat map[string]IndexStat, skipped map[string]bool) error {
 	objects, err := v.repo.repo.OpenObjects()
 	if err != nil {
 		return err
@@ -81,6 +82,10 @@ func (v *Revision) WriteIndex(ctx context.Context, name string, stat map[string]
 	}
 	for i := range idx.Entries {
 		e := &idx.Entries[i]
+		if skipped[e.Path] {
+			e.SkipWorktree = true
+			continue
+		}
 		if s, ok := stat[e.Path]; ok {
 			mtime := index.Time{Sec: uint32(s.Mtime.Unix()), Nsec: uint32(s.Mtime.Nanosecond())}
 			e.Stat = index.Stat{MTime: mtime, Size: index.StatSize(s.Size)}

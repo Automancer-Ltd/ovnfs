@@ -14,21 +14,110 @@ import (
 	"github.com/stencil-hq/ovnfs/store"
 )
 
-// revisionView evaluates ignore files from the revision, while testing the type
-// of existing ignored paths against the folder. Dirty ignore files must not
-// decide what survives a revision checkout.
+// revisionView supplies rule facts from REV, not the folder's current contents.
 type revisionView struct {
-	source.Dir
 	files   map[string]store.File
+	info    map[string]source.Info
+	dirs    map[string]revisionDir
 	objects *git.Objects
 }
 
-func (v revisionView) ReadFile(p string) ([]byte, error) {
+type revisionDir struct {
+	class   rules.Class // cached classification, including any deciding ancestor
+	visible bool        // has a revision leaf that survives the projection
+}
+
+func (v *revisionView) Lstat(p string) (os.FileInfo, error) {
+	if f, ok := v.files[p]; ok {
+		mode := os.FileMode(0o644)
+		switch f.Mode {
+		case store.ModeDir:
+			mode = os.ModeDir | 0o755
+		case store.ModeSymlink:
+			mode = os.ModeSymlink | 0o777
+		case store.ModeExec:
+			mode = 0o755
+		}
+		return capturedInfo{name: path.Base(p), mode: mode, size: v.info[p].Size}, nil
+	}
+	if _, ok := v.dirs[p]; ok {
+		return capturedInfo{name: path.Base(p), mode: os.ModeDir | 0o755}, nil
+	}
+	return nil, os.ErrNotExist
+}
+
+func (v *revisionView) tracked(p string) bool {
+	_, dir := v.dirs[p]
+	return dir || v.files[p].ID != ""
+}
+
+func (v *revisionView) ReadFile(p string) ([]byte, error) {
 	f, ok := v.files[p]
 	if !ok {
 		return nil, os.ErrNotExist
 	}
 	return v.objects.Blob(string(f.ID))
+}
+
+type revisionProjection struct {
+	hidden  map[string]int       // deciding root -> rule position
+	skipped map[string]bool      // omitted index entries, including gitlinks
+	ignores map[string]store.OID // hidden .gitignore blobs still used to classify takes
+}
+
+// project honors first-match and ancestor precedence without re-evaluating each
+// directory for every leaf beneath it. Only Hidden removes tracked paths.
+func (v *revisionView) project(set rules.Set, domains *source.Domains) revisionProjection {
+	var projection revisionProjection
+	match := func(p string) rules.Class {
+		i := set.MatchIndex(p, domains.Facts(v, p, nil))
+		if i < 0 {
+			return rules.Source
+		}
+		class := set.Rules[i].Class
+		if class == rules.Hidden {
+			if projection.hidden == nil {
+				projection.hidden, projection.skipped = map[string]int{}, map[string]bool{}
+			}
+			projection.hidden[p] = i
+		}
+		return class
+	}
+	var classifyDir func(string) rules.Class
+	classifyDir = func(p string) rules.Class {
+		if p == "." {
+			return rules.Source
+		}
+		d := v.dirs[p]
+		if d.class == "" {
+			d.class = classifyDir(path.Dir(p))
+			if d.class == rules.Source {
+				d.class = match(p)
+			}
+			v.dirs[p] = d
+		}
+		return d.class
+	}
+	for p := range v.files {
+		parent := path.Dir(p)
+		class := classifyDir(parent)
+		if class == rules.Source {
+			class = match(p)
+		}
+		if class == rules.Hidden {
+			projection.skipped[p] = true
+			continue
+		}
+		for dir := parent; dir != "."; dir = path.Dir(dir) {
+			d := v.dirs[dir]
+			if d.visible {
+				break
+			}
+			d.visible = true
+			v.dirs[dir] = d
+		}
+	}
+	return projection
 }
 
 // revisionIndex names the private index of a revision base in its state directory.
@@ -38,27 +127,37 @@ const revisionIndex = "revision-index"
 // capture's stat identities remain usable only for content identical to REV.
 // LFS pointers, under REV's attributes, present their objects (see lfsFile).
 // Its index has no stat data yet: seedRevisionIndex adds it once takes are done.
-func reviseCapture(ctx context.Context, c Config, res *source.Result, revision *git.Revision, fork time.Time) error {
+func reviseCapture(ctx context.Context, c Config, res *source.Result, revision *git.Revision, set rules.Set, fork time.Time, taking bool) (revisionProjection, error) {
 	index := filepath.Join(c.StateDir, revisionIndex)
-	if err := revision.WriteIndex(ctx, index, nil); err != nil {
-		return err
+	if err := revision.WriteIndex(ctx, index, nil, nil); err != nil {
+		return revisionProjection{}, err
 	}
 	repos := []source.Repo{{Path: "", Head: revision.Commit, Index: index}}
 	domains, err := source.NewDomains(res.Root, repos, nil)
 	if err != nil {
-		return err
+		return revisionProjection{}, err
 	}
 	repo := domains.Repo("")
 	objects, err := repo.Objects()
 	if err != nil {
-		return err
+		return revisionProjection{}, err
 	}
 	defer objects.Close()
 	tree, err := treeFiles(revision.Entries, *res, repo, git.AttributeOptions{Source: revision.Commit}, fork)
 	if err != nil {
-		return err
+		return revisionProjection{}, err
 	}
 	files, info := tree.files, tree.info
+	view := &revisionView{files: files, info: info, dirs: map[string]revisionDir{}, objects: objects}
+	for p := range files {
+		for dir := path.Dir(p); dir != "."; dir = path.Dir(dir) {
+			if _, ok := view.dirs[dir]; ok {
+				break
+			}
+			view.dirs[dir] = revisionDir{}
+		}
+	}
+	projection := view.project(set, domains)
 	// Gitlinks start empty in revision checkouts. Their contents belong to the
 	// submodule and must not be judged by the superproject's ignore rules.
 	gitlinks := map[string]bool{}
@@ -67,22 +166,28 @@ func reviseCapture(ctx context.Context, c Config, res *source.Result, revision *
 			gitlinks[entry.Path] = true
 		}
 	}
-	inSubmodule := func(p string) bool {
+	blocked := func(p string) bool {
+		if len(projection.hidden) == 0 && len(gitlinks) == 0 {
+			return false
+		}
 		for ; p != "." && p != ""; p = path.Dir(p) {
-			if gitlinks[p] {
+			if _, hidden := projection.hidden[p]; hidden || gitlinks[p] {
 				return true
 			}
 		}
 		return false
 	}
-	tracked := map[string]bool{}
-	for file := range files {
-		for p := file; p != "."; p = path.Dir(p) {
-			tracked[p] = true
+	ignored := func(p string, isDir bool) bool {
+		var mode os.FileMode
+		if isDir {
+			mode = os.ModeDir
 		}
+		return domains.Facts(view, p, capturedInfo{mode: mode}).Ignored()
 	}
-	view := revisionView{Dir: source.Dir(res.Root), files: files, objects: objects}
 	roots := map[string]rules.Class{}
+	for p := range projection.hidden {
+		roots[p] = rules.Hidden
+	}
 	// Ignored roots remain live and copy-on-write, and hidden ones absent, just
 	// as in an ordinary checkout. Nonignored roots can contain ignored
 	// descendants; descend only those roots, never a retained ignored build
@@ -103,13 +208,13 @@ func reviseCapture(ctx context.Context, c Config, res *source.Result, revision *
 				return err
 			}
 			rel = filepath.ToSlash(rel)
-			if inSubmodule(rel) {
+			if blocked(rel) {
 				if entry.IsDir() {
 					return filepath.SkipDir
 				}
 				return nil
 			}
-			if !tracked[rel] && domains.Facts(view, rel, nil).Ignored() {
+			if !view.tracked(rel) && ignored(rel, entry.IsDir()) {
 				roots[rel] = class
 				if entry.IsDir() {
 					return filepath.SkipDir
@@ -123,61 +228,68 @@ func reviseCapture(ctx context.Context, c Config, res *source.Result, revision *
 		})
 	}
 	for p, class := range res.Roots {
-		if path.Base(p) == ".git" || inSubmodule(p) {
+		if path.Base(p) == ".git" || blocked(p) {
 			continue // discarded nested repositories need no object-directory walk; gitlinks start empty
 		}
-		if class == rules.Hidden && !tracked[p] {
-			// REV tracks nothing here, so however large the root, it stays
-			// absent whole, unwalked. Below a hidden root REV does track, REV's
-			// files appear and only the ignored remainder stays hidden.
+		if class == rules.Hidden && !view.tracked(p) {
+			// REV tracks nothing here; the captured hidden root stays unwalked.
 			roots[p] = rules.Hidden
 			continue
 		}
 		if err := keep(p, class); err != nil {
-			return err
+			return revisionProjection{}, err
 		}
 	}
-	for p := range res.Files {
-		if !inSubmodule(p) && !tracked[p] && domains.Facts(view, p, nil).Ignored() {
+	for p, f := range res.Files {
+		if !view.tracked(p) && !blocked(p) && ignored(p, f.Mode == store.ModeDir) {
 			roots[p] = rules.Local
 		}
 	}
-	// An ignored descendant can survive a removed untracked directory. Keep
-	// its ancestor directories visible without retaining their other files.
+	// Preserve the source directories of inherited roots and projected children.
+	// Only the deepest directories without visible leaves need empty tree entries.
 	dirs, parents := map[string]bool{}, map[string]bool{}
 	for p, class := range roots {
-		if inSubmodule(p) || class == rules.Hidden {
-			continue
+		if _, projected := projection.hidden[p]; class == rules.Hidden && !projected {
+			continue // a hidden root from the folder cannot create a directory in REV
 		}
 		dir := path.Dir(p)
 		if dir == "." {
 			continue
 		}
 		dirs[dir] = true
-		for p := path.Dir(dir); p != "."; p = path.Dir(p) {
+		for p := path.Dir(dir); p != "." && !parents[p]; p = path.Dir(p) {
 			parents[p] = true
 		}
 	}
 	for dir := range dirs {
-		if !tracked[dir] && !parents[dir] {
+		if _, leaf := files[dir]; !leaf && !view.dirs[dir].visible && !parents[dir] {
 			files[dir] = store.File{Mode: store.ModeDir, ID: store.EmptyTree}
 		}
 	}
-	// A hidden root keeps no directory visible. As in an ordinary capture, it
-	// is recorded only inside a directory the view keeps: below one the
-	// revision dropped it is absent anyway, and takes retain no directory for it.
+	// Discard hidden roots from the folder whose parents REV left out.
 	for p, class := range roots {
 		dir := path.Dir(p)
 		if class != rules.Hidden || dir == "." || dirs[dir] || parents[dir] {
 			continue
 		}
-		if f, ok := files[dir]; !tracked[dir] || ok && f.Mode != store.ModeDir {
+		if f, ok := files[dir]; !view.tracked(dir) || ok && f.Mode != store.ModeDir {
 			delete(roots, p)
 		}
 	}
+	for p := range projection.skipped {
+		if _, root := projection.hidden[p]; taking && root && path.Base(p) == ".gitignore" {
+			if projection.ignores == nil {
+				projection.ignores = map[string]store.OID{}
+			}
+			projection.ignores[p] = files[p].ID
+		}
+		delete(files, p)
+		delete(info, p)
+		delete(tree.lfs, p)
+	}
 	res.Files, res.Info, res.Roots, res.Repos, res.Domains, res.LFS = files, info, roots, repos, domains, tree.lfs
 	res.Tree, err = c.Store.Build(files)
-	return err
+	return projection, err
 }
 
 // seedRevisionIndex rewrites the revision index with the stat data the view
@@ -185,10 +297,10 @@ func reviseCapture(ctx context.Context, c Config, res *source.Result, revision *
 // pointer's object, which git's clean filter stores as that blob), so git's
 // first refresh trusts those files instead of reading each one. It runs on the
 // final capture: a path taken with other content, a gitlink, an LFS pointer
-// git's clean filter would rewrite, and any other path the view does not serve
-// as REV's keep zero stat data, which git reads.
-func seedRevisionIndex(ctx context.Context, c Config, res source.Result, revision *git.Revision, fork time.Time) error {
-	stat := make(map[string]git.IndexStat, len(revision.Entries))
+// git's clean filter would rewrite, and other paths not serving REV's content
+// keep zero stat data. Only hidden paths are skipped by git's refresh.
+func seedRevisionIndex(ctx context.Context, c Config, res source.Result, revision *git.Revision, skipped map[string]bool, fork time.Time) error {
+	stat := make(map[string]git.IndexStat, len(revision.Entries)-len(skipped))
 	for _, e := range revision.Entries {
 		if res.Files[e.Path] != (store.File{Mode: e.Mode, ID: store.OID(e.OID)}) {
 			continue
@@ -199,5 +311,5 @@ func seedRevisionIndex(ctx context.Context, c Config, res source.Result, revisio
 		}
 		stat[e.Path] = git.IndexStat{Size: info.Size, Mtime: presentedMtime(info, fork)}
 	}
-	return revision.WriteIndex(ctx, filepath.Join(c.StateDir, revisionIndex), stat)
+	return revision.WriteIndex(ctx, filepath.Join(c.StateDir, revisionIndex), stat, skipped)
 }
