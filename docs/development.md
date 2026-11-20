@@ -12,6 +12,89 @@ with WinFsp installed it also mounts real WinFsp drives. The git engines under
 They are written from git's documentation and observed behaviour, never from
 git's or another implementation's source.
 
+## Overlay and kernel-share tests
+
+The overlay is checked against a reference model: an in-memory POSIX tree
+(`overlay/model_test.go`) that knows nothing of layers, uppers, memory files
+or indexes, except where the overlay deliberately differs from POSIX, each
+such rule citing its source. `overlay/model_run_test.go` drives seeded random
+operation streams through the overlay and the model and fails on the first
+difference in a result class, a handle's contents or the whole view.
+`TestModelSequential` runs one stream over a lower stack with whiteouts, an
+opaque directory and hard links, in three memory configurations: `memory=off`,
+`memory=spill` (an 8 KiB budget, a 2 KiB per-file limit and a 1 ms idle age, so
+files spill by size, by eviction and by background write-back all through the
+run) and `memory=roomy` (room for everything, so most files never reach the
+disk before `Flush`). At random points, and once more at the end, it takes
+four checkpoints: a reopen of the flushed upper without memory, a cool (the
+index unloads and the tree must read the same cold), a freeze (the flushed
+upper becomes a layer and a fresh upper continues on top), and a crash (the
+upper as it is on disk, with host changes still queued and files still in
+memory, is copied and an overlay opened on the copy must show every name in a
+state it had since the last `Flush`; names are ordered, contents are not).
+`TestModelConcurrent` runs four streams at once, each in its own subtree and
+its own names of one shared directory, with a model per stream, and compares
+the merged models with the final tree before and after `Flush` and a reopen.
+`TestModelDeniedOpenKeepsIdentity` checks that a refused write-open of one name
+of a frozen read-only hard link changes nothing, so the name keeps its
+identity. A failure prints the seed, the environment that reproduces it and
+the last operations.
+
+| variable | effect |
+| --- | --- |
+| `OVERLAY_MODEL_SEED` | the stream's seed (default 1) |
+| `OVERLAY_MODEL_OPS` | operations per sequential stream (default 1500); raise it for soak runs |
+| `OVERLAY_MODEL_FINDINGS` | known findings to reproduce instead of leaving out: a comma-separated list or `all` |
+| `OVERLAY_MODEL_HISTORY` | operations a failure report shows (default 40) |
+
+Two findings, where the overlay differs from the model and no document or test
+justifies the overlay, stay excluded unless asked for: `readdir-below-file`
+(`ReadDir` below a regular file only the bottom provides fails with ENOTDIR,
+while `Lstat` of that path reports it missing) and `root-mtime` (reopening a
+non-empty upper and freezing it move the root's mtime to the present).
+
+The host side of the memory tier has its own tests.
+`TestQueueCrashLeavesAnEarlierState` queues renames, links, unlinks, mkdirs
+and rmdirs without letting the workers make them, lets them make one change at
+a time, and after each opens an overlay on a copy of the upper as a crash would
+leave it, which must show every name in a state it had.
+`TestQueueParksAFailure` checks that a change the host refuses parks the queue,
+which the budget reports and `Flush` returns, while new changes go to the host
+themselves, and that the queue moves on once the host accepts it.
+`TestHostOpsConcurrent` runs workers that create, spill, read, rename, link and
+remove files while the write-back worker moves idle files to disk and another
+worker renames a directory whose files spill meanwhile; every file must read
+back as written, and after `Flush` the index must match the upper on disk,
+directory times included. `TestMemorySyscallTrace` records an execution trace
+of each memory-tier name change and of the same changes on files on disk, so
+`go tool trace -d=parsed` can count the host syscalls each makes; it runs only
+with `OVERLAY_SYSCALL_TRACE` naming a directory for the traces.
+
+`kfs`, the kernel client's server, is tested by protocol: `TestCompound`,
+`TestCompoundMalformed` and `TestCompoundReplyLimit` for COMPOUND,
+`TestCreateWithGuestIDs` for guest-chosen ids, and `TestOpsByIDAgainstRenames`,
+which runs operations by id on one connection while another renames the file
+back and forth, renames its directory back and forth and renames other files
+onto its old name, for a file in the memory tier and one on disk; no operation
+by id may fail, none may touch the files renamed onto the old name, and the
+writes must end up in the file. Three measurements run only on request, against
+a daemon's kernel share or an in-process fixture:
+
+- `TestMutationWorkload` (`KFS_WORKLOAD`) drives the guest benchmark's
+  small-file workload over four connections: 10,000 1 KiB files in 100
+  directories created and written, read back after the memory tier let them go,
+  linked, renamed and removed, and logs each operation's count, mean, median and
+  daemon file calls. `KFS_WORKLOAD_SOCK` names a daemon's share (its checkout
+  must hold an empty directory named by `KFS_WORKLOAD_DIR`, default `w`),
+  `KFS_WORKLOAD_WORKERS` the connections (default 4).
+- `TestCompoundCreates` (`KFS_WORKLOAD`) measures what one connection's
+  COMPOUNDs of 256 requests cost the daemon per file: creates with a guest id
+  and 4 KiB of content in one CREATE, the same as CREATE, WRITE and SETATTR, and
+  renames and unlinks of the files while the memory tier holds them, 20,000
+  files each. `KFS_WORKLOAD_MEMORY` sets the in-process fixture's budget in MiB.
+- `TestRoundTrip` (`KFS_RTT`, `KFS_RTT_SOCK`, `KFS_RTT_CONNS`) measures GETATTR
+  round trips, 20,000 per connection, and logs their median and p99.
+
 ## CLI
 
 The command line is a [kong](https://github.com/alecthomas/kong) grammar: one
@@ -210,10 +293,15 @@ from the host (a guest boots at the Unix epoch), mounts the tree and reports
 every phase on the console.
 
 The workloads are `net` (round-trip time and throughput of the VM's network,
-the floor under the NFS columns), `walk` (an lstat of every entry), `git`
-(`git status`, with the git directory on the guest's disk, since a checkout's
-`.git` names a host path), `rg`, `fio`, `small` (create, stat, rename and
-unlink 10,000 files), `replay` (buildbench's `io` phases) and `cargo`. A
+the floor under the NFS columns), `trap` (`trap.one` and `trap.par`: one
+uncached round trip to whatever serves the tree, a loop of `statfs` calls on
+its root that no client answers from a cache, with one worker and with one per
+job), `walk` (an lstat of every entry), `git` (`git status`, with the git
+directory on the guest's disk, since a checkout's `.git` names a host path),
+`rg`, `fio`, `small` (create, stat, rename and unlink 10,000 files, with a
+`syncfs` after the creates, `small.sync`, and after the unlinks,
+`small.settle`, so work a filesystem defers shows on every column), `replay`
+(buildbench's `io` phases), `cargo` and `verify` (correctness; see below). A
 `.cold` phase remounts the tree and drops the guest's caches first. At every
 phase boundary the daemon's `calls` timers are sampled, so the report shows,
 beside each median and its ratio to ext4, the daemon calls per guest operation
@@ -233,6 +321,27 @@ go run ./scripts/guestbench -vmon ~/src/vibevmm/target/release/vmon \
     -rootfs ~/.cache/ovnfs-guestbench/rootfs-aarch64.ext4 -out results.json
 ```
 
+`verify` checks instead of timing. `verify.tree` hashes every tracked file and
+compares it with git's blob id, and `verify.data` runs sixteen written-data
+cases (page and megabyte boundaries, back-to-front and mid-file rewrites,
+truncation up and down, a shared writable mapping, rename and hard links),
+each read back after a cold reset, so the bytes come from the filesystem and
+not the guest's caches. `verify.churn` runs four workers at once, each in its
+own subtree, through 4,000 seeded random operations apiece: create (written
+three ways), write, truncate, rename of files and directories, hard link,
+unlink, mkdir, rmdir, symlink, chmod, set-mtime and read, on five names so
+that operations collide often. Every operation's outcome (success or the exact
+error) is checked against a model of what POSIX requires, and every 200
+operations and after the last the whole subtree is compared with the model:
+each directory's names, and each entry's type, permission bits, symlink
+target, and a file's size, link count, mtime and content. The mtime checks are
+exact against the value `stat` showed after the file's last change, and stamped
+times must fall within the run's wall-clock span plus a slack. After the
+workers finish, the tree is compared again after a cold reset, and once more
+after `syncfs`, a two-second wait and another cold reset, so changes a
+filesystem applies late are caught. A failure names the worker and its seed
+(`churnSeed` in `guest/churn.go`), which replays the sequence.
+
 Two more configs are opt-in (`-configs kmod,erofs,nfs3,ext4`):
 
 - `kmod` reaches the tree through the kernel client: the daemon serves the
@@ -242,8 +351,10 @@ Two more configs are opt-in (`-configs kmod,erofs,nfs3,ext4`):
   kernel (it needs the `vmon-kernel-build` image and the `vmon-kernel-cache`
   volume that `just kernel` leaves behind) and checks its vermagic; `-ko FILE`
   takes a prebuilt one. At the end of a run the module's own counters
-  (`/sys/kernel/debug/ovnfs/calls`: calls and nanoseconds per operation) and
-  the guest kernel's warnings are saved with the results.
+  (`/sys/kernel/debug/ovnfs/calls`: calls and nanoseconds per operation, the
+  COMPOUND and ALLOC_IDS calls included, then the journal's counters, see
+  [kernel-client.md](kernel-client.md#counters)) and the guest kernel's
+  warnings are saved with the results.
 - `erofs` gives the guest an EROFS image of the tree as the lower of an
   overlayfs whose upper is the guest's disk, so nothing but block reads leaves
   the guest. The image is built with `mkfs.erofs` from the guest image's

@@ -26,22 +26,206 @@ see [First version (v0)](#first-version-v0).
 | Transport | a trap: the guest writes the address of a call block to an MMIO doorbell, and the VMM performs the call on the trapping vCPU thread, relaying one length-prefixed request to the daemon's Unix socket and reading the reply straight into guest memory; one doorbell and one daemon connection per vCPU | no virtio driver, interrupt, wait queue or completion in the guest and no device state in the VMM, so snapshot, restore and fork need nothing; a round trip is one exit instead of an exit, a device-thread wakeup and an interrupt. Guest RAM of restored and forked VMs is mapped private (vibevmm `vmm/src/memory.rs`), so the daemon could not serve the guest directly anyway |
 | Addressing | the export's stable file ids, confined by the daemon to the share's checkout; id 1 is always the tree's root | an id follows its file through renames; nothing is addressed by path |
 | Server state | none per connection or open file: no open, release or forget; the daemon keeps files open by id only as a cache | the VMM may reconnect at any time; restore and fork need no replay |
-| Durability | the daemon never syncs for a write or a create; only FSYNC syncs | the baseline's NFS creates cost milliseconds each because every one was synced |
+| Durability | the daemon never syncs for a write or a create; only FSYNC syncs. A journaled change is applied by the daemon after its syscall returned: `fsync`, `sync`, `syncfs` and unmount wait for it, and a refusal after the fact is reported late (see [Late failures](#late-failures)) | the baseline's NFS creates cost milliseconds each because every one was synced |
 | Caching | one epoch per mount, carried by every reply: names, missing names, attributes and file contents cached under an epoch are valid until a reply carries another. A directory is listed whole into a table that answers every later lookup, hit or miss, without a call. A poll once a second while the mount is active bounds how late a change made elsewhere is noticed | round trips are what the baseline shows to be unaffordable; a timer per file is what made NFS's warm walk as slow as its cold one |
-| Page cache | plain page-cache operations with order-0 folios; dirty pages are written back when a file is closed | the transport is synchronous, so the netfs library's request machinery buys nothing here; write-back on close lets the host see a closed file's data without any sync |
+| Batching | COMPOUND (op 20): one call carries several requests, which the daemon runs in order as if they had arrived one by one on the connection, continuing past one that fails; each reply has its own error and epoch. A malformed compound (a truncated sub-request, a nested COMPOUND) runs nothing and fails as a whole. A sub-request whose largest possible reply does not fit the rest of the frame is answered EMSGSIZE without running, and the sub-requests after it still run. The write-cache barrier (`Options.Quiesce`) is taken once for the whole compound | a batch of creates, renames or unlinks pays for one round trip; bounding the replies keeps the frame within the call's limit |
+| Guest-chosen ids | ALLOC_IDS (op 21) hands the guest a run of consecutive ids, at most the count it asked for, that the daemon gives to nothing else; the daemon saves a mark past them before it replies (`allocateRun` in `overlay/identity.go`), so they stay usable after a restart or an epoch change, until the VM is attached to another tree. CREATE (with the new id, an mtime and up to `max_io` bytes of content, which needs `CREATE_EXCL`) and MKDIR (with the new id and an mtime) then create the entry under that id, mtime and content in one step. The daemon checks that the id belongs to the share's checkout, that it is one the overlay's allocator issued and that no visible entry holds it; otherwise EINVAL, and the id is spent either way. It does not check which client was given the id, so one handed out for anything else (a memory file since removed) passes. ALLOC_IDS on a read-only share is EROFS | the guest can show a new file or directory with its final id and mtime before the daemon has created it, and what the daemon later shows equals what the guest showed; content in CREATE saves the WRITE and SETATTR a small file would otherwise need |
+| Round-trip latency | after a reply the daemon polls the connection for 50 µs before it parks in the runtime's network poller (`kfs/spin_unix.go`); the VMM likewise polls for the reply for 50 µs before it blocks (vibevmm `vmm/src/devices/ovnfs.rs`; metrics `ovnfs.spin_hits`, `ovnfs.send_ns`, `ovnfs.reply_wait_ns`) | a busy guest CPU sends its next request within microseconds, and waking a parked goroutine or thread costs about as much again; a connection that goes quiet stops costing CPU once the window passes |
+| Operations by id | the daemon holds one lock per checkout (`namesOf` in `kfs/server.go`), shared by every share and connection of it: exclusive for RENAME, UNLINK and RMDIR, shared for every other request that resolves an id (HELLO, POLL, STATFS and ALLOC_IDS resolve none, and a compound's sub-requests take it one by one) | an operation resolves an id to a path and then acts on the path in separate export calls, and a rename between the two, of the file, of a directory above it or of another file onto its name, would fail it with ENOENT or make it act on another file |
+| Journal | create and mkdir of a name known to be absent, unlink, rmdir of a directory known empty, rename, hard link, SETATTR and a closed file's data update the guest's caches and return; one worker per mount sends them in order in COMPOUND batches (see [The journal](#the-journal)) | a mutation then costs a share of a batch, not a round trip, and the daemon still sees the sequence of syscalls the guest made |
+| Mount options | none of the module's own: `ro`, `sync` and `dirsync` are the generic ones, and `sync` and `dirsync` (or the same inode flags) make every change synchronous | one way to ask for the v0 behaviour, which the kernel's own tools already know |
+| Page cache | plain page-cache operations with order-0 folios; dirty pages of a closed file are queued for the daemon as a journal entry (inside the file's CREATE when it is small), those of an open file are written back by `writepages` | the transport is synchronous, so the netfs library's request machinery buys nothing here; sending a closed file's data through the journal lets the host see it without any sync, in the same batch as the names |
 | Delivery | a loadable module built against the pinned guest kernel (`kmod/build.sh`), to be pushed by the vibevmm node and loaded by its guest agent with `finit_module` | driver updates need no template rebuild (precedent: vibevmm's NVIDIA bundle) |
 | Source | `kmod/` in this repository with one shared wire header; vibevmm pins it | client and server change together |
 | Lifecycle | the vibevmm node creates, forks, shares and removes checkouts per sandbox | decided by the project owner |
 | Windows hosts | not supported yet: the call device is built for Linux and macOS hosts | scope |
 
+## The journal
+
+A mutation in a directory the guest knows well does not trap. The syscall
+changes the guest's own caches (dentries, directory listings, inodes) exactly
+as a successful reply would, appends an entry to the mount's journal and
+returns. One worker per mount takes the entries oldest first, packs them into
+COMPOUND calls of up to 1 MiB of request, one call at a time, and applies the
+replies in order. A file that is created, written, closed and renamed costs
+sub-requests of one call, not a round trip per step.
+
+### What is journaled
+
+| entry | when |
+| --- | --- |
+| CREATE, MKDIR | the name is known to be absent (a current negative dentry) and an id is in the pool |
+| UNLINK | the name and the file's link count are current |
+| RMDIR | the directory is known to be empty: its listing is complete and has no entries |
+| RENAME | both names are current, a moved or replaced file's link count is current and a replaced directory is known to be empty (files and directories move; `RENAME_NOREPLACE` is supported, other flags are EINVAL) |
+| LINK | the file's link count is current and it still has a name |
+| SETATTR | mode, an explicit mtime or the size (truncation, `O_TRUNC`) of a regular file or directory whose attributes are current |
+| DATA | a closed file's dirty pages |
+
+Every entry also needs a directory the guest can predict the daemon's answer
+in: its attributes are current and its owner write bit is set (the daemon acts
+on the host as the owner of the tree). The ids of new files and directories
+come from a pool that ALLOC_IDS fills 8,192 at a time and refills in the
+background when fewer than 2,048 remain; a create finding the pool empty is
+synchronous, and if the daemon refuses ALLOC_IDS the pool stays off for the
+mount, the module logs once that creates are synchronous, and everything else
+is unchanged.
+
+Closing a file opened for writing queues its dirty pages as one DATA entry: a
+WRITE per contiguous run, then a SETATTR that gives the daemon the guest's
+mtime. A file that is closed, wholly in the page cache, not mapped writable
+and at most 256 KiB travels inside its own CREATE (content and mtime in the one
+sub-request, which consumes its DATA entry); a truncated and rewritten file of
+that size has its size SETATTR carry the whole content as one WRITE. Larger
+files go in entries of at most 256 KiB, queued again until none of their data
+is left. Files still open are written back by `writepages`, as `fsync` does,
+in WRITE calls of up to `max_io` on another port. When a file's last name is
+removed (unlink or rename over it, link count 1, not open) its queued DATA
+entry is cancelled instead of sent; no other entry is cancelled, so an entry
+is sent even if a later one undoes it.
+
+The journal is bounded to 131,072 entries and 32 MiB, which a burst of tens of
+thousands of small creates fits; a caller that finds it full waits for the
+worker.
+
+### What stays synchronous
+
+- SYMLINK and MKNOD, because the protocol cannot give them guest-chosen ids
+  yet: only CREATE and MKDIR carry one.
+- Anything whose result the guest cannot predict: a dentry or attributes that
+  are not current, a parent directory without its owner write bit, a mode with
+  setuid, setgid or sticky bits, a change of owner, an empty id pool.
+- Everything on a mount or inode with the standard `sync` or `dirsync` flags
+  (`-o sync`, `-o dirsync`, `chattr +S` and `+D`): each such call is one trap
+  that returns the daemon's result, and with `sync` a close writes the file's
+  data back and waits for it.
+
+The module has no mount options of its own.
+
+### Ordering and the barrier
+
+The daemon receives the journal in append order, each entry once: one batch is
+in flight at a time and the sub-requests of a batch run in order, so the daemon
+sees a sequence the syscalls could have produced one by one. A file has data
+in a batch at most once; later data of the same file starts the next batch.
+Entries carry the names and ids of the moment, and the daemon resolves ids
+atomically against renames, so an entry that names a file below a directory
+renamed earlier still finds it.
+
+Data never overtakes its file's CREATE or a size change. A truncation moves the
+file's queued DATA entry behind itself, so data written before it cannot
+reappear after it; data taken for an entry that a later size change overtook
+is given back and queued again behind it; and a read of a page that is not
+cached waits while a size change of the file is unanswered, because the daemon
+still holds bytes the change will cut. `writepages` is not ordered with the
+journal, so it leaves a file with any unanswered entry alone (background
+write-back) or waits for the entries (integrity write-back: `fsync`, `sync`),
+and the worker sends none of a file's data or SETATTRs while `writepages` for
+it runs, since a WRITE in flight on the other port would undo a truncation or
+mtime that overtook it.
+
+A call that goes to the daemon and is not itself journaled first waits until
+every entry naming one of the inodes it names has been answered:
+
+- LOOKUP and READDIR of a directory wait for the entries that change a name
+  in it, so the daemon's answer includes them;
+- SETATTR and FSYNC of an inode wait for the entries naming it: its creation,
+  data and links;
+- a synchronous namespace change (SYMLINK, MKNOD, and CREATE, MKDIR, UNLINK,
+  RMDIR, RENAME or LINK when not journaled) waits for every directory and node
+  it names, so the daemon finds the names, ids and emptiness the guest saw;
+- `sync`, `syncfs`, unmount and remount read-only wait for everything.
+
+Entries elsewhere need no wait. Some calls never wait: GETATTR of an inode
+with unanswered entries is not sent at all, since its cached attributes are
+what the entries will produce, and a refresh is not applied to it meanwhile; a
+READ goes straight out, because pages that are not cached were never dirty (a
+dirty page stays cached until written), pages past the zero point of a file
+created or truncated here read as zeros without a call, and a pending size
+change is the one case that waits, as above; the WRITEs of `writepages` need
+only the data rule; READLINK (symlinks are never journaled), STATFS, POLL and
+ALLOC_IDS.
+
+What this guarantees: `fsync` of a file sends the journal up to the entries
+naming it, writes back the range and then issues one FSYNC, so the file, its
+name and its data are on the daemon and synced. `fsync` of a directory issues
+one FSYNC after the entries naming it. `sync`, `syncfs`, unmount and remount
+read-only return only when the daemon has answered every entry; unmount drains
+before the dcache goes, because late failures revisit dentries. They make the
+daemon apply the changes, not sync them: only FSYNC syncs.
+
+### Timestamps
+
+The guest's clock stamps the guest's own changes, so what the guest shows is
+what the daemon will report. The daemon is told that mtime: in the CREATE for a
+new file, and by a SETATTR after the data of a file written later. A
+sub-request carries the mtime the guest shows when it is packed, not the one
+of the syscall that queued it; an entry that carries data written after later
+entries were queued therefore still gives every later sub-request an mtime at
+least as recent, and the last one the daemon runs is the guest's. Replies to
+journal entries never move a node's times, and their attributes are applied
+only when no later entry names the inode (the daemon has not seen that change
+yet) and no change of this guest overtook the call; otherwise only the size and
+mtime the daemon reports are noted.
+
+### Late failures
+
+A local filesystem reports an error from the call that caused it. Here a
+journaled operation has already returned success when the daemon refuses it:
+a full disk, a permission the guest could not foresee, a name another frontend
+made meanwhile. The refusal cannot reach the caller. This is a semantic
+difference from a local filesystem, and the module handles it as follows:
+
+- it logs the refusal (`ovnfs: deferred NAME of ID/NAME failed: errno N`,
+  rate-limited) and counts it in `late_failures`;
+- it reports the error once through `syncfs` (the superblock's write-back
+  error) and through `fsync` and close of the files involved;
+- it brings the guest's view to the daemon's: the directories involved lose
+  their complete mark, so the next lookup or listing asks the daemon, the
+  dentries of the names and the attributes of the inodes are revalidated on
+  next use, and a node whose CREATE or MKDIR was refused becomes a bad inode,
+  whose calls fail and whose dentries are dropped;
+- entries that depended on a failed one fail on the daemon by themselves.
+
+An entry whose reply never arrived (a transport failure) is treated the same
+way, except that its node is not marked bad: revalidation finds it if the
+daemon created it.
+
+A program that needs to know that a name exists on the daemon calls `fsync` on
+the file and on its directory, or `syncfs`. Mounting with `-o sync` (or
+`-o dirsync` for names only) restores the behaviour of v0: each call is one
+trap and returns the daemon's result, and with `sync` a close writes the
+file's data back and waits.
+
+### Counters
+
+`/sys/kernel/debug/ovnfs/calls` has one line per operation, `NAME CALLS
+NANOSECONDS` (the calls' total time), including `compound` and `alloc_ids`,
+then lines `NAME COUNT 0` for event counters and the journal's high-water
+mark:
+
+| line | counts |
+| --- | --- |
+| `batched` | sub-requests sent inside COMPOUND calls |
+| `journal_create`, `journal_mkdir`, `journal_unlink`, `journal_rmdir`, `journal_rename`, `journal_link`, `journal_setattr`, `journal_data` | entries journaled, by kind |
+| `create_data` | CREATEs that carried their file's content |
+| `id_refills` | ALLOC_IDS refills of the id pool |
+| `late_failures` | entries the daemon refused or did not answer |
+| `journal_high` | the most entries any journal held at once |
+
 ## Remaining work
 
 | area | what is missing |
 | --- | --- |
-| Testing | only the benchmark's workloads and its `verify` checks have run. No xfstests, pjdfstest, fsx or fsstress, no KASAN or lockdep kernel, no fuzzing of the daemon's decoder, no test of snapshot, restore or fork with a mounted tree |
+| Testing | the module has been exercised by the benchmark's workloads and its `verify` checks (`verify.tree`, `verify.data`, `verify.churn`) and, with temporary builds that are not in the tree, by failure exercises: each journaled operation refused by the daemon, a 64-entry journal bound and ALLOC_IDS refused. No xfstests, pjdfstest, fsx or fsstress, no fuzzing of the daemon's decoder, no test of snapshot, restore or fork with a mounted tree. The daemon's server has protocol, concurrency and workload tests (see [development](development.md#overlay-and-kernel-share-tests)) |
+| Debug kernels | no run under a kernel with lockdep or KASAN |
+| Ids for SYMLINK and MKNOD | the contract and the daemon give guest-chosen ids to CREATE and MKDIR only, so a symlink-heavy install still traps once per link |
+| Transport failure | a transport failure in the middle of a COMPOUND with the new entry kinds (a CREATE with content, a SETATTR with the whole content, DATA runs) has not been exercised |
+| Mapped files | a writable mapping racing a journaled truncation is not covered by any test |
 | Changes made elsewhere | the epoch changes when the daemon changes the checkout (`pull`, reattach, removal) or restarts. A change made through another frontend of the same checkout (the host's own mount, a second VM) does not change it, so a guest keeps what it cached of the changed files |
 | Ownership | new files are owned by the daemon's user, whoever created them in the guest; a non-root guest user is then refused access to its own files. remote-fs's id-range maps are to be shared with the kernel share |
-| Mutation cost | creates, renames and unlinks cost the daemon tens to hundreds of microseconds each (see the results) |
+| Creation cost | sustained small-file creation is bounded by the host's cost of writing each file out once the memory tier's budget is full (30-45 µs per file on APFS) |
+| Renames elsewhere | the lock that orders operations by id against renames is not taken by renames through the checkout's other frontends (the host's mount, NFS, SMB), so such a rename can still fail or misdirect an operation by id in flight |
 | Read path | file contents are copied three times between the daemon's file and the guest's page cache; the VMM reading the backing file of immutable content straight into guest pages is the planned fix |
 | Semantics | a file unlinked while open lives only in the guest's page cache from then on; `RENAME_NOREPLACE` is a check followed by a move on the daemon; when the daemon connection breaks after it executed a request, the VMM's single resend can execute it twice |
 | Platforms | the module is built and run for aarch64 on Hypervisor.framework only; x86_64 and KVM hosts are untested. The guest finds the call page at a fixed address per architecture, not through the device tree or ACPI |
@@ -365,29 +549,46 @@ their factor is `kmod` divided by NFS).
 
 ### Correctness
 
-The `verify` workload hashes every tracked file against git's blob ids and
-runs sixteen written-data cases: page and megabyte boundaries, back-to-front
-and mid-file rewrites, truncation up and down, a shared writable mapping,
-rename and hard links, each read back after the guest's caches are dropped. It
-passes on `kmod`, `erofs`, `ext4` and NFSv4. It fails on NFSv3: a 2 MiB file
+The `verify` workload has three phases. `verify.tree` hashes every tracked
+file against git's blob ids, and `verify.data` runs sixteen written-data cases:
+page and megabyte boundaries, back-to-front and mid-file rewrites, truncation
+up and down, a shared writable mapping, rename and hard links, each read back
+after the guest's caches are dropped. `verify.churn` runs four workers through
+seeded random operation sequences on a few colliding names and checks every
+operation's outcome and the whole subtree against a POSIX model, after the
+operations, after a cold reset and again after `syncfs` and a wait (see
+[development](development.md#guest-comparisons)); it is the check on the
+journal's ordering, since the guest answers most of those operations before
+the daemon has seen them. In the v0 run `verify.tree` and `verify.data` passed
+on `kmod`, `erofs`, `ext4` and NFSv4. They fail on NFSv3: a 2 MiB file
 truncated to 4,097 bytes and then appended with 100 bytes reads back with
 2,097,152 bytes after a remount (an existing defect of the NFSv3 path with the
 Linux client, not investigated; repro `-configs nfs3 -workloads verify`), and
 on remote-fs v1, which has no hard links. The guest kernel's log after a full
-`kmod` run holds no warning, BUG or oops. This is the only testing the kernel
-client has had (see [Remaining work](#remaining-work)).
+`kmod` run held no warning, BUG or oops.
+
+The journal's failure paths are not reachable from a healthy daemon, so they
+were exercised with temporary builds: each journaled operation refused by the
+daemon after its syscall returned, a journal bound of 64 entries, and ALLOC_IDS
+refused. These are not tests in the tree, and the rest of the testing is
+listed under [Remaining work](#remaining-work).
 
 ### What the numbers say
 
 1. Everything answerable from the guest's caches is at or below the ext4
    column: the warm phases, and the cold walk and `git status` at one
    directory read per directory.
-2. Mutations are 10 to 13 times ext4: each is one synchronous round trip of
-   60 to 70 microseconds, nearly all of it in the daemon, where every mutation
-   takes one checkout-wide overlay lock across a host filesystem call
+2. In v0 mutations were 10 to 13 times ext4: each was one synchronous round
+   trip of 60 to 70 microseconds, nearly all of it in the daemon, where every
+   mutation took one checkout-wide overlay lock across a host filesystem call
    (measured on APFS without contention: about 67 microseconds to unlink, 87
-   to rename, 280 to hard-link, 35 to open), so four guest CPUs mutate no
-   faster than one.
+   to rename, 280 to hard-link, 35 to open), so four guest CPUs mutated no
+   faster than one. Both halves have been changed since: the overlay applies
+   the host side of a name change behind the call when the memory tier is on
+   (see [internals](internals.md#memory-tiers)), and the module no longer
+   makes the guest wait for the daemon at all for the operations it can
+   predict ([The journal](#the-journal)), so a mutation costs the guest its
+   caches' update and a share of a batch.
 3. Bulk I/O was limited by macOS's 8 KiB default buffers on Unix stream
    sockets until both ends raised them to 2 MiB: sequential read went from
    318.4 to 4571.4 MiB/s and sequential write from 280.1 to 1488.4 MiB/s
@@ -410,6 +611,88 @@ none of its writes until the guest hands its upper back, and a change on the
 host needs a remount. It is kept in the harness as the yardstick for what zero
 round trips buy; the kernel client keeps the tree live in both directions that
 the daemon controls.
+
+## With the journal (v1)
+
+Measured on 2026-11-20 and 2026-11-21 with `scripts/guestbench`, same host,
+kernel and guest image as v0. The host was shared and its load average moved
+between 4 and 60 during the work, so every comparison below is interleaved:
+the committed v0 build (daemon and module of the first version) and the
+current build alternate, four runs each, with `ext4` measured in the same VM
+session as each current run. Fixture of 2,000 files, 3 rounds per run with the
+median taken, 3 cold builds per run; each cell is the range of the four runs'
+medians. `small.*` phases cover 10,000 files of 4 KiB on 4 workers.
+
+### Wall time (ms per phase)
+
+| phase | v0 | v1 | ext4 | v1 / ext4 |
+| --- | ---: | ---: | ---: | ---: |
+| small.create | 289 to 1036 | 24.2 to 37.8 | 22.2 to 28.5 | about 1.1x |
+| small.rename | 193 to 628 | 11.7 to 18.8 | 12.9 to 14.9 | about 0.9x |
+| small.unlink | 189 to 2604 | 4.6 to 5.3 | 22.4 to 24.2 | about 0.2x |
+| replay.cold | 180 to 738 | 38.6 to 56.6 | 28.7 to 63.1 | about 1.2x |
+| replay.touch | 28.6 to 43.5 | 13.9 to 16.8 | 14.9 to 30.2 | about 0.9x |
+| replay.clean | 66 to 182 | 1.9 to 3.2 | 7.6 to 9.4 | about 0.3x |
+| cargo.cold | 545 to 878 | 449 to 513 | 438 to 556 | about 1.0x |
+| cargo.touch | 307 to 550 | 212 to 226 | 202 to 227 | about 1.0x |
+| verify.churn | 430 to 530 | 164 to 731 | 98 to 192 | about 1.7x |
+
+`small.sync`, the `syncfs` after the create phase, took 1.6 to 2.9 ms on v1
+and 79 to 120 ms on `ext4`. The two are not the same promise: after it `ext4`
+has written to its virtual disk, while the module has handed everything to the
+daemon, whose memory tier still holds it. The phases where v1 is below `ext4`
+are the ones whose host work happens after the syscall returns.
+
+A full-size run (50,000 files, every workload, 3 rounds) passed on `ext4` and
+`kmod` with a clean guest kernel log and no late failure, but the host's load
+rose to 36 while the `kmod` column ran (its `net.*` rows, which do not touch
+the filesystem, were 1.8 to 7.3 times `ext4`'s), so its timings are not used
+here; the results are in `v1-journal.json`.
+
+### Traps
+
+In one run of `small`, `replay`, `cargo` and `verify` the v0 module made
+35,743 CREATE, 37,847 WRITE, 3,211 SETATTR and 2,247 RMDIR calls. The v1 module
+made about 2,900 COMPOUND calls and, of the synchronous kinds, 1 SETATTR,
+1 WRITE, 3 RMDIR and 140 SYMLINK (all of `verify.churn`'s symlinks); the cold
+READ and READDIR calls remain (about 4,900 and 104). The journal's high-water
+mark was 9,770 to 15,576 entries of its 131,072.
+
+One uncached round trip (`trap.one`, a `statfs` loop) had a median of 17
+microseconds before the daemon and the VMM polled for the next message, and 12
+in the one quiet pair measured after; with four callers the median per call
+fell from 32 to 52 microseconds to 24 to 27 in all four pairs.
+
+### What changed the numbers
+
+1. The overlay stopped making host calls under the checkout lock and then
+   stopped making them in the call at all (directory times in the index, queued
+   host changes). Measured alone against v0 in the guest: create, rename and
+   unlink about 2 to 10 times faster under load, and a floor of one round trip
+   per mutation.
+2. Batching write-back through COMPOUND removed one of a small file's two
+   traps.
+3. The journal removed the rest: a create, rename, unlink, link, mkdir, rmdir
+   or attribute change costs the guest its own cache update, and the daemon
+   executes a content-carrying create in about 3.5 microseconds while the
+   memory tier has room.
+
+The other frontends gained nothing measurable from the overlay changes: NFSv3
+in the same guest took 54 to 63 s for `small.create` with the v0 daemon and 60
+to 80 s with the current one, within the noise of that path.
+
+### Correctness
+
+`verify.tree`, `verify.data` and `verify.churn` passed on `kmod` in every run
+used above. `verify.churn` passes on `ext4`, which is what validates its
+model, and with the v0 module against both daemons. It found, in order: a
+daemon race between operations by id and renames on another connection
+(present in v0, now closed by the names lock), ordering races between
+write-back, replies and truncation in the module, and three deadlocks (a read
+holding page locks while waiting for the journal against a truncation, inode
+eviction against `sync`, and `sync` starved by a file truncated in a loop).
+After the last fix the command that had hung passed 60 consecutive runs under
+load and the `verify` loop 40.
 
 ## Kernel audit
 

@@ -31,6 +31,18 @@ WinFsp spill a named memory-backed file to the upper and sync its host file.
 It is off by default and does not sync parent directories or make snapshots
 durable. NFS handles [stable writes and COMMIT](platforms.md#nfs) regardless
 of this option.
+
+With the memory tier on, a daemon crash or `kill -9` loses what the daemon
+had not yet put on the host: written files that had not spilled, and the name
+changes (unlink, rename and hard link of files on disk, mkdir and rmdir of
+directories no lower layer has) it had queued for the host (see
+[internals](internals.md#memory-tiers)). Removed names can then reappear and
+renamed files show their old names, but every name shows a state it had since
+the last flush, which `snap`, `fork`, `diff` and a planned stop each do. File
+contents are per file, not per name: data written through a descriptor reaches
+the file whatever happened to its names. `--memory 0` keeps every change
+synchronous. A queued change the host refuses is retried every second, and
+`ovnfs status` shows a `queue error` row while one waits.
 `serve --atime` (`OVNFS_ATIME=1`) lets the mount update access times; by
 default it is mounted `noatime`, since the macOS NFS client otherwise sends a
 SETATTR for every exec of a checkout binary. A restart applies the setting to

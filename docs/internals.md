@@ -509,16 +509,83 @@ Written files start in memory, not in the upper: new and truncated files, and
 files of at most 256 KiB copied up for writing, share one budget across all
 checkouts (`--memory`, default 64 MiB). A file moves into its upper once it has been left
 untouched for 2 s, when it outgrows 256 KiB, when newer files need the budget
-(least recently used first), before a hard link, `chown` or lock, before a
+(least recently used first), before a `chown` or lock, before a
 rename over a file already in the upper (so the host rename replaces the old
 copy atomically), and before
 `snap`, `fork`, `diff` and a planned stop, which therefore cost one host create
 per file written in the last 2 s; files deleted sooner never reach the disk.
 Directories, symlinks and whiteouts always live in the upper. A deleted name
 keeps its whiteout on disk until the new memory file at that name spills.
+A hard link to a memory file adds a name to it in memory: every name shows
+the one file, and unlinking a name leaves the others. When the file spills,
+its first name is installed as any spill installs it and the others follow
+as one queued host link change, so a crash can lose those names but never
+leaves a second copy of the file (Windows and `--memory 0` link on disk in
+the call).
 On FUSE, SMB and WinFsp a handle sync spills memory files only with `--fsync`.
 [NFS stable writes and COMMIT](platforms.md#nfs) spill and sync their file
 regardless of the flag; unstable writes can stay in memory.
+
+With the memory tier the loaded upper index is the truth for names too, and
+the upper on disk trails it:
+
+- Directory times live in the index. A name change made only in memory
+  stamps the directory in the index and makes no host call; copy-ups, spills
+  and deletion markers, which clients must not see as a change, leave the
+  time alone and no longer restore it on the host. A directory whose time on
+  the host differs from the index's is unsettled. The index's times reach the
+  host at `Flush`, at a freeze, before the index unloads, for the ancestors of
+  a file an `fsync` syncs, and when a call sets the directory's own
+  attributes; a crash leaves a time the host chose, which clients see as one
+  more change. Windows, whose native records the index cannot give a time of
+  their own, and `--memory 0` keep the host's times: each change stats the
+  directory afterwards, and each invisible one restores the time it read
+  first.
+- Some host changes are queued, on darwin and linux: unlink, rename and hard
+  link of upper files on disk, and mkdir and rmdir of directories no lower
+  layer has. The call changes the index and returns; up to four workers per
+  checkout make the queued changes, one host call each, changes on related
+  names (equal, or one below the other, or names of one file) in the order
+  the index saw them. The index is the authority for link counts: it shows
+  the count after a queued change, which the host does not yet, so a call
+  that needs the host state of any name of the file waits like one that
+  needs the name's own. A call that needs a name's host state (opening a file
+  on disk, creating one on disk, a spill, an `fsync`) waits only for the
+  queued changes on that name, which the workers make next; `Flush`, a freeze
+  and `Empty` wait for the whole queue, and at most 1,024 changes wait per
+  checkout. A directory made by the queue gets a new Synthetic identity,
+  persisted on it when it is made. A change the host refuses parks the queue:
+  it is retried every second, new changes run in their calls meanwhile, a
+  call that would wait for the parked change or one queued behind it
+  (`Flush` included) returns the failure instead, and `ovnfs status` shows a
+  `queue error` row (`queue_parked` and `queue_error` in JSON).
+- Names reach the upper's volume after the call, so the overlay checks them
+  against the volume first. When it opens, it probes the volume: whether it
+  refuses names that are not valid UTF-8 and whether it takes names that
+  differ only in case or Unicode normalization for one entry (APFS: all
+  three on its default case-insensitive volumes; Linux volumes usually
+  none). A create, mkdir, symlink, mknod, link or rename to a new name then
+  fails with `EILSEQ` for a name the volume refuses and with `EEXIST` for a
+  name the volume would take for another entry of the directory (where the
+  host's create without `O_EXCL` would open that entry and its rename would
+  replace it); a rename that changes only the case or normalization of an
+  entry's own name goes through. Lookups still match names exactly.
+- A spill writes a staged copy and installs it with a rename outside the
+  checkout's lock, as do the other host changes that run in their calls
+  (opens, renames, removes and links the queue does not take): other calls on
+  the checkout go on meanwhile, and the file in memory is replaced only if it
+  did not change before the install. Deletion markers are index entries, so a
+  create over a deleted name knows without a host call whether a marker is on
+  disk; the exception is a memory file, which keeps the marker of its name
+  until it spills and records that itself.
+
+A daemon crash loses the queued changes: removed names show again and renamed
+files under their old names. Every name shows a state it had since the last
+`Flush`, because changes on related names reach the host in the order the
+index saw them; a file's contents are the file's own, whatever happened to its
+names (see [configuration](configuration.md)).
+
+With `--memory 0` every change goes to the host in the call, as before.
 
 When a file's write to disk fails (a full disk, say), the file stays in memory
 and the daemon retries it every second. While any file waits, new files go to
@@ -559,8 +626,9 @@ while paths below it use the nested repository's facts.
 
 Small store blobs (at most 1 MiB) are served from a second budget
 (`--blob-cache`, default 16 MiB) instead of their object files. `ovnfs status` shows both. A
-crash or `kill -9` loses the files still in memory; `--memory 0` writes every
-file to the upper as it happens.
+crash or `kill -9` loses the files still in memory and the name changes still
+queued for the host; `--memory 0` writes every change to the host as it
+happens.
 
 Two smaller caches have fixed budgets: reconstructed git delta bases, 16 MiB
 shared by every repository the daemon reads (git's default is 96 MiB per
