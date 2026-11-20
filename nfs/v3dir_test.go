@@ -313,7 +313,8 @@ func TestV3ReaddirChangesMidListing(t *testing.T) {
 
 // TestV3ReaddirPlusContinuationAfterRecall checks that READDIRPLUS
 // continuations of a cacheable directory report an entry changed behind the
-// server once the change was recalled, and one changed by a WRITE.
+// server once it was recalled, and both files changed by a WRITE and a
+// subsequent SETATTR before the next page.
 func TestV3ReaddirPlusContinuationAfterRecall(t *testing.T) {
 	fs := newTestFS(t)
 	fs.cacheable = func(string) bool { return true }
@@ -356,6 +357,23 @@ func TestV3ReaddirPlusContinuationAfterRecall(t *testing.T) {
 	id := fs.FileID(path.Join("d", last))
 	if stat, d := call(v3Write, writeArgs(id, 0, []byte("rewritten by the client, longer"))); stat != rpcSuccess || status(d.u32()) != stOK {
 		t.Fatal("WRITE failed")
+	}
+	other := files[len(files)-2]
+	if stat, d := call(v3SetAttr, func(e *encoder) {
+		e.fh(fs.FileID(path.Join("d", other)), 0)
+		for range 3 { // leave mode, uid and gid alone
+			e.bool(false)
+		}
+		e.bool(true)
+		e.u64(5)
+		e.u32(0)      // unchanged atime
+		e.u32(0)      // unchanged mtime
+		e.bool(false) // no guard
+	}); stat != rpcSuccess || status(d.u32()) != stOK {
+		t.Fatal("SETATTR failed")
+	}
+	if a := pageFrom(first, other); a == nil || a.size != 5 {
+		t.Fatalf("after a SETATTR: %+v", a)
 	}
 	if a := pageFrom(first, last); a == nil || a.size != uint64(len("rewritten by the client, longer")) {
 		t.Fatalf("after a WRITE: %+v", a)

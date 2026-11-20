@@ -559,7 +559,10 @@ Two smaller caches have fixed budgets: reconstructed git delta bases, 16 MiB
 shared by every repository the daemon reads (git's default is 96 MiB per
 process, and the daemon keeps one object database per work tree open), and
 the NFS READDIR snapshots that keep a paged listing stable, 64 MiB by estimated
-size; the newest snapshot stays even when it alone exceeds that.
+size; the newest snapshot stays even when it alone exceeds that. `rm` drops
+that checkout's snapshots and saved continuation points before its file-id
+slot can be reused. A page already in flight cannot put them back. Memory
+becomes reclaimable without waiting for another checkout to fill the cache.
 
 The Go collector runs with its defaults (`GOGC=100`: the heap may grow to twice
 the live heap between collections; `GOGC` and `GOMEMLIMIT` apply as usual). A
@@ -569,12 +572,14 @@ burst. `ovnfs status` shows the Go heap (live, in use, held from the OS) and the
 process footprint the OS charges (`heap_live`, `heap_in_use`, `go_held`,
 `footprint` in JSON).
 
-The NFS server keeps at most 1024 listing snapshots for READDIR cookies.
-READDIR checks reply budgets before identifying or encoding an entry that
-cannot fit. A READDIRPLUS continuation restats its entries when a change or
-recall reached the server since the listing was read, or the directory is not
-cacheable; it does so before checking space, so a removed entry cannot block a
-later name that fits. Each connection reuses a bounded pool of request workers,
+NFSv3 READDIRPLUS keeps the names from the first page but must not return an
+old size or mode after a write. A regular-file WRITE or SETATTR stamps a
+bucket keyed by file id: continuations restat entries in changed buckets,
+including aliases of the same file. Collisions cost a stat, not accuracy.
+A namespace change, external recall or uncacheable directory still requires
+refreshing the whole page. If the listing was evicted and names changed, v3
+resumes by name from the newly read directory instead of reading it twice.
+Each connection reuses a bounded pool of request workers,
 started on demand; each worker reuses its call and reply-encoder storage,
 clearing buffer references after replying. The reading goroutine answers a
 quick call itself (GETATTR, LOOKUP, ACCESS, CREATE, WRITE and the like) when

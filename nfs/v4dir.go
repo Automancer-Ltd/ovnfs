@@ -93,7 +93,8 @@ func (x *v4compound) readdir() status {
 	if s := x.s.dir4(cur.path); s != stOK {
 		return s
 	}
-	l, s := x.s.list(cur.id, cur.path, cookie, verf)
+	dir := listingDir{id: cur.id, gen: x.handleGen(cur), path: cur.path, epoch: x.listEpoch}
+	l, s := x.s.list(dir, cookie, verf)
 	if s == stBadCookie {
 		return stNotSame
 	}
@@ -151,7 +152,7 @@ func (x *v4compound) readdir() status {
 	}
 	x.e.bool(false)
 	x.e.bool(eof)
-	return stOK
+	return x.s.finishPage(dir, l.verf, 0, "")
 }
 
 // create answers CREATE of directories and symbolic links; regular files

@@ -5,7 +5,6 @@ import (
 	"os"
 	"slices"
 	"strings"
-	"sync"
 )
 
 // firstCookie is the READDIR cookie of a listing's first entry. NFSv4
@@ -22,9 +21,7 @@ type listing struct {
 	verf    uint64
 	first   uint64
 	entries []os.FileInfo
-	// changes is Server.changes from before the directory was read: while
-	// it is unchanged, the entries' attributes are as current as when read.
-	changes uint64
+	changes uint64 // change clock before enumeration; see dirChanges
 }
 
 // after returns the index of the first entry after cookie; false for a
@@ -41,73 +38,129 @@ func (l *listing) after(cookie uint64) (int, bool) {
 	return int(i), true
 }
 
-// list returns the listing a READDIR of directory id, at path p, pages
+// listingDir is the handle and path being listed. epoch is sampled before
+// resolving the handle, not after ReadDir: retirement may overlap either.
+type listingDir struct {
+	id, gen, epoch uint64
+	path           string
+}
+
+// lock takes the listing-cache lock if the directory is still live. The
+// usual case needs no backend call. After a retirement, revalidate *outside*
+// the lock (the registry calls RetireRange under its own lock), and retry if
+// another range was retired during revalidation.
+func (d listingDir) lock(s *Server) bool {
+	for {
+		s.listMu.Lock()
+		epoch := s.epoch.Load()
+		if d.epoch == epoch {
+			return true
+		}
+		s.listMu.Unlock()
+		if p, ok := s.FS.Path(d.id, d.gen); !ok || p != d.path {
+			return false
+		}
+		d.epoch = epoch
+	}
+}
+
+// list returns the listing a READDIR of directory d pages
 // through: the snapshot verf names when continuing (cookie and verf not 0),
 // else a fresh listing. A continuation whose snapshot was evicted lists the
-// directory again and fails with stBadCookie unless its entries are still
-// the same, which is the verifier no longer matching.
-func (s *Server) list(id uint64, p string, cookie, verf uint64) (*listing, status) {
+// directory again. A mismatched verifier returns stBadCookie with the fresh,
+// unpublished listing: v4 rejects the cookie; v3 can resume by name without
+// enumerating the directory a second time.
+func (s *Server) list(d listingDir, cookie, verf uint64) (*listing, status) {
 	resume := cookie != 0 && verf != 0
 	if resume {
-		if l := s.dirs.get(id, verf); l != nil {
+		if !d.lock(s) {
+			return nil, stStale
+		}
+		l := s.dirs.get(d.id, verf)
+		s.listMu.Unlock()
+		if l != nil {
 			return l, stOK
 		}
 	}
-	l, st := s.read(id, p, firstCookie)
+	l, st := s.read(d, firstCookie)
 	if st != stOK {
 		return nil, st
 	}
 	if resume && l.verf != verf {
-		return nil, stBadCookie
+		return l, stBadCookie
 	}
-	s.dirs.put(l)
-	return l, stOK
+	return s.cacheListing(d, l)
 }
 
-// relist lists directory id again for a continuation after cookie, from the
-// listing verf names, whose snapshot is gone and whose directory changed.
+// resume3 renumbers an unpublished listing for a v3 continuation after
+// cookie when the snapshot named by verf was evicted and the names changed.
 // When s.resumes knows the last name that page returned, it keeps only the
 // entries after it. Its entries are numbered from cookie+1: the macOS client
 // drops entries whose cookie is not past the one it asked for, and ends the
 // listing at BAD_COOKIE.
-func (s *Server) relist(id uint64, p string, cookie, verf uint64) (*listing, status) {
-	changes := s.changes.Load()
-	infos, err := s.FS.ReadDir(p)
-	if err != nil {
-		return nil, statusOf(err)
+func (s *Server) resume3(d listingDir, l *listing, cookie, verf uint64) (*listing, status) {
+	if !d.lock(s) {
+		return nil, stStale
 	}
-	if last, ok := s.resumes.get(resumeKey{id, verf, cookie}); ok {
-		i, found := slices.BinarySearchFunc(infos, last, func(info os.FileInfo, name string) int {
+	last, ok := s.resumes.get(resumeKey{d.id, verf, cookie})
+	s.listMu.Unlock()
+	if ok {
+		i, found := slices.BinarySearchFunc(l.entries, last, func(info os.FileInfo, name string) int {
 			return strings.Compare(info.Name(), name)
 		})
 		if found {
 			i++
 		}
-		infos = infos[i:]
+		l.entries = l.entries[i:]
 	}
-	first := cookie + 1
-	l := &listing{dir: id, verf: verifier(id, first, infos), first: first, entries: infos, changes: changes}
-	s.dirs.put(l)
-	return l, stOK
+	l.first = cookie + 1
+	l.verf = verifier(d.id, d.gen, l.first, l.entries)
+	return s.cacheListing(d, l)
 }
 
-// read lists directory id, at path p, sorted by name and numbered from first.
-func (s *Server) read(id uint64, p string, first uint64) (*listing, status) {
-	changes := s.changes.Load()
-	infos, err := s.FS.ReadDir(p)
+// read lists directory d, sorted by name and numbered from first.
+func (s *Server) read(d listingDir, first uint64) (*listing, status) {
+	changes := s.changes.clock.Load()
+	infos, err := s.FS.ReadDir(d.path)
 	if err != nil {
 		return nil, statusOf(err)
 	}
-	return &listing{dir: id, verf: verifier(id, first, infos), first: first, entries: infos, changes: changes}, stOK
+	return &listing{dir: d.id, verf: verifier(d.id, d.gen, first, infos), first: first, entries: infos, changes: changes}, stOK
+}
+
+func (s *Server) cacheListing(d listingDir, l *listing) (*listing, status) {
+	size := l.bytes()
+	if !d.lock(s) {
+		return nil, stStale
+	}
+	s.dirs.put(l, size)
+	s.listMu.Unlock()
+	return l, stOK
+}
+
+// finishPage checks for retirement during encoding (including cache hits)
+// and atomically records a partial v3 page's continuation point, if any.
+func (s *Server) finishPage(d listingDir, verf, cookie uint64, last string) status {
+	if last == "" && s.epoch.Load() == d.epoch {
+		return stOK
+	}
+	if !d.lock(s) {
+		return stStale
+	}
+	if last != "" {
+		s.resumes.put(resumeKey{d.id, verf, cookie}, last)
+	}
+	s.listMu.Unlock()
+	return stOK
 }
 
 // verifier is a cookie verifier for a directory's entry names and their
 // numbering, never 0 (which clients send before they have one): FNV-1a of
-// the directory's id, its first cookie and its names, each preceded by a NUL.
-func verifier(dir, first uint64, infos []os.FileInfo) uint64 {
+// the directory's id and generation, first cookie and NUL-separated names.
+func verifier(dir, gen, first uint64, infos []os.FileInfo) uint64 {
 	const prime = 1099511628211
 	h := uint64(14695981039346656037)
-	for _, v := range []uint64{dir, first} {
+	for _, v := range [...]uint64{dir, gen, first} {
 		for i := range 8 {
 			h = (h ^ v>>(8*i)&0xff) * prime
 		}
@@ -148,7 +201,6 @@ func (l *listing) bytes() int {
 // directory too big for the budget still pages through its own snapshot.
 // The zero value is empty and ready.
 type dirCache struct {
-	mu     sync.Mutex
 	byVerf map[uint64]*list.Element // of *cachedListing
 	lru    list.List                // most recently used first
 	size   int
@@ -162,8 +214,6 @@ type cachedListing struct {
 
 // get returns the listing verf names if it belongs to directory dir.
 func (c *dirCache) get(dir, verf uint64) *listing {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	if e := c.byVerf[verf]; e != nil {
 		if l := e.Value.(*cachedListing); l.dir == dir {
 			c.lru.MoveToFront(e)
@@ -174,10 +224,7 @@ func (c *dirCache) get(dir, verf uint64) *listing {
 }
 
 // put records l, replacing any listing with the same verifier.
-func (c *dirCache) put(l *listing) {
-	n := l.bytes()
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *dirCache) put(l *listing, n int) {
 	if c.byVerf == nil {
 		c.byVerf = make(map[uint64]*list.Element)
 	}
@@ -191,7 +238,7 @@ func (c *dirCache) put(l *listing) {
 	}
 }
 
-// remove forgets entry e. The caller holds c.mu.
+// remove forgets entry e.
 func (c *dirCache) remove(e *list.Element) {
 	l := c.lru.Remove(e).(*cachedListing)
 	delete(c.byVerf, l.verf)
@@ -210,7 +257,6 @@ type resumeKey struct{ dir, verf, cookie uint64 }
 // used, so a continuation whose snapshot dirCache evicted resumes after it.
 // The zero value is empty and ready.
 type resumeCache struct {
-	mu    sync.Mutex
 	byKey map[resumeKey]*list.Element // of *resumePoint
 	lru   list.List                   // most recently used first
 }
@@ -223,8 +269,6 @@ type resumePoint struct {
 
 // put records that continuation point k follows the entry named last.
 func (c *resumeCache) put(k resumeKey, last string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.byKey == nil {
 		c.byKey = make(map[resumeKey]*list.Element)
 	}
@@ -241,8 +285,6 @@ func (c *resumeCache) put(k resumeKey, last string) {
 
 // get returns the name of the entry continuation point k follows.
 func (c *resumeCache) get(k resumeKey) (string, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	e := c.byKey[k]
 	if e == nil {
 		return "", false

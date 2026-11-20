@@ -66,9 +66,9 @@ func (s *Server) setattr3(d *decoder, res *encoder) status {
 	if sa.setSize {
 		res.beginSize(id, sa.size)
 	}
-	s.Recall(id)
+	s.recallAttrs(id, pre.typ)
 	st = s.apply3(p, &sa)
-	s.Recall(id)
+	s.recallAttrs(id, pre.typ)
 	if st != stOK {
 		return st
 	}
@@ -255,17 +255,24 @@ func (s *Server) write3(d *decoder, res *encoder) status {
 	if count > math.MaxInt32 || off > math.MaxInt64 {
 		return stFBig
 	}
-	info, err := s.FS.Stat(p)
+	info, err := s.FS.Lstat(p)
 	if err != nil {
 		return statusOf(err)
+	}
+	typ := typeOf(info.Mode())
+	if typ == typeLnk {
+		// A write through a symlink changes its target, not the handle's id.
+		if info, err = s.FS.Stat(p); err != nil {
+			return statusOf(err)
+		}
 	}
 	if !info.Mode().IsRegular() {
 		return stInval
 	}
 	pre := attrsOf(id, info)
-	s.Recall(id)
+	s.recallAttrs(id, typ)
 	n, err := s.writeAt3(id, p, data[:min(len(data), int(count))], int64(off))
-	s.Recall(id)
+	s.recallAttrs(id, typ)
 	if err != nil {
 		return statusOf(err)
 	}

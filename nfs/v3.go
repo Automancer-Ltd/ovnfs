@@ -66,19 +66,20 @@ type v3proc struct {
 	name string // as RFC 1813 spells it, which names its Server.Stats timer
 	run  func(s *Server, d *decoder, res *encoder) status
 	fail int
-	// changes marks a procedure that may change a file or directory.
-	changes bool
+	// namespace marks changes that can affect multiple entries. SETATTR and
+	// WRITE record their affected object themselves.
+	namespace bool
 }
 
 // v3procs are the procedures by number; NULL is answered by nfs3 itself.
 var v3procs = [v3Count]v3proc{
 	v3GetAttr:     {"GETATTR", (*Server).getattr3, 0, false},
-	v3SetAttr:     {"SETATTR", (*Server).setattr3, 8, true},
+	v3SetAttr:     {"SETATTR", (*Server).setattr3, 8, false},
 	v3Lookup:      {"LOOKUP", (*Server).lookup3, 4, false},
 	v3Access:      {"ACCESS", (*Server).access3, 4, false},
 	v3Readlink:    {"READLINK", (*Server).readlink3, 4, false},
 	v3Read:        {"READ", (*Server).read3, 4, false},
-	v3Write:       {"WRITE", (*Server).write3, 8, true},
+	v3Write:       {"WRITE", (*Server).write3, 8, false},
 	v3Create:      {"CREATE", (*Server).create3, 8, true},
 	v3Mkdir:       {"MKDIR", (*Server).mkdir3, 8, true},
 	v3Symlink:     {"SYMLINK", (*Server).symlink3, 8, true},
@@ -110,8 +111,8 @@ func (s *Server) nfs3(c *call, res *encoder) acceptStat {
 	began := timer.Start()
 	st := p.run(s, &c.args, res)
 	timer.Since(began)
-	if p.changes {
-		s.changes.Add(1)
+	if p.namespace {
+		s.changes.invalidate()
 	}
 	if c.args.err != nil {
 		return rpcGarbageArgs

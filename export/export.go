@@ -24,7 +24,7 @@ func New(rt *Router, upperVolume string) *Export {
 func (e *Export) Retire(name string, slot uint16) {
 	if fn := e.fs.onRecall.Load(); fn != nil {
 		first, last := slotIDs(slot)
-		(*fn)(Recall{First: first, Last: last, Path: name})
+		(*fn)(Recall{First: first, Last: last, Path: name, Retired: true})
 	}
 	e.rt.retire(name)
 }

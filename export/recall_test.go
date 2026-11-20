@@ -29,18 +29,23 @@ func (r *recorder) add(rc exportfs.Recall) {
 	r.mu.Unlock()
 }
 
-// has reports whether a recall covered the file NFS handle fh names, then
+// covering returns a recall covering the file NFS handle fh names, then
 // clears the recorder.
-func (r *recorder) has(fh []byte) bool {
+func (r *recorder) covering(fh []byte) (exportfs.Recall, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var id uint64
 	if len(fh) >= 8 {
 		id = binary.BigEndian.Uint64(fh)
 	}
-	found := slices.ContainsFunc(r.recalls, func(rc exportfs.Recall) bool { return rc.First <= id && id <= rc.Last })
+	recalls := r.recalls
 	r.recalls = nil
-	return found
+	for _, rc := range recalls {
+		if rc.First <= id && id <= rc.Last {
+			return rc, true
+		}
+	}
+	return exportfs.Recall{}, false
 }
 
 // paths returns the paths recalled since the last check, then clears the recorder.
@@ -67,10 +72,10 @@ func TestInvalidateTreeRecallsItsCheckout(t *testing.T) {
 	c := nfstest.Start(t, f.export.NFS())
 	x := lookup(t, c, "app/t/d/x")
 	o := lookup(t, c, "other/s")
-	rec.has(nil)
+	rec.covering(nil)
 
 	f.export.Invalidate("app", nil, []string{"t"})
-	if !rec.has(x) {
+	if rc, ok := rec.covering(x); !ok || rc.Retired {
 		t.Fatal("a tree invalidation did not recall a handle below it")
 	}
 	f.export.Invalidate("app", nil, []string{"t"})
@@ -78,7 +83,7 @@ func TestInvalidateTreeRecallsItsCheckout(t *testing.T) {
 		t.Fatalf("tree invalidation named %q, want app/t", got)
 	}
 	f.export.Invalidate("app", nil, []string{""})
-	if rec.has(o) {
+	if _, ok := rec.covering(o); ok {
 		t.Fatal("invalidating one checkout recalled another's handle")
 	}
 }
@@ -95,10 +100,10 @@ func TestRecallsChangesBehindNFSClients(t *testing.T) {
 	c := nfstest.Start(t, f.export.NFS())
 	src := lookup(t, c, "app/src")
 	gone := nfsCreate(t, c, lookup(t, c, "app"), "gone", "doomed")
-	rec.has(nil) // the client's own requests are not the subject here
+	rec.covering(nil) // the client's own requests are not the subject here
 
 	nfsWrite(t, c, src, "nfs")
-	if rec.has(src) {
+	if _, ok := rec.covering(src); ok {
 		t.Fatal("an NFS write went through the export's recall hook; the NFS server recalls conflicting delegations itself")
 	}
 
@@ -107,7 +112,7 @@ func TestRecallsChangesBehindNFSClients(t *testing.T) {
 		t.Fatal(err)
 	}
 	other.Close()
-	if !rec.has(src) {
+	if rc, ok := rec.covering(src); !ok || rc.Retired {
 		t.Fatal("a write through another protocol did not recall the NFS handle")
 	}
 
@@ -121,7 +126,7 @@ func TestRecallsChangesBehindNFSClients(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.export.Invalidate("app", []string{"gone", "never-handed-out"}, nil)
-	if !rec.has(gone) {
+	if rc, ok := rec.covering(gone); !ok || rc.Retired {
 		t.Fatal("Invalidate did not recall the changed path")
 	}
 	_, status, err := c.GetAttr(gone)
@@ -130,7 +135,7 @@ func TestRecallsChangesBehindNFSClients(t *testing.T) {
 	if err := f.reg.Rm(context.Background(), api.RmArgs{Checkout: "app"}); err != nil {
 		t.Fatal(err)
 	}
-	if !rec.has(src) {
-		t.Fatal("removing the checkout did not recall its handles")
+	if rc, ok := rec.covering(src); !ok || !rc.Retired {
+		t.Fatal("removing the checkout did not retire its handles")
 	}
 }

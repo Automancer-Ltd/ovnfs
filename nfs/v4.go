@@ -123,7 +123,7 @@ func (s *Server) nfs4(c *call, res *encoder) acceptStat {
 	case proc4Null:
 		return rpcSuccess
 	case proc4Compound:
-		defer s.changes.Add(1)
+		defer s.changes.invalidate()
 		defer s.timers.compound.Since(s.timers.compound.Start())
 		return s.compound4(c, res)
 	}
@@ -151,7 +151,7 @@ func (s *Server) compound4(c *call, res *encoder) acceptStat {
 		return rpcSuccess
 	}
 
-	x := v4compound{s: s, conn: c.conn, d: d, e: res, limit: at + v4ReplyBudget}
+	x := v4compound{s: s, conn: c.conn, d: d, e: res, limit: at + v4ReplyBudget, listEpoch: s.epoch.Load()}
 	st := stOK
 	var done uint32
 	for st == stOK && done < n {
@@ -201,10 +201,12 @@ func opKeepsBody4(op uint32, st status) bool {
 
 // v4compound is what a COMPOUND carries from operation to operation.
 type v4compound struct {
-	s    *Server
-	conn *conn
-	d    *decoder
-	e    *encoder
+	// listEpoch predates every handle resolution in this compound (see listingDir).
+	listEpoch uint64
+	s         *Server
+	conn      *conn
+	d         *decoder
+	e         *encoder
 	// limit is the reply length an operation may not start past
 	// (v4ReplyBudget); READ and READDIR fit within it.
 	limit int

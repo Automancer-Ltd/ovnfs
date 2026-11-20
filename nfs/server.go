@@ -53,11 +53,12 @@ type Server struct {
 	once sync.Once
 	// verf is this instance's write verifier: it changes when the server
 	// restarts, telling clients to resend unstable writes.
-	verf [8]byte
-	// changes counts the changes that may have made a listing's attributes
-	// stale: each NFSv3 change once it is done, each NFSv4 COMPOUND and each
-	// recall (see listing.changes).
-	changes atomic.Uint64
+	verf    [8]byte
+	changes dirChanges // freshness of attributes in paged listings
+	// listMu protects both listing caches and serializes publication with
+	// RetireRange. Epoch changes only when a range is retired.
+	listMu  sync.Mutex
+	epoch   atomic.Uint64
 	dirs    dirCache
 	resumes resumeCache
 	v3      v3State
@@ -116,16 +117,49 @@ func (s *Server) start() {
 // themselves; the embedder calls Recall for every other change to a file
 // Backend.Cacheable admits. It does not block.
 func (s *Server) Recall(id uint64) {
-	s.changes.Add(1)
+	s.changes.invalidate()
 	s.v4.recall(id)
+}
+
+// recallAttrs narrows a known regular-file mutation to its file id. Directory
+// and symlink changes can affect other entries, so keep the broad recall.
+func (s *Server) recallAttrs(id uint64, typ fileType) {
+	if typ == typeReg {
+		s.changes.mark(s.changes.file(id))
+		s.v4.recall(id)
+	} else {
+		s.Recall(id)
+	}
 }
 
 // RecallRange is Recall of every file id in [first, last], for the
 // embedder's changes that reach many files at once, such as every file of a
 // checkout (a checkout's ids share one range). It does not block.
 func (s *Server) RecallRange(first, last uint64) {
-	s.changes.Add(1)
+	s.changes.invalidate()
 	s.v4.recallRange(first, last)
+}
+
+// RetireRange recalls [first, last] and releases its directory snapshots and
+// continuation points before those ids can be reused. The caller retires the
+// range under its registry lock; no listing-cache lock calls the backend.
+func (s *Server) RetireRange(first, last uint64) {
+	s.RecallRange(first, last)
+	s.listMu.Lock()
+	defer s.listMu.Unlock()
+	s.epoch.Add(1)
+	for _, e := range s.dirs.byVerf {
+		id := e.Value.(*cachedListing).dir
+		if first <= id && id <= last {
+			s.dirs.remove(e)
+		}
+	}
+	for k, e := range s.resumes.byKey {
+		if first <= k.dir && k.dir <= last {
+			delete(s.resumes.byKey, k)
+			s.resumes.lru.Remove(e)
+		}
+	}
 }
 
 // logf logs through Logf, if set.

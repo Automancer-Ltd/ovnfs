@@ -12,7 +12,7 @@ func (s *Server) readdir3(d *decoder, res *encoder) status { return s.list3(d, r
 func (s *Server) readdirplus3(d *decoder, res *encoder) status { return s.list3(d, res, true) }
 
 // list3 answers READDIR or, with plus, READDIRPLUS from the listing
-// snapshot the cookie verifier names (see Server.list), or from Server.relist
+// snapshot the cookie verifier names (see Server.list), or from Server.resume3
 // when that snapshot is gone and the directory changed. "." and ".." come
 // first, with cookies 1 and 2; entries[i] has cookie first+i. Entries are
 // added while the result stays within the client's byte budgets, measured on
@@ -29,19 +29,24 @@ func (s *Server) list3(d *decoder, res *encoder, plus bool) status {
 	if d.err != nil {
 		return stInval
 	}
-	p, st := s.path3(id, gen, ok)
-	if st != stOK {
-		return st
+	if !ok {
+		return stBadHandle
 	}
+	epoch := s.epoch.Load()
+	p, gen, live := s.resolve(id, gen)
+	if !live {
+		return stStale
+	}
+	dir := listingDir{id: id, gen: gen, path: p, epoch: epoch}
 	// The type is checked rather than left to the listing's error: Windows
 	// fails it with ENOTDIR, which is ERROR_PATH_NOT_FOUND there, so ENOENT.
 	da, err := s.stat(id, p)
 	if err == nil && da.typ != typeDir {
 		return stNotDir
 	}
-	l, st := s.list(id, p, cookie, verf)
+	l, st := s.list(dir, cookie, verf)
 	if st == stBadCookie {
-		l, st = s.relist(id, p, cookie, verf)
+		l, st = s.resume3(dir, l, cookie, verf)
 	}
 	if st != stOK {
 		return st
@@ -89,13 +94,18 @@ func (s *Server) list3(d *decoder, res *encoder, plus bool) status {
 	var lastName string
 	// A continuation reports current attributes: the client keeps those of
 	// the newest reply, so a snapshot's could undo a change it saw since.
-	// The listing's are current while no change or recall came since and
-	// every change to the directory's entries reaches Recall (Cacheable).
-	refresh := plus && cookie != 0 && (s.changes.Load() != l.changes || !s.FS.Cacheable(p))
+	// Namespace changes and unknown writers require a stat of every entry;
+	// a write to a known file need not make the rest of the directory pay.
+	continuing := plus && cookie != 0
+	refreshAll := continuing && (s.changes.all.Load() > l.changes || !s.FS.Cacheable(p))
+	checkFiles := continuing && !refreshAll && s.changes.clock.Load() != l.changes
 	for i := start; fits && i < len(l.entries); i++ {
 		info := l.entries[i]
 		var childID uint64
-		if refresh {
+		if !refreshAll {
+			childID = s.FS.ChildID(p, info)
+		}
+		if refreshAll || checkFiles && s.changes.file(childID).Load() > l.changes {
 			// Refresh before checking space: a vanished entry must not
 			// prevent a later, shorter name from fitting this page.
 			child := path.Join(p, info.Name())
@@ -104,8 +114,6 @@ func (s *Server) list3(d *decoder, res *encoder, plus bool) status {
 				continue
 			}
 			info, childID = fresh, s.FS.IDOf(child, fresh)
-		} else {
-			childID = s.FS.ChildID(p, info)
 		}
 		var a attrs
 		if !r.room(info.Name(), &a) {
@@ -126,17 +134,15 @@ func (s *Server) list3(d *decoder, res *encoder, plus bool) status {
 			lastCookie, lastName = c, info.Name()
 		}
 	}
-	if !fits && lastName != "" {
-		// The page ended with entries left: record where it stopped, for a
-		// continuation whose snapshot is evicted (see Server.relist).
-		s.resumes.put(resumeKey{id, l.verf, lastCookie}, lastName)
+	if fits {
+		lastName = "" // EOF needs no continuation point.
 	}
 	if !fits && r.n == 0 {
 		return stTooSmall
 	}
 	res.bool(false) // no further entry
 	res.bool(fits)  // eof
-	return stOK
+	return s.finishPage(dir, l.verf, lastCookie, lastName)
 }
 
 // dirReply3 appends the entries of a READDIR or READDIRPLUS result within

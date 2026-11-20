@@ -17,6 +17,9 @@ import (
 type Recall struct {
 	First, Last uint64
 	Path        string
+	// Retired distinguishes the end of a checkout's life from an ordinary
+	// invalidation, which may also recall its entire slot.
+	Retired bool
 }
 
 // OnRecall registers the frontend's cache invalidation hook; daemon changes

@@ -109,14 +109,15 @@ func TestListingContinuation(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	first, st := s.list(1, "", 0, 0)
+	dir := listingDir{id: 1}
+	first, st := s.list(dir, 0, 0)
 	if st != stOK || len(first.entries) != 3 || first.entries[0].Name() != "a" {
 		t.Fatalf("first listing: %v %v", st, first)
 	}
 	if err := os.Remove(fs.host("a")); err != nil {
 		t.Fatal(err)
 	}
-	next, st := s.list(1, "", firstCookie, first.verf)
+	next, st := s.list(dir, firstCookie, first.verf)
 	if st != stOK || next != first {
 		t.Fatalf("continuation did not reuse its snapshot: %v", st)
 	}
@@ -128,12 +129,12 @@ func TestListingContinuation(t *testing.T) {
 	}
 
 	s.dirs = dirCache{} // the snapshot is evicted
-	if _, st := s.list(1, "", firstCookie, first.verf); st != stBadCookie {
+	if _, st := s.list(dir, firstCookie, first.verf); st != stBadCookie {
 		t.Fatalf("changed directory continued with %v", st)
 	}
-	fresh, _ := s.list(1, "", 0, 0)
+	fresh, _ := s.list(dir, 0, 0)
 	s.dirs = dirCache{}
-	if again, st := s.list(1, "", firstCookie, fresh.verf); st != stOK || again.verf != fresh.verf {
+	if again, st := s.list(dir, firstCookie, fresh.verf); st != stOK || again.verf != fresh.verf {
 		t.Fatalf("unchanged directory did not continue: %v", st)
 	}
 }
