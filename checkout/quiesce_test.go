@@ -511,3 +511,71 @@ func TestWriteCacheableOnlyIsolatedOwnedUpper(t *testing.T) {
 		}
 	}
 }
+
+// BenchmarkQuiesceNoWriteCache measures the gate when the export has no
+// write cache to recall, as for a daemon serving NFS: what every remote-fs
+// and kernel-client request pays.
+func BenchmarkQuiesceNoWriteCache(b *testing.B) {
+	r := &Registry{}
+	none := func() {}
+	r.config.Quiesce = func(context.Context) (func(), error) { return none, nil }
+	ctx := context.Background()
+	b.ReportAllocs()
+	for b.Loop() {
+		release, err := r.Quiesce(ctx)
+		if err != nil {
+			b.Fatal(err)
+		}
+		release()
+	}
+}
+
+// TestQuiesceBoundArmsLazily checks that the bound a gate gets behaves as
+// context.WithTimeout's would whether or not the gate ever looks at it.
+func TestQuiesceBoundArmsLazily(t *testing.T) {
+	r := &Registry{}
+	var kept context.Context
+	r.config.Quiesce = func(ctx context.Context) (func(), error) {
+		kept = ctx
+		return func() {}, nil
+	}
+	release, err := r.Quiesce(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	if b := kept.(*bounded); b.armed.Load() != nil {
+		t.Fatal("a gate that did not wait armed a timer")
+	}
+	select {
+	case <-kept.Done():
+	default:
+		t.Fatal("bound used after the gate returned is not done")
+	}
+	if !errors.Is(kept.Err(), context.Canceled) {
+		t.Fatalf("bound after return: %v", kept.Err())
+	}
+
+	// A gate that outlasts the caller's deadline without looking fails.
+	short, stop := context.WithTimeout(t.Context(), 5*time.Millisecond)
+	defer stop()
+	r.config.Quiesce = func(context.Context) (func(), error) {
+		time.Sleep(20 * time.Millisecond)
+		return func() {}, nil
+	}
+	if release, err := r.Quiesce(short); err == nil || release != nil {
+		t.Fatal("a gate past the deadline was accepted")
+	}
+
+	// A gate waiting in another goroutine sees the deadline fire.
+	short, stop = context.WithTimeout(t.Context(), 5*time.Millisecond)
+	defer stop()
+	r.config.Quiesce = func(ctx context.Context) (func(), error) {
+		done := make(chan error, 1)
+		go func() { <-ctx.Done(); done <- ctx.Err() }()
+		return nil, <-done
+	}
+	if _, err := r.Quiesce(short); err == nil || !strings.Contains(err.Error(), "deadline") {
+		t.Fatalf("waiting gate: %v", err)
+	}
+}
