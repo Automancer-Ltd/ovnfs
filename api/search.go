@@ -2,8 +2,8 @@ package api
 
 // SearchArgs selects a search root and the traversal shared by grep and glob.
 // Dir and Checkout are mutually exclusive; the CLI defaults Dir to its current
-// directory. Searches honor ignore files by default, always prune .git, and
-// prune node_modules unless requested or named by the search glob.
+// directory. Searches honor ignore files by default, prune .git unless Git is
+// set, and prune node_modules unless requested or named by the search glob.
 type SearchArgs struct {
 	Dir         string `json:"dir,omitempty"`          // absolute ordinary folder or mounted checkout path
 	Checkout    string `json:"checkout,omitempty"`     // named checkout, searched directly through its overlay
@@ -11,6 +11,7 @@ type SearchArgs struct {
 	Hidden      bool   `json:"hidden,omitempty"`       // include dot-prefixed entries
 	NoIgnore    bool   `json:"no_ignore,omitempty"`    // do not honor .gitignore, .ignore, or exclude files
 	NodeModules bool   `json:"node_modules,omitempty"` // descend into node_modules even when not named by the glob
+	Git         bool   `json:"git,omitempty"`          // include .git entries; with Hidden, as they are dot-prefixed
 	Workers     int    `json:"workers,omitempty"`      // walking goroutines; zero selects the platform default
 	MaxDepth    int    `json:"max_depth,omitempty"`    // root children have depth 1; zero means unlimited
 }

@@ -94,6 +94,27 @@ func TestSearchIgnoreRulesAndSnapshotPaths(t *testing.T) {
 	}
 }
 
+// TestSearchGitEntries finds nested repositories only when asked to (#81).
+func TestSearchGitEntries(t *testing.T) {
+	f := newFixture(t)
+	dir := folder(t, map[string]string{"sub/nested/.git/HEAD": "ref: refs/heads/main\n", "sub/nested/n.txt": "n\n"})
+	f.newCheckout(dir, "search")
+	for _, root := range []api.SearchArgs{{Checkout: "search"}, {Dir: dir}} {
+		for pattern, want := range map[string]string{"**/.git": "sub/nested/.git", "**/.git/HEAD": "sub/nested/.git/HEAD"} {
+			root.Hidden, root.NoIgnore, root.Git = true, true, false
+			defaults, err := f.reg.Glob(t.Context(), api.GlobArgs{SearchArgs: root, Pattern: pattern})
+			if err != nil || len(defaults.Matches) != 0 {
+				t.Fatalf("%+v: %s without Git: %+v, %v", root, pattern, defaults, err)
+			}
+			root.Git = true
+			got, err := f.reg.Glob(t.Context(), api.GlobArgs{SearchArgs: root, Pattern: pattern})
+			if err != nil || !slices.Equal(globPaths(got), []string{want}) {
+				t.Fatalf("%+v: %s with Git: %+v, %v", root, pattern, got, err)
+			}
+		}
+	}
+}
+
 // TestSearchSkipsAppleDoubleSidecars checks that searches see the listing a
 // client of the mount sees: no AppleDouble sidecars.
 func TestSearchSkipsAppleDoubleSidecars(t *testing.T) {

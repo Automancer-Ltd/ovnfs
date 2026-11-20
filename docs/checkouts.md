@@ -279,10 +279,14 @@ ovnfs grep 'needle' app --path src --mode filesWithMatches
 
 Patterns without a slash match at any depth; `--anchored` restricts them to
 the search root. Ignore files are honored, dot-prefixed paths and
-`node_modules` are skipped, and `.git` is always pruned. `--no-ignore`,
-`--hidden` and `--node-modules` override those respective traversal defaults;
-a pattern naming `node_modules` also enables it. Hidden-class paths remain
-absent regardless of these flags. Symlink directories are not descended.
+`node_modules` are skipped, and `.git` is pruned. `--no-ignore`,
+`--hidden`, `--node-modules` and `--git` override those respective traversal
+defaults; a pattern naming `node_modules` also enables it. `.git` is
+dot-prefixed, so `--git` needs `--hidden` too:
+`ovnfs glob '**/.git' app --type dir --hidden --no-ignore --git` lists nested
+repositories (a checkout's own `.git` is a file). Hidden-class paths remain
+absent regardless of these flags.
+Symlink directories are not descended.
 
 Grep supports `-F` literal text, `-i`, `--multiline`, file `--type` filters,
 `content`, `filesWithMatches` and `count` modes, context (`-A`, `-B`, `-C`),

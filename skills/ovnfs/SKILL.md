@@ -126,7 +126,7 @@ ovnfs --json glob '*.go' fix-auth --mtime  # newest first, with metadata
 
 The target can be a checkout name, its mounted path, a directory below that
 path, or any folder (defaults to `.`). Ignore files are honored, and `.git`
-is always pruned.
+is pruned unless `--hidden --git` asks for it.
 
 ## What a checkout contains: path classes
 

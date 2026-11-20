@@ -30,7 +30,7 @@ type searchTarget struct {
 // not fetched on that machine.
 func (r *Registry) searchRoot(ctx context.Context, args api.SearchArgs, s *Session) (searchTarget, error) {
 	wo := walk.Options{
-		Hidden: args.Hidden, Gitignore: !args.NoIgnore, SkipGit: true,
+		Hidden: args.Hidden, Gitignore: !args.NoIgnore, SkipGit: !args.Git,
 		SkipNodeModules: !args.NodeModules, Workers: args.Workers, MaxDepth: args.MaxDepth,
 	}
 	if (args.Dir == "") == (args.Checkout == "") {
