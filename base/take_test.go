@@ -227,9 +227,6 @@ func TestTakePreservesIgnoredDescendantOfDeletedDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.Close()
-	if !sharesBlocks(t, dir) {
-		t.Skip("the volume cannot clone: cache roots start empty")
-	}
 	if got := readBase(t, b, "src/cache/cache.bin"); got != "live cache\n" {
 		t.Fatalf("ignored descendant = %q", got)
 	}

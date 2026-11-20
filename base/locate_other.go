@@ -1,11 +1,18 @@
-//go:build !darwin
+//go:build !darwin && !linux
 
 package base
 
-// locator is empty: only macOS maps an inode to its path (fsgetpath(2)).
-// Elsewhere the overlay resolves the State identities of snapshot files from
-// the entries it has served.
+import "os"
+
+// locator is empty: Windows frontends name files by path, and the file index
+// that would identify a snapshot's entry costs an open to read.
 type locator struct{}
 
+// seen remembers nothing: see [locator].
+func (*locator) seen(os.FileInfo, string) {}
+
+// listed remembers nothing: see [locator].
+func (*locator) listed(os.FileInfo, string, string) {}
+
 // locate reports false: see [locator].
-func (c *Caches) locate(uint64) (string, bool) { return "", false }
+func (c *Caches) locate(*Base, uint64, func(string) bool) (string, bool) { return "", false }

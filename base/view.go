@@ -25,10 +25,11 @@ import (
 // bottom serves a local base to the overlay without copying anything. A source
 // file is the folder's file while its size, mtime and inode still match the
 // capture, and the captured blob once they do not; a source directory lists
-// the captured names, plus the cache and local roots c holds. Everything at or
-// below those roots comes from c, the checkout's cache snapshot (see
-// [Caches]); without one (hashing views) the roots do not exist. A checkout's
-// writes copy up into its own upper.
+// the captured names, plus the cache and local roots c shows. c, the
+// checkout's cache snapshot (see [Caches]), fixes everything at or below
+// those roots: a local root is its copy, a cache root the folder's own
+// entries its fence shows (see fence.go). Without one (hashing views) the
+// roots do not exist. A checkout's writes copy up into its own upper.
 type bottom struct {
 	b *Base
 	c *Caches
@@ -36,14 +37,18 @@ type bottom struct {
 
 // entry is what serves a path of the view.
 type entry struct {
-	host     string // the folder's file serving a source path; "" for captured content and snapshot entries
+	// host is the folder's file serving a source path or a path at or below a
+	// cache root; "" for captured content and snapshot entries.
+	host     string
 	info     os.FileInfo
-	n        uint32 // its index node, for a source path
-	snapshot bool   // host is in the cache snapshot
+	n        uint32      // its index node, for a source path; its root's otherwise
+	snapshot bool        // the cache snapshot's copy of a local root serves it
+	fenced   bool        // host is at or below a cache root
+	folder   os.FileInfo // host's own lstat data, for a fenced entry
 }
 
-// Lstat returns current metadata for unchanged source and snapshot paths,
-// captured metadata otherwise.
+// Lstat returns current metadata for unchanged source, snapshot and cache
+// paths, captured metadata otherwise.
 func (v bottom) Lstat(p string) (os.FileInfo, error) {
 	e, err := v.resolve(overlay.Clean(p))
 	return e.info, err
@@ -58,35 +63,33 @@ func (v bottom) Await(p string) {
 }
 
 // Locate returns the path of the entry whose identity is id: a captured entry
-// by its index node, a snapshot file by its inode; false when the view does
-// not show it.
+// by its index node, a snapshot file or a folder file below a cache root by
+// its inode; false when the view does not show it.
 func (v bottom) Locate(id ident.ID) (string, bool) {
-	var p string
-	var ok bool
+	shown := func(p string) bool {
+		info, err := v.Lstat(p)
+		if err != nil {
+			return false
+		}
+		got, known := ident.Of(info)
+		return known && got == id
+	}
 	switch id.Space() {
 	case ident.Capture:
-		p, ok = v.b.nodePath(id.Value())
+		if p, ok := v.b.nodePath(id.Value()); ok && shown(p) {
+			return p, true
+		}
 	case ident.State:
 		if v.c != nil {
-			p, ok = v.c.locate(id.Value())
-			p = filepath.ToSlash(p)
+			return v.c.locate(v.b, id.Value(), shown)
 		}
 	}
-	if !ok {
-		return "", false
-	}
-	info, err := v.Lstat(p)
-	if err != nil {
-		return "", false
-	}
-	if got, known := ident.Of(info); !known || got != id {
-		return "", false
-	}
-	return p, true
+	return "", false
 }
 
 // ReadDir lists a directory: captured source names with the roots the cache
-// snapshot holds, or a snapshot directory.
+// snapshot shows, a snapshot directory, or a folder directory below a cache
+// root.
 func (v bottom) ReadDir(p string) ([]os.FileInfo, error) {
 	b := v.b
 	p = overlay.Clean(p)
@@ -99,6 +102,9 @@ func (v bottom) ReadDir(p string) ([]os.FileInfo, error) {
 	}
 	if e.snapshot {
 		return v.c.list(p)
+	}
+	if e.fenced {
+		return v.fencedDir(p)
 	}
 	// Both lists are sorted. Native metadata serves every present child;
 	// captured names missing from the host still retain their fork-time info.
@@ -114,10 +120,8 @@ func (v bottom) ReadDir(p string) ([]os.FileInfo, error) {
 			child = p + "/" + child
 		}
 		if x.kind(n) == kindNone {
-			if class := x.class(n); snapshotted(class) && v.c != nil {
-				if info, err := v.c.lstat(child, child, n); err == nil {
-					out = append(out, info)
-				}
+			if root, err := v.below(child, child, n, x.class(n)); err == nil {
+				out = append(out, root.info)
 			}
 			continue
 		}
@@ -151,9 +155,10 @@ func (v bottom) ReadDir(p string) ([]os.FileInfo, error) {
 	return out, nil
 }
 
-// Open opens the folder's file while it still matches the capture, or the
-// snapshot's file, else serves the captured blob (from memory when the store
-// caches it), or the object an LFS pointer blob names (see lfsFile).
+// Open opens the folder's file while it still matches the capture or, below
+// a cache root, the fence shows it, or the snapshot's file, else serves the
+// captured blob (from memory when the store caches it), or the object an LFS
+// pointer blob names (see lfsFile).
 func (v bottom) Open(p string) (overlay.Content, error) {
 	b := v.b
 	p = overlay.Clean(p)
@@ -167,6 +172,9 @@ func (v bottom) Open(p string) (overlay.Content, error) {
 	if e.snapshot {
 		// The snapshot is the checkout's own and never changes.
 		return v.c.files.openFile(p)
+	}
+	if e.fenced {
+		return v.openFenced(p, e)
 	}
 	if e.host != "" {
 		f, err := hostfile.Open(e.host)
@@ -186,10 +194,10 @@ func (v bottom) Open(p string) (overlay.Content, error) {
 }
 
 // Readlink returns a symlink's target from the folder, the snapshot or the
-// captured blob. A snapshot link whose absolute target lies inside the folder
-// becomes relative to the link, so in a checkout it names the checkout's copy
-// instead of the folder: Bun on Windows, for one, links workspace packages by
-// absolute path.
+// captured blob. A link at or below a cache or local root whose absolute
+// target lies inside the folder becomes relative to the link, so in a
+// checkout it names the checkout's copy instead of the folder: Bun on
+// Windows, for one, links workspace packages by absolute path.
 func (v bottom) Readlink(p string) (string, error) {
 	b := v.b
 	p = overlay.Clean(p)
@@ -202,10 +210,16 @@ func (v bottom) Readlink(p string) (string, error) {
 	}
 	if e.snapshot || e.host != "" {
 		var target string
-		if e.snapshot {
+		switch {
+		case e.snapshot:
 			target, err = v.c.files.readlink(p)
 			target = b.relocate(b.lower(p), target)
-		} else {
+		case e.fenced:
+			if target, err = os.Readlink(e.host); err != nil {
+				return "", inView("readlink", p, err)
+			}
+			target = b.relocate(e.host, target)
+		default:
 			target, err = os.Readlink(e.host)
 		}
 		if err != nil {
@@ -251,7 +265,8 @@ func (v bottom) CopyTo(p, dst string) error {
 			return err
 		}
 		for _, child := range children {
-			if err := v.CopyTo(path.Join(p, child.Name()), filepath.Join(dst, child.Name())); err != nil && !os.IsNotExist(err) {
+			// A child the folder took from below a cache root meanwhile is no longer part of p.
+			if err := v.CopyTo(path.Join(p, child.Name()), filepath.Join(dst, child.Name())); err != nil && !os.IsNotExist(err) && !errors.Is(err, syscall.ESTALE) {
 				return err
 			}
 		}
@@ -277,15 +292,15 @@ func (v bottom) CopyTo(p, dst string) error {
 			return err
 		}
 	default:
-		// Sockets, FIFOs and devices in snapshots have no content to copy.
+		// Sockets, FIFOs and devices have no content to copy.
 		return nil
 	}
 	return setTimes(dst, info.ModTime(), info.Mode()&os.ModeSymlink != 0)
 }
 
 // resolve finds what serves p: the folder's entry of an unchanged source path
-// with its current metadata, the captured blob with captured metadata, or the
-// cache snapshot's entry below a cache or local root.
+// with its current metadata, the captured blob with captured metadata, or
+// what the cache snapshot shows at or below a cache or local root.
 func (v bottom) resolve(p string) (entry, error) {
 	b := v.b
 	if p == ".git" || strings.HasPrefix(p, ".git/") || source.IsJJPath(p) {
@@ -301,9 +316,21 @@ func (v bottom) resolve(p string) (entry, error) {
 		}
 		return entry{host: host, info: info, n: n}, nil
 	}
-	if snapshotted(class) && v.c != nil {
+	return v.below(p, root, n, class)
+}
+
+// below finds what serves p, at or below the root of class whose index node
+// is n: the cache snapshot's copy of a local root, the folder's entry its
+// fence shows of a cache root. A view without a snapshot, and a root of
+// another class, has nothing there.
+func (v bottom) below(p, root string, n uint32, class rules.Class) (entry, error) {
+	switch {
+	case v.c == nil:
+	case class == rules.Local:
 		info, err := v.c.lstat(p, root, n)
 		return entry{info: info, snapshot: true}, err
+	case class == rules.Cache:
+		return v.fenced(p, root, n)
 	}
 	return entry{}, absent(p)
 }
@@ -379,8 +406,19 @@ func (b *Base) blobFile(p string, id store.OID) (overlay.Content, error) {
 // copyContent materializes c at the new path dst with mode: host files are
 // cloned, in-memory content is written out.
 func copyContent(c overlay.Content, dst string, mode os.FileMode) error {
-	if f, ok := c.(*os.File); ok {
+	switch f := c.(type) {
+	case *os.File:
 		return clone.FD(f, dst, mode)
+	case *fencedFile:
+		// A clone takes the folder's blocks as they are now: they must still
+		// be the ones opened.
+		err := clone.FD(f.file, dst, mode)
+		if err == nil {
+			if err = f.intact(); err != nil {
+				os.Remove(dst)
+			}
+		}
+		return err
 	}
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {

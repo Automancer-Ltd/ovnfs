@@ -6,14 +6,15 @@ import (
 	"github.com/stencil-hq/ovnfs/internal/ident"
 )
 
-// stateInfo returns the metadata of cache snapshot file host as served. A
-// Windows stat carries no file index, so the State identity is read from the
-// file when asked for: listings stay one directory query.
+// stateInfo returns the metadata of host, a file on the state volume serving
+// an entry below a root, as served. A Windows stat carries no file index, so
+// the State identity is read from the file when asked for: listings stay one
+// directory query.
 func stateInfo(info os.FileInfo, host string) os.FileInfo {
 	return snapshotInfo{FileInfo: info, host: host}
 }
 
-// snapshotInfo is a cache snapshot entry's metadata with its identity read on demand.
+// snapshotInfo is the metadata of an entry below a root with its identity read on demand.
 type snapshotInfo struct {
 	os.FileInfo
 	host string

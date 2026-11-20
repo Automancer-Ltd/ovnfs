@@ -16,7 +16,7 @@ func mklinkJ(t *testing.T, link, target string) {
 }
 
 // TestJunctionsAreLinks serves junctions as the directory symlinks they act as,
-// in cache snapshots and in captured source alike, instead of empty irregular
+// below cache roots and in captured source alike, instead of empty irregular
 // files.
 func TestJunctionsAreLinks(t *testing.T) {
 	repo, dir := repository(t)
@@ -24,11 +24,7 @@ func TestJunctionsAreLinks(t *testing.T) {
 	mklinkJ(t, filepath.Join(dir, "linked"), filepath.Join(dir, "src"))
 	b, _ := createTestBase(t, repo, nil)
 	mklinkJ(t, filepath.Join(dir, "node_modules", "agent"), filepath.Join(b.Meta().Dir, "src"))
-	want := map[string]string{"linked": filepath.ToSlash(filepath.Join(dir, "src"))}
-	shared := sharesBlocks(t, dir)
-	if shared {
-		want["node_modules/agent"] = "../src"
-	}
+	want := map[string]string{"linked": filepath.ToSlash(filepath.Join(dir, "src")), "node_modules/agent": "../src"}
 	view := b.Bottom(b.TakeCaches("c1"))
 	for p, want := range want {
 		info, err := view.Lstat(p)
@@ -38,9 +34,6 @@ func TestJunctionsAreLinks(t *testing.T) {
 		if got, err := view.Readlink(p); err != nil || got != want {
 			t.Errorf("readlink %s = %q, %v; want %q", p, got, err, want)
 		}
-	}
-	if !shared {
-		return
 	}
 	entries, err := view.ReadDir("node_modules")
 	if err != nil {

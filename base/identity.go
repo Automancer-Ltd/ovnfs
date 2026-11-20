@@ -9,7 +9,9 @@ import (
 // Every entry a base serves carries its identity (see package ident): a
 // captured entry, source or root, its Capture identity, the number of its
 // capture index node, whether the folder's file or the captured blob serves
-// it; an entry below a root, its cache snapshot file's State identity.
+// it; an entry below a root, the State identity of the file serving it, which
+// is the cache snapshot's copy below a local root and the folder's own file
+// below a cache root.
 
 // captureID is the identity of capture index node n.
 func captureID(n uint32) ident.ID {
@@ -18,8 +20,8 @@ func captureID(n uint32) ident.ID {
 }
 
 // hostInfo is the folder's own metadata of a captured entry it still holds
-// unchanged, carrying the entry's Capture identity: the folder is not on the
-// state volume, so its inode is no identity.
+// unchanged, source or root, carrying the entry's Capture identity instead
+// of the folder inode's.
 type hostInfo struct {
 	os.FileInfo
 	id ident.ID

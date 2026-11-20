@@ -5,6 +5,7 @@ package base
 import (
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -42,6 +43,20 @@ func fileIdentity(_ os.FileInfo, root, p string) (uint64, uint64, error) {
 	err = windows.GetFileInformationByHandle(h, &info)
 	return uint64(info.VolumeSerialNumber), uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow), err
 }
+
+// birthTime returns when the entry info describes was made, in Unix
+// nanoseconds; false when info carries no Windows attribute data.
+func birthTime(_ string, info os.FileInfo) (int64, bool) {
+	data, ok := info.Sys().(*syscall.Win32FileAttributeData)
+	if !ok {
+		return 0, false
+	}
+	return data.CreationTime.Nanoseconds(), true
+}
+
+// onVolume reports true: Windows file information names no volume, and a
+// volume mounted in a folder is a reparse point no view follows.
+func onVolume(os.FileInfo, uint64) bool { return true }
 
 // setTimes updates the symlink itself through a reparse-point handle.
 func setTimes(p string, t time.Time, symlink bool) error {

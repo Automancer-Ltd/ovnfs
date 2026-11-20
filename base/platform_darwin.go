@@ -24,6 +24,22 @@ func fileIdentity(info os.FileInfo, _, _ string) (uint64, uint64, error) {
 	return uint64(s.Dev), uint64(s.Ino), nil
 }
 
+// birthTime returns when the entry info describes was made, in Unix
+// nanoseconds; false for a filesystem that keeps no birth time.
+func birthTime(_ string, info os.FileInfo) (int64, bool) {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || st.Birthtimespec == (syscall.Timespec{}) {
+		return 0, false
+	}
+	return st.Birthtimespec.Nano(), true
+}
+
+// onVolume reports whether info describes an entry of volume (see volumeID).
+func onVolume(info os.FileInfo, volume uint64) bool {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	return !ok || uint64(st.Dev) == volume
+}
+
 // setTimes preserves nanosecond mtimes without following symlinks.
 func setTimes(p string, t time.Time, symlink bool) error {
 	flags := 0

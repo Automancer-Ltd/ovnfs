@@ -8,35 +8,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"syscall"
 	"testing"
+	"time"
 
-	"github.com/stencil-hq/ovnfs/internal/clone"
 	"github.com/stencil-hq/ovnfs/internal/ident"
 	"github.com/stencil-hq/ovnfs/overlay"
 )
-
-// sharesBlocks reports whether files in dir can be cloned; cache roots of a
-// snapshot start empty where they cannot.
-func sharesBlocks(t *testing.T, dir string) bool {
-	t.Helper()
-	probe := filepath.Join(dir, ".probe")
-	writeTestFile(t, probe, "probe")
-	defer os.Remove(probe)
-	in, err := os.Open(probe)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer in.Close()
-	dst := filepath.Join(t.TempDir(), "clone")
-	err = clone.Reflink(in, dst, 0o644)
-	if errors.Is(err, errors.ErrUnsupported) {
-		return false
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-	return true
-}
 
 // read returns the content of p in view.
 func read(t *testing.T, view overlay.Bottom, p string) string {
@@ -67,17 +45,26 @@ func names(t *testing.T, view overlay.Bottom, p string) []string {
 	return out
 }
 
-// TestCacheSnapshotIsolatesTheFolder serves cache and local roots as the
-// snapshot holds them: files the folder writes, adds or deletes afterwards do
-// not change the view, a later snapshot sees them while the earlier one keeps
-// its content, and a symlink planted in the folder cannot lead the view
-// outside it.
-func TestCacheSnapshotIsolatesTheFolder(t *testing.T) {
-	repo, dir := repository(t)
-	if !sharesBlocks(t, dir) {
-		t.Skip("the volume cannot clone: cache roots start empty")
+// gone fails the test unless view shows nothing at each of paths.
+func gone(t *testing.T, view overlay.Bottom, why string, paths ...string) {
+	t.Helper()
+	for _, p := range paths {
+		if _, err := view.Lstat(p); !os.IsNotExist(err) {
+			t.Errorf("%s: %s is in the view (%v)", why, p, err)
+		}
 	}
+}
+
+// TestCacheRootsAreFenced serves a cache root from the folder without copying
+// it and fences it at the snapshot: an entry the folder rewrites or removes
+// afterwards leaves the view instead of changing in it, nothing the folder
+// adds appears, what it left alone stays, and a symlink planted in the folder
+// cannot lead the view outside it. A local root is the snapshot's copy
+// throughout, and a later snapshot shows the folder as it is then.
+func TestCacheRootsAreFenced(t *testing.T) {
+	repo, dir := repository(t)
 	writeTestFile(t, filepath.Join(dir, "node_modules", "pkg", "index.js"), "v1")
+	writeTestFile(t, filepath.Join(dir, "node_modules", "kept", "k.js"), "kept")
 	writeTestFile(t, filepath.Join(dir, "node_modules", "gone", "a.js"), "gone")
 	writeTestFile(t, filepath.Join(dir, ".env"), "SECRET=1")
 	outside := t.TempDir()
@@ -86,8 +73,21 @@ func TestCacheSnapshotIsolatesTheFolder(t *testing.T) {
 	first := b.TakeCaches("c1")
 	first.Wait()
 	old := b.Bottom(first)
+	if _, err := os.Lstat(filepath.Join(first.tree, "node_modules")); !os.IsNotExist(err) {
+		t.Errorf("the snapshot holds a copy of the cache root: %v", err)
+	}
+	for p, want := range map[string]string{"node_modules/pkg/index.js": "v1", "node_modules/kept/k.js": "kept", ".env": "SECRET=1"} {
+		if got := read(t, old, p); got != want {
+			t.Errorf("%s = %q, want %q", p, got, want)
+		}
+	}
 
 	writeTestFile(t, filepath.Join(dir, "node_modules", "pkg", "index.js"), "v2")
+	// As an installer extracting an archive does: the mtime says nothing.
+	long := time.Now().Add(-24 * time.Hour)
+	if err := os.Chtimes(filepath.Join(dir, "node_modules", "pkg", "index.js"), long, long); err != nil {
+		t.Fatal(err)
+	}
 	writeTestFile(t, filepath.Join(dir, "node_modules", "added", "x.js"), "added")
 	writeTestFile(t, filepath.Join(dir, ".env"), "SECRET=2")
 	writeTestFile(t, filepath.Join(dir, "new-source"), "new source")
@@ -98,19 +98,25 @@ func TestCacheSnapshotIsolatesTheFolder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for p, want := range map[string]string{"node_modules/pkg/index.js": "v1", "node_modules/gone/a.js": "gone", ".env": "SECRET=1"} {
+	for p, want := range map[string]string{"node_modules/kept/k.js": "kept", ".env": "SECRET=1"} {
 		if got := read(t, old, p); got != want {
-			t.Errorf("%s = %q after the folder changed, want the snapshot's %q", p, got, want)
+			t.Errorf("%s = %q after the folder changed other entries, want %q", p, got, want)
 		}
 	}
-	if _, err := old.Lstat("node_modules/added/x.js"); !os.IsNotExist(err) {
-		t.Errorf("a file the folder added after the snapshot is visible: %v", err)
+	gone(t, old, "rewritten, removed or added after the fence",
+		"node_modules/pkg/index.js", "node_modules/gone", "node_modules/gone/a.js", "node_modules/added/x.js",
+		"node_modules/escape", "node_modules/escape/leak", "new-source")
+	if got := names(t, old, "node_modules"); !slices.Contains(got, "kept") || !slices.Contains(got, "pkg") || slices.Contains(got, "gone") || slices.Contains(got, "escape") {
+		t.Errorf("fenced listing = %v, want kept and pkg without gone and escape", got)
 	}
-	if got := names(t, old, "node_modules"); !slices.Equal(got, []string{"gone", "pkg"}) {
-		t.Errorf("snapshot listing = %v", got)
+	if got := names(t, old, "node_modules/pkg"); len(got) != 0 {
+		t.Errorf("the rewritten file is listed: %v", got)
 	}
-	if _, err := old.Lstat("new-source"); !os.IsNotExist(err) {
-		t.Errorf("new source path visible: %v", err)
+	added := filepath.Join(dir, "node_modules", "added")
+	if info, err := os.Lstat(added); err != nil {
+		t.Fatal(err)
+	} else if _, known := birthTime(added, info); known {
+		gone(t, old, "a directory made after the fence", "node_modules/added")
 	}
 
 	second := b.TakeCaches("c2")
@@ -120,68 +126,90 @@ func TestCacheSnapshotIsolatesTheFolder(t *testing.T) {
 			t.Errorf("newer snapshot: %s = %q, want %q", p, got, want)
 		}
 	}
-	if _, err := view.Lstat("node_modules/gone/a.js"); !os.IsNotExist(err) {
-		t.Errorf("newer snapshot shows a deleted file: %v", err)
-	}
+	gone(t, view, "newer snapshot", "node_modules/gone/a.js")
 	if _, err := view.Lstat("node_modules/escape/leak"); err == nil {
 		t.Error("a symlink inside a cache root led outside the folder")
 	}
-	if got := read(t, old, "node_modules/pkg/index.js"); got != "v1" {
-		t.Errorf("older snapshot changed with the newer one: %q", got)
-	}
+	gone(t, old, "after a newer snapshot", "node_modules/pkg/index.js", "node_modules/added/x.js")
 }
 
-// TestCacheSnapshotFirstAccessWaits reads a cache root completely right after
-// the snapshot starts: the access waits until the clone is complete instead
-// of serving part of it.
-func TestCacheSnapshotFirstAccessWaits(t *testing.T) {
+// TestFencedFileNeverChangesUnderAReader fails the reads of an open cache
+// file after a same-size rewrite with a restored mtime. A replacement can
+// invalidate the old descriptor but can never feed it new bytes.
+func TestFencedFileNeverChangesUnderAReader(t *testing.T) {
 	repo, dir := repository(t)
-	if !sharesBlocks(t, dir) {
-		t.Skip("the volume cannot clone: cache roots start empty")
-	}
-	const files = 2000
-	for i := range files {
-		writeTestFile(t, filepath.Join(dir, "target", "debug", fmt.Sprintf("f%04d", i)), "x")
-	}
+	writeTestFile(t, filepath.Join(dir, "target", "rewritten"), "old content")
+	writeTestFile(t, filepath.Join(dir, "target", "replaced"), "old content")
 	b, _ := createTestBase(t, repo, nil)
-	c := b.TakeCaches("c1")
-	view := b.Bottom(c)
-	view.(overlay.Awaiter).Await("target/debug")
-	if got := names(t, view, "target/debug"); len(got) != files {
-		t.Fatalf("first listing = %d entries, want %d", len(got), files)
+	view := b.Bottom(b.TakeCaches("c1"))
+	rewritten, err := view.Open("target/rewritten")
+	if err != nil {
+		t.Fatal(err)
 	}
-	view = b.Bottom(b.TakeCaches("c2"))
-	if got := names(t, view, "target/debug"); len(got) != files {
-		t.Fatalf("listing without Await = %d entries, want %d", len(got), files)
+	defer rewritten.Close()
+	replaced, err := view.Open("target/replaced")
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer replaced.Close()
+
+	p := filepath.Join(dir, "target", "rewritten")
+	info, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, p, "new content")
+	if err := os.Chtimes(p, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(dir, "target", "replaced.tmp"), "new")
+	if err := os.Rename(filepath.Join(dir, "target", "replaced.tmp"), filepath.Join(dir, "target", "replaced")); err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 64)
+	if n, err := rewritten.ReadAt(buf, 0); !errors.Is(err, syscall.ESTALE) {
+		t.Errorf("read of a file rewritten in place = %q, %v; want ESTALE", buf[:n], err)
+	}
+	if n, err := replaced.ReadAt(buf, 0); !errors.Is(err, syscall.ESTALE) && (string(buf[:n]) != "old content" || (err != nil && err != io.EOF)) {
+		t.Errorf("read of a replaced file = %q, %v; want the opened bytes or ESTALE", buf[:n], err)
+	}
+	gone(t, view, "changed after the fence", "target/rewritten", "target/replaced", "target/replaced.tmp")
 }
 
-// TestCacheSnapshotWithoutSharedBlocks starts cache roots empty and copies
-// local roots where the state cannot share the folder's blocks.
-func TestCacheSnapshotWithoutSharedBlocks(t *testing.T) {
+// TestCacheRootsOnAnotherVolume starts cache roots empty and copies local
+// roots where the folder is not on the state's volume, whose inodes are the
+// only ones a view can name.
+func TestCacheRootsOnAnotherVolume(t *testing.T) {
 	repo, dir := repository(t)
 	writeTestFile(t, filepath.Join(dir, "node_modules", "pkg", "index.js"), "v1")
 	writeTestFile(t, filepath.Join(dir, ".env"), "SECRET=1")
 	b, _ := createTestBase(t, repo, nil)
 	c := b.newCaches("c1")
-	c.shared = false
+	c.fence = fence{}
 	b.serve(c)
 	c.take(b)
 	view := b.Bottom(c)
+	if info, err := view.Lstat("node_modules"); err != nil || !info.IsDir() {
+		t.Errorf("cache root = %v, %v; want an empty directory", info, err)
+	}
 	if got := names(t, view, "node_modules"); len(got) != 0 {
 		t.Errorf("cache root = %v, want empty", got)
 	}
+	gone(t, view, "another volume", "node_modules/pkg", "node_modules/pkg/index.js")
 	if got := read(t, view, ".env"); got != "SECRET=1" {
 		t.Errorf("local root = %q, want a copy", got)
 	}
 }
 
-// TestCacheSnapshotsReopenAndRemove keeps a complete snapshot across a
-// restart, takes an incomplete one again, serves nothing once its base is
-// closed and removes snapshots on request.
+// TestCacheSnapshotsReopenAndRemove keeps a complete snapshot with its fence
+// across a restart, takes an incomplete one again with a new fence, serves
+// nothing of a local root once its base is closed and releases snapshots for
+// removal on request.
 func TestCacheSnapshotsReopenAndRemove(t *testing.T) {
 	repo, dir := repository(t)
 	writeTestFile(t, filepath.Join(dir, ".env"), "SECRET=1")
+	writeTestFile(t, filepath.Join(dir, "target", "out"), "one")
 	first, config := createTestBase(t, repo, nil)
 	first.TakeCaches("c1").Wait()
 	first.TakeCaches("c2").Wait()
@@ -189,6 +217,7 @@ func TestCacheSnapshotsReopenAndRemove(t *testing.T) {
 		t.Errorf("snapshot served again = %q", got)
 	}
 	writeTestFile(t, filepath.Join(dir, ".env"), "SECRET=2")
+	writeTestFile(t, filepath.Join(dir, "target", "out"), "two")
 	if err := os.Remove(filepath.Join(config.StateDir, cachesDir, "c2", rootsFile)); err != nil {
 		t.Fatal(err)
 	}
@@ -203,13 +232,20 @@ func TestCacheSnapshotsReopenAndRemove(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { b.Close() })
-	if got := read(t, b.Bottom(b.OpenCaches("c1")), ".env"); got != "SECRET=1" {
+	reopened := b.Bottom(b.OpenCaches("c1"))
+	if got := read(t, reopened, ".env"); got != "SECRET=1" {
 		t.Errorf("reopened snapshot = %q, want its own SECRET=1", got)
 	}
-	if got := read(t, b.Bottom(b.OpenCaches("c2")), ".env"); got != "SECRET=2" {
+	gone(t, reopened, "reopened snapshot, rewritten after its fence", "target/out")
+	retaken := b.Bottom(b.OpenCaches("c2"))
+	if got := read(t, retaken, ".env"); got != "SECRET=2" {
 		t.Errorf("reopened incomplete snapshot = %q, want it taken again", got)
 	}
-	if err := b.RemoveCaches("c1"); err != nil {
+	if got := read(t, retaken, "target/out"); got != "two" {
+		t.Errorf("reopened incomplete snapshot: target/out = %q, want the folder's at the new fence", got)
+	}
+	// Released, nothing of the snapshot is held open, so its directory can go.
+	if err := os.RemoveAll(b.ReleaseCaches("c1")); err != nil {
 		t.Fatal(err)
 	}
 	if ids, err := b.CachesIDs(); err != nil || !slices.Equal(ids, []string{"c2"}) {
@@ -217,9 +253,39 @@ func TestCacheSnapshotsReopenAndRemove(t *testing.T) {
 	}
 }
 
-// TestBaseIdentities gives captured entries their Capture identity, served
-// from the folder or the capture alike, and snapshot files their State
-// identity; Locate maps each back to its path.
+// TestSnapshotWithoutFenceFileIsFencedWhenComplete reopens a snapshot of a
+// build that cloned cache roots into it, which wrote no fence: the checkouts
+// reading it see the folder's cache roots as of the snapshot's completion,
+// not as of the restart.
+func TestSnapshotWithoutFenceFileIsFencedWhenComplete(t *testing.T) {
+	repo, dir := repository(t)
+	writeTestFile(t, filepath.Join(dir, "target", "kept"), "kept")
+	writeTestFile(t, filepath.Join(dir, "target", "out"), "one")
+	first, config := createTestBase(t, repo, nil)
+	first.TakeCaches("c1").Wait()
+	if err := os.Remove(filepath.Join(config.StateDir, cachesDir, "c1", fenceFile)); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(dir, "target", "out"), "two")
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, err := Open(config, first.Meta())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	view := b.Bottom(b.OpenCaches("c1"))
+	if got := read(t, view, "target/kept"); got != "kept" {
+		t.Errorf("target/kept = %q, want the folder's", got)
+	}
+	gone(t, view, "rewritten after the snapshot was complete", "target/out")
+}
+
+// TestBaseIdentities gives captured entries and roots their Capture identity,
+// served from the folder or the capture alike, and the folder's entries below
+// a cache root the State identity of their inode; Locate maps each back to
+// its path.
 func TestBaseIdentities(t *testing.T) {
 	repo, dir := repository(t)
 	writeTestFile(t, filepath.Join(dir, "node_modules", "pkg", "index.js"), "v1")
@@ -242,18 +308,27 @@ func TestBaseIdentities(t *testing.T) {
 			t.Errorf("locate %v = %q, %v; want %q", id, got, ok, p)
 		}
 	}
-	if sharesBlocks(t, dir) { // else the cache root starts empty
-		info, err := view.Lstat("node_modules/pkg/index.js")
+	for _, p := range []string{"node_modules/pkg", "node_modules/pkg/index.js"} {
+		info, err := view.Lstat(p)
 		if err != nil {
 			t.Fatal(err)
 		}
-		id, ok := ident.Of(info)
-		if !ok || id.Space() != ident.State {
-			t.Fatalf("snapshot file identity = %v, %v; want State", id, ok)
+		host, err := os.Lstat(filepath.Join(dir, filepath.FromSlash(p)))
+		if err != nil {
+			t.Fatal(err)
 		}
-		if runtime.GOOS == "darwin" {
-			if got, ok := view.Locate(id); !ok || got != "node_modules/pkg/index.js" {
-				t.Errorf("locate snapshot file = %q, %v", got, ok)
+		_, ino, err := fileIdentity(host, dir, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, fits := ident.New(ident.State, ino)
+		if id, ok := ident.Of(info); fits && (!ok || id != want) {
+			t.Errorf("%s: identity %v, %v; want the folder inode's State identity %v", p, id, ok, want)
+		}
+		// Windows frontends name files by path: nothing locates an inode there.
+		if runtime.GOOS != "windows" {
+			if got, ok := view.Locate(want); !ok || got != p {
+				t.Errorf("locate %s = %q, %v", p, got, ok)
 			}
 		}
 	}
@@ -263,11 +338,11 @@ func TestBaseIdentities(t *testing.T) {
 	}
 }
 
-// TestSnapshotLinksIntoTheFolderAreRelative serves a snapshot link's absolute
-// target inside the folder relative to the link, so a checkout's link names
-// the checkout's copy; targets outside the folder and relative ones stay as
-// stored.
-func TestSnapshotLinksIntoTheFolderAreRelative(t *testing.T) {
+// TestLinksIntoTheFolderAreRelative serves the absolute target of a link
+// below a cache root, when it lies inside the folder, relative to the link, so
+// a checkout's link names the checkout's copy; targets outside the folder and
+// relative ones stay as stored.
+func TestLinksIntoTheFolderAreRelative(t *testing.T) {
 	repo, dir := repository(t)
 	writeTestFile(t, filepath.Join(dir, "node_modules", "pkg", "index.js"), "v1")
 	b, _ := createTestBase(t, repo, nil)
@@ -284,9 +359,6 @@ func TestSnapshotLinksIntoTheFolderAreRelative(t *testing.T) {
 		if err := os.Symlink(target, filepath.Join(dir, filepath.FromSlash(link))); err != nil {
 			t.Fatal(err)
 		}
-	}
-	if !sharesBlocks(t, dir) {
-		t.Skip("the volume cannot clone: cache roots start empty")
 	}
 	view := b.Bottom(b.TakeCaches("c1"))
 	for link, want := range map[string]string{
@@ -314,9 +386,9 @@ func TestCachesAffectedBy(t *testing.T) {
 	}
 }
 
-// BenchmarkCacheSnapshotLstat measures Lstat of one entry below a cache root,
-// over a 30,000-entry snapshot directory, as NFS LOOKUP and GETATTR issue it.
-func BenchmarkCacheSnapshotLstat(b *testing.B) {
+// BenchmarkCacheRootLstat measures Lstat of one entry below a cache root, in
+// a 30,000-entry folder directory, as NFS LOOKUP and GETATTR issue it.
+func BenchmarkCacheRootLstat(b *testing.B) {
 	repo, dir := repository(b)
 	const entries = 30000
 	names := make([]string, entries)
@@ -325,9 +397,7 @@ func BenchmarkCacheSnapshotLstat(b *testing.B) {
 		writeTestFile(b, filepath.Join(dir, filepath.FromSlash(names[i])), "x")
 	}
 	base, _ := createTestBase(b, repo, nil)
-	c := base.TakeCaches("c1")
-	c.Wait()
-	view := base.Bottom(c)
+	view := base.Bottom(base.TakeCaches("c1"))
 	for _, p := range names {
 		if _, err := view.Lstat(p); err != nil {
 			b.Fatal(err)

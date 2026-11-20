@@ -326,9 +326,6 @@ func TestRevisionHiddenRootsStayHidden(t *testing.T) {
 				}
 			}
 			for p, want := range tc.cached {
-				if strings.HasPrefix(p, "tmp/") && !sharesBlocks(t, dir) {
-					continue // below a cache root, which starts empty where the volume cannot clone
-				}
 				if got := readBase(t, b, p); got != want {
 					t.Errorf("%s = %q, want %q", p, got, want)
 				}

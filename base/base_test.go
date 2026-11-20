@@ -258,9 +258,7 @@ func TestReadDirPreservesCapturedMetadata(t *testing.T) {
 	}
 	check("", []string{".gitignore", "cache", "source.txt", "src"})
 	check("src", []string{"nested.txt"})
-	if sharesBlocks(t, dir) {
-		check("cache", []string{"old"})
-	}
+	check("cache", []string{"old"})
 }
 
 // TestCaptureKeepsOriginalIndex verifies staged state, dirty content and carried files.
@@ -294,12 +292,8 @@ func TestCaptureKeepsOriginalIndex(t *testing.T) {
 	if got := readBase(t, b, "source.txt"); got != "dirty\n" {
 		t.Fatalf("dirty source = %q", got)
 	}
-	// cache/secret lies below the cache root cache, which starts empty where
-	// the volume cannot clone.
-	if sharesBlocks(t, dir) {
-		if got := readBase(t, b, "cache/secret"); got != "carried" {
-			t.Fatalf("carry = %q", got)
-		}
+	if got := readBase(t, b, "cache/secret"); got != "carried" {
+		t.Fatalf("carry = %q", got)
 	}
 	if got := readBase(t, b, "untracked"); got != "untracked" {
 		t.Fatalf("untracked = %q", got)

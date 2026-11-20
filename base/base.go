@@ -25,6 +25,7 @@ import (
 	"github.com/stencil-hq/ovnfs/overlay"
 	"github.com/stencil-hq/ovnfs/rules"
 	"github.com/stencil-hq/ovnfs/source"
+	"github.com/stencil-hq/ovnfs/stats"
 	"github.com/stencil-hq/ovnfs/store"
 )
 
@@ -74,8 +75,9 @@ type Mirror interface {
 type Config struct {
 	ID, StateDir string
 	Store        *store.Store
-	Fetch        Fetcher // remote bases only
-	Mirror       Mirror  // remote bases only; nil reads everything through Fetch
+	Fetch        Fetcher         // remote bases only
+	Mirror       Mirror          // remote bases only; nil reads everything through Fetch
+	Stats        *stats.Recorder // records how long cache snapshots take; nil records nothing
 	OnFault      func(msg string)
 }
 
@@ -90,6 +92,7 @@ type Base struct {
 	objects   map[string]*git.Objects // object readers by work tree top
 	// cacheRoots lists the capture's cache and local roots, sorted.
 	cacheRoots []string
+	proofs     dirProofs // folder directories proven real, for lookups below cache roots
 	mu         sync.Mutex
 	caches     map[string]*Caches // mu: the cache snapshots served, by id
 	closeOnce  sync.Once
