@@ -5,6 +5,7 @@ package overlay
 import (
 	"encoding/binary"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 
@@ -82,6 +83,9 @@ func readAttr(name, a string) (uint64, error) {
 	if err := windows.ReadFile(h, buf[:], &n, nil); err != nil {
 		return 0, &fs.PathError{Op: "read", Path: name + attrStream(a), Err: err}
 	}
+	if n < 8 {
+		return 0, &fs.PathError{Op: "read", Path: name + attrStream(a), Err: errShortAttr}
+	}
 	if n != 8 {
 		return 0, &fs.PathError{Op: "read", Path: name + attrStream(a), Err: errors.New("overlay: malformed attribute stream")}
 	}
@@ -125,13 +129,18 @@ func writeAttr(name, a string, v uint64) error {
 	if err := windows.SetFileTime(h, nil, &keep, &keep); err != nil {
 		return &fs.PathError{Op: "setattr", Path: name + attrStream(a), Err: err}
 	}
-	if err := windows.SetEndOfFile(h); err != nil {
-		return &fs.PathError{Op: "setattr", Path: name + attrStream(a), Err: err}
-	}
+	// Overwrite in place: truncating first exposes an empty stream to a
+	// concurrent reader and loses the old value even if the write never runs.
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], v)
 	var n uint32
 	if err := windows.WriteFile(h, buf[:], &n, nil); err != nil {
+		return &fs.PathError{Op: "setattr", Path: name + attrStream(a), Err: err}
+	}
+	if n != uint32(len(buf)) {
+		return &fs.PathError{Op: "setattr", Path: name + attrStream(a), Err: io.ErrShortWrite}
+	}
+	if err := windows.SetEndOfFile(h); err != nil {
 		return &fs.PathError{Op: "setattr", Path: name + attrStream(a), Err: err}
 	}
 	return nil

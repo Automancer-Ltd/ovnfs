@@ -41,6 +41,9 @@ const syntheticLimit = 1 << (ident.ValueBits - 1)
 // [idTable] instead.
 var errNoAttr = errors.New("overlay: file cannot hold identity attributes")
 
+// errShortAttr reports an interrupted write of a Windows attribute stream.
+var errShortAttr = errors.New("overlay: incomplete attribute stream")
+
 // Seams through which tests imitate other hosts on this one.
 var (
 	inodeOf            = fileKey      // the inode of a host file
@@ -140,7 +143,13 @@ func layerStore(root string) (*idStore, error) {
 // its Lstat info, with inode key; 0 when none is.
 func (s *idStore) persisted(name string, info os.FileInfo, key inodeKey) (ident.ID, error) {
 	if canHoldAttr(info.Mode()) {
-		if id, err := readID(name); err != nil || id != 0 {
+		id, err := readID(name)
+		// Only a writable upper can replace an incomplete ID. Treat it like
+		// a missing one so inheritance and the locked allocator work as usual.
+		if err != nil && s != nil && s.syn != nil && errors.Is(err, errShortAttr) {
+			err = nil
+		}
+		if err != nil || id != 0 {
 			return id, err
 		}
 	}

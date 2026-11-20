@@ -252,7 +252,9 @@ and snapshots; the state directory must be on NTFS or ReFS for such modes. New
 files get 0644 and directories 0755, as with a umask of 022. Likewise an
 `:ovnfs.id` stream keeps the file id of a file copied up from a lower layer or
 written from memory (see [internals](internals.md#file-identity)); a file's
-own id is its NTFS file record number.
+own id is its NTFS file record number. If an interrupted write leaves fewer
+than eight bytes in a writable upper's `:ovnfs.id`, ovnfs treats that id as
+missing and persists a replacement without changing the file's contents.
 
 Microsoft Defender scans every file the daemon writes into its state and every
 file Windows reads over SMB; excluding the state directory
