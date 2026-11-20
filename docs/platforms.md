@@ -96,6 +96,34 @@ checkout's files (cache and local paths come from a snapshot, see
 mount: its stateful open and close traffic substantially slows cold Cargo
 builds on macOS.
 
+### When the NFS daemon stops answering
+
+The default NFS mount is hard: requests that need a reply keep retrying.
+The 5 s deadline for ovnfs's mount commands does not bound `stat`, `read`
+or `write` from a checkout. One stalled daemon can block clients of every
+checkout on its mount.
+
+Recover from a shell whose working directory is **outside** the mount:
+
+1. If the daemon was paused, resume that specific process after verifying its
+   PID and state directory. If it is busy, let it drain. Restoring the server
+   gives pending requests a chance to finish without replacing the mount.
+2. If it exited, try `ovnfs --state "$state" --mount "$mount" start` with
+   the original absolute paths. Do not delete the state directory.
+3. If startup cannot recover the mount and no daemon for that state is
+   running, stop clients of those checkouts. Verify the mount point in
+   `mount` output before using `umount -f "$mount"` as a last resort, then
+   run the same `start` command. A forced unmount invalidates open handles
+   and can discard unflushed writes; reopen files and check affected output.
+
+A soft NFS mount trades waiting for errors; it is not a repair for a dead
+server. A timed-out request can report `ETIMEDOUT` on macOS or `EIO` with
+Linux `soft`. It does not prove a write had no effect: files may be only
+partly updated. A failed page-in of a mapped file can deliver `SIGBUS`
+instead of a recoverable I/O error. On macOS even the default `intr`
+mount can do this if a signal interrupts a page-in. Keep executables and
+native libraries on a local filesystem if they must survive a mount outage.
+
 ## FUSE
 
 `serve --proto fuse` (the Linux default) mounts through `fusermount3`, with the
