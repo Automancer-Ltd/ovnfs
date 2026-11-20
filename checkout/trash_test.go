@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/stencil-hq/ovnfs/api"
 	"github.com/stencil-hq/ovnfs/stats"
@@ -24,6 +25,30 @@ func (f *fixture) trashed() []string {
 		names[i] = e.Name()
 	}
 	return names
+}
+
+// awaitTrash waits for real background I/O, not a wall-time estimate of when
+// the OS will schedule it. A surviving requested tree after one pass is a failure.
+func (f *fixture) awaitTrash(labels ...string) {
+	f.t.Helper()
+	done := make(chan struct{})
+	deadline := time.NewTimer(time.Minute)
+	defer deadline.Stop()
+	select {
+	case f.reg.trashWake <- done:
+	case <-deadline.C:
+		f.t.Fatal("trash reaper did not accept a pass")
+	}
+	select {
+	case <-done:
+	case <-deadline.C:
+		f.t.Fatal("trash reaper did not finish its pass")
+	}
+	for _, name := range f.trashed() {
+		if len(labels) == 0 || slices.Contains(labels, trashLabel(name)) {
+			f.t.Fatalf("trash tree survived a completed deletion pass: %s", name)
+		}
+	}
 }
 
 // TestDeadCacheSnapshotIsDeletedWhileServing checks that the cache snapshot
@@ -46,8 +71,9 @@ func TestDeadCacheSnapshotIsDeletedWhileServing(t *testing.T) {
 	}
 	eventually(t, "the removed checkout's cache snapshot was not deleted", func() bool {
 		_, _, onDisk := f.checkoutCaches("b")
-		return !slices.Contains(onDisk, first) && slices.Contains(onDisk, second) && len(f.trashed()) == 0
+		return !slices.Contains(onDisk, first) && slices.Contains(onDisk, second)
 	})
+	f.awaitTrash("caches-" + first)
 	if got := f.read("b", ".env"); got != "SECRET=2" {
 		t.Errorf("b: .env = %q after a's snapshot went, want its own SECRET=2", got)
 	}
@@ -115,12 +141,12 @@ func TestTrashBacklogIsRelieved(t *testing.T) {
 	}
 	f.stats = rec
 	f.open()
-	eventually(t, "the excess was not deleted by trash.relieve, or trees stayed in the trash", func() bool {
+	f.awaitTrash()
+	eventually(t, "the excess was not deleted by trash.relieve", func() bool {
 		reply, err := rec.Report(t.Context(), api.StatsArgs{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		relieved := slices.ContainsFunc(reply.Jobs, func(j api.StatsJob) bool { return j.Name == "trash.relieve" })
-		return relieved && len(f.trashed()) == 0
+		return slices.ContainsFunc(reply.Jobs, func(j api.StatsJob) bool { return j.Name == "trash.relieve" })
 	})
 }

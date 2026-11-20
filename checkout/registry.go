@@ -116,7 +116,7 @@ func Open(c Config) (*Registry, error) {
 	if err != nil {
 		return nil, coded(err)
 	}
-	r := &Registry{config: c, store: st, checkouts: make(map[string]*checkoutRecord), snapshots: make(map[string]*snapRecord), lineage: make(map[string]*snapRecord), bases: make(map[string]*baseRecord), layers: make(map[string]*layerRecord), intents: make(map[string]diskIntent), reserved: make(map[string]bool), watched: make(map[string]bool), folders: make(map[string]*reuseFolder), roots: make(map[string]string), nextSnapshot: d.NextSnapshot, nextSlot: d.NextSlot, nextLife: d.NextLife, bySlot: make(map[uint16]*checkoutRecord), proto: d.Proto, port: d.Port, rootTime: time.Now().UTC(), gcWake: make(chan struct{}, 1), noticeWake: make(chan struct{}, 1), trashWake: make(chan struct{}, 1), stop: make(chan struct{})}
+	r := &Registry{config: c, store: st, checkouts: make(map[string]*checkoutRecord), snapshots: make(map[string]*snapRecord), lineage: make(map[string]*snapRecord), bases: make(map[string]*baseRecord), layers: make(map[string]*layerRecord), intents: make(map[string]diskIntent), reserved: make(map[string]bool), watched: make(map[string]bool), folders: make(map[string]*reuseFolder), roots: make(map[string]string), nextSnapshot: d.NextSnapshot, nextSlot: d.NextSlot, nextLife: d.NextLife, bySlot: make(map[uint16]*checkoutRecord), proto: d.Proto, port: d.Port, rootTime: time.Now().UTC(), gcWake: make(chan struct{}, 1), noticeWake: make(chan struct{}, 1), trashWake: make(chan chan struct{}, 1), stop: make(chan struct{})}
 	r.commits.cond.L = &r.commits.mu
 	r.prepares = make(chan struct{}, prepareSlots)
 	r.resolving = make(map[string]chan struct{})

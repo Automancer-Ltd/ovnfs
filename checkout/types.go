@@ -193,8 +193,8 @@ type Registry struct {
 	hashes       sync.WaitGroup
 	hasher       *hasher
 	gcWake       chan struct{}
-	trashWake    chan struct{} // wakes emptyTrash after a discard
-	relieving    atomic.Bool   // a relieveTrash runs
+	trashWake    chan chan struct{} // nil wakes the reaper; a non-nil channel is closed after that pass
+	relieving    atomic.Bool        // a relieveTrash runs
 	noticeWake   chan struct{}
 	stop         chan struct{}
 	workers      sync.WaitGroup

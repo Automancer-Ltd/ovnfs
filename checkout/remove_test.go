@@ -102,7 +102,7 @@ func TestRmRemovesUnwritableDirs(t *testing.T) {
 	if ls := f.ls(); len(ls.Checkouts) != 0 {
 		t.Fatalf("checkouts after rm = %+v", ls.Checkouts)
 	}
-	eventually(t, "the removed upper was never deleted", func() bool { return len(f.trashed()) == 0 })
+	f.awaitTrash("uppers-c")
 }
 
 // TestOpenReclaimsOrphanWithUnwritableDir checks that an orphaned upper holding
@@ -121,10 +121,7 @@ func TestOpenReclaimsOrphanWithUnwritableDir(t *testing.T) {
 	if _, err := os.Lstat(orphan); !os.IsNotExist(err) {
 		t.Fatalf("orphan upper survived open: %v", err)
 	}
-	eventually(t, "the orphan upper was never deleted", func() bool {
-		entries, err := os.ReadDir(filepath.Join(f.state, trashDir))
-		return err == nil && len(entries) == 0
-	})
+	f.awaitTrash("uppers-gone")
 	if ls := f.ls(); len(ls.Checkouts) != 1 || ls.Checkouts[0].Name != "live" {
 		t.Fatalf("checkouts after open = %+v", ls.Checkouts)
 	}

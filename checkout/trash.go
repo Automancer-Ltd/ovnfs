@@ -34,7 +34,7 @@ func (r *Registry) discard(path, label string) error {
 		return removeTree(path)
 	}
 	select {
-	case r.trashWake <- struct{}{}:
+	case r.trashWake <- nil:
 	default:
 	}
 	if waiting, _ := os.ReadDir(dir); len(waiting) > trashBacklog && r.relieving.CompareAndSwap(false, true) {
@@ -57,8 +57,12 @@ func (r *Registry) emptyTrash() {
 		r.enqueueNotice(baseNotice{fault: "lower the priority of deletions: " + err.Error()})
 	}
 	dir := filepath.Join(r.config.State, trashDir)
+	var done chan struct{}
 	for {
-		entries, _ := os.ReadDir(dir)
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			r.enqueueNotice(baseNotice{fault: "list trash: " + err.Error()})
+		}
 		for _, entry := range entries {
 			select {
 			case <-r.stop:
@@ -66,14 +70,24 @@ func (r *Registry) emptyTrash() {
 			default:
 			}
 			job := r.config.Stats.ThreadJob("trash.empty", trashLabel(entry.Name()))
-			removeTree(filepath.Join(dir, entry.Name()))
+			r.removeTrashed(dir, entry.Name())
 			job.End()
+		}
+		if done != nil {
+			close(done)
 		}
 		select {
 		case <-r.stop:
 			return
-		case <-r.trashWake:
+		case done = <-r.trashWake:
 		}
+	}
+}
+
+// removeTrashed reports a tree the reaper could not delete; a later pass retries it.
+func (r *Registry) removeTrashed(dir, name string) {
+	if err := removeTree(filepath.Join(dir, name)); err != nil {
+		r.enqueueNotice(baseNotice{fault: "empty trash: " + err.Error()})
 	}
 }
 
@@ -99,7 +113,7 @@ func (r *Registry) relieveTrash(dir string, excess []os.DirEntry) {
 		default:
 		}
 		job := r.config.Stats.Job("trash.relieve", trashLabel(entry.Name()))
-		removeTree(filepath.Join(dir, entry.Name()))
+		r.removeTrashed(dir, entry.Name())
 		job.End()
 	}
 }
