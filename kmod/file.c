@@ -21,8 +21,13 @@
 
 /*
  * Reads n consecutive locked folios with one READ; *got is the byte count
- * the daemon returned (short only at end of file). An orphan has no daemon
- * copy: whatever is not cached is gone.
+ * the daemon returned (short only at end of file). Pages at or past the
+ * zero point (a file this guest created, a range it truncated) read as zeros
+ * without a call (*got 0). It never waits for the journal (it may hold folio
+ * locks a truncation waits for): a pending size change only affects bytes
+ * past the zero point, and the zero point rises past written data only once
+ * the daemon has it (journal.c rule 2). An orphan has no daemon copy:
+ * whatever is not cached is gone.
  */
 static int ovnfs_read_folios(struct inode *inode, struct folio **folios, unsigned int n, u32 *got)
 {
@@ -42,9 +47,11 @@ static int ovnfs_read_folios(struct inode *inode, struct folio **folios, unsigne
 	int err;
 
 	*got = 0;
+	if (ovnfs_is_zero(inode, folio_pos(folios[0])))
+		return 0;
 	if (test_bit(OVNFS_I_ORPHAN, &OVNFS_I(inode)->flags))
 		return -ESTALE;
-	err = ovnfs_icall(inode, &m);
+	err = ovnfs_icall_now(inode, &m);
 	if (!err)
 		*got = m.data_got;
 	return err;
@@ -187,19 +194,33 @@ out:
 	return copied;
 }
 
+/*
+ * Says whether a file's dirty data is to be dropped rather than sent: an
+ * orphan's pages are its only store, a file without names or a bad one has
+ * no daemon file to receive them.
+ */
+static bool ovnfs_wb_skip(struct inode *inode)
+{
+	const unsigned long *flags = &OVNFS_I(inode)->flags;
+
+	return !inode->i_nlink || test_bit(OVNFS_I_ORPHAN, flags) || test_bit(OVNFS_I_BAD, flags);
+}
+
 /* Contiguous dirty folios collected for one WRITE; all locked, under writeback. */
 struct ovnfs_wb {
 	struct inode *inode;
 	struct folio **folios;
 	unsigned int n;
 	unsigned int cap;
+	unsigned int wrote;	/* a WRITE succeeded: the daemon's mtime is its own clock now */
 };
 
 /*
  * Sends the batch as one WRITE (nothing for an orphan, whose pages are its
- * only store) and ends writeback. A transport failure redirties the folios,
- * since the data may not have arrived; a daemon error is recorded on the
- * mapping for fsync and close to report.
+ * only store, for a file whose last name this guest removed, or for a bad
+ * one, which has no daemon file) and ends writeback. A transport failure
+ * redirties the folios, since the data may not have arrived; a daemon error
+ * is recorded on the mapping for fsync and close to report.
  */
 static int ovnfs_wb_flush(struct ovnfs_wb *wb, struct writeback_control *wbc)
 {
@@ -223,13 +244,17 @@ static int ovnfs_wb_flush(struct ovnfs_wb *wb, struct writeback_control *wbc)
 	unsigned int i;
 	int err = 0;
 
-	if (len > 0 && !test_bit(OVNFS_I_ORPHAN, &oi->flags)) {
+	if (len > 0 && !ovnfs_wb_skip(inode)) {
+		u64 since = atomic64_read(&OVNFS_SB(inode->i_sb)->attr_seq);
+
 		req.len = cpu_to_le32(len);
 		m.data_len = len;
-		err = ovnfs_icall(inode, &m);
+		err = ovnfs_icall_now(inode, &m);
+		if (!err)
+			wb->wrote = 1;
 		if (!err && le64_to_cpu(a.id) == oi->id)
-			ovnfs_apply_attr(inode, &a, m.gen, OVNFS_ATTR_OWN, 0);
-		else if (err && test_bit(OVNFS_I_ORPHAN, &oi->flags))
+			ovnfs_apply_written(inode, &a, m.gen, since);
+		else if (err && ovnfs_wb_skip(inode))
 			err = 0;
 	}
 	for (i = 0; i < wb->n; i++) {
@@ -237,11 +262,12 @@ static int ovnfs_wb_flush(struct ovnfs_wb *wb, struct writeback_control *wbc)
 
 		if (err && m.status)
 			folio_redirty_for_writepage(wbc, folio);
+		ovnfs_zero_past(inode, folio_pos(folio) + folio_size(folio));
 		folio_end_writeback(folio);
 		folio_unlock(folio);
 	}
 	if (err && !m.status)
-		mapping_set_error(inode->i_mapping, err);
+		ovnfs_writeback_error(inode, err);
 	wb->n = 0;
 	return err;
 }
@@ -267,7 +293,29 @@ static int ovnfs_wb_add(struct ovnfs_wb *wb, struct writeback_control *wbc, stru
 	return err;
 }
 
-/* writepages: contiguous dirty folios go out in WRITE calls of up to max_io. */
+/* Cleans the dirty folios of a file whose data is dropped (ovnfs_wb_skip). */
+static int ovnfs_wb_discard(struct address_space *mapping, struct writeback_control *wbc)
+{
+	struct folio *folio = NULL;
+	int error = 0;
+
+	while ((folio = writeback_iter(mapping, wbc, folio, &error))) {
+		folio_start_writeback(folio);
+		folio_end_writeback(folio);
+		folio_unlock(folio);
+	}
+	return error;
+}
+
+/*
+ * writepages: contiguous dirty folios go out in WRITE calls of up to
+ * max_io, followed by one SETATTR that gives the daemon the local mtime.
+ * It runs on another port than the journal and is excluded from it per file
+ * (journal.c rule 2): it leaves a file with unanswered journal entries to
+ * the journal's DATA entries (background) or waits for the entries there
+ * when it starts (integrity), and the journal waits for it before sending
+ * the file's data or SETATTRs or appending a size change.
+ */
 static int ovnfs_writepages(struct address_space *mapping, struct writeback_control *wbc)
 {
 	struct inode *inode = mapping->host;
@@ -276,6 +324,14 @@ static int ovnfs_writepages(struct address_space *mapping, struct writeback_cont
 	struct ovnfs_wb wb = { .inode = inode };
 	int error = 0, err = 0;
 
+	/*
+	 * Data to be dropped needs no ordering with the journal; waiting for it
+	 * here could also wait for the worker that is evicting the inode.
+	 */
+	if (ovnfs_wb_skip(inode))
+		return ovnfs_wb_discard(mapping, wbc);
+	if (!ovnfs_writeback_begin(inode, wbc->sync_mode == WB_SYNC_ALL))
+		return 0;
 	wb.folios = kmalloc_array(cap, sizeof(*wb.folios), GFP_NOFS | __GFP_NOWARN);
 	wb.cap = cap;
 	if (!wb.folios) {
@@ -288,6 +344,13 @@ static int ovnfs_writepages(struct address_space *mapping, struct writeback_cont
 		err = ovnfs_wb_flush(&wb, wbc);
 	if (wb.folios != &one)
 		kfree(wb.folios);
+	if (wb.wrote) {
+		int terr = ovnfs_send_mtime(inode);
+
+		if (!err)
+			err = terr;
+	}
+	ovnfs_writeback_end(inode);
 	return error ?: err;
 }
 
@@ -318,21 +381,37 @@ static int ovnfs_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-/* On close, writes dirty pages back synchronously and reports write errors. */
+/*
+ * On close, queues dirty pages for the journal (for a synchronous file,
+ * mount option sync, or when no entry can be allocated: writes them back
+ * now, after the file's journal entries) and reports write-back errors
+ * recorded since this file last looked.
+ */
 static int ovnfs_flush(struct file *file, fl_owner_t id)
 {
+	struct inode *inode = file_inode(file);
+
 	if (!(file->f_mode & FMODE_WRITE))
 		return 0;
-	return file_write_and_wait(file);
+	if (IS_SYNC(inode) || (mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) &&
+			       ovnfs_journal_data(inode))) {
+		ovnfs_journal_wait_inode(inode);
+		return file_write_and_wait(file);
+	}
+	return file_check_and_advance_wb_err(file);
 }
 
-/* Writes the range back, then makes it durable with one FSYNC. */
+/*
+ * Sends the file's journal entries (its creation, names and queued data),
+ * writes the range back, then makes it durable with one FSYNC.
+ */
 static int ovnfs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 {
 	struct inode *inode = file_inode(file);
 	struct ovnfs_msg m = { .op = OVNFS_OP_FSYNC };
 	int err;
 
+	ovnfs_journal_wait_inode(inode);
 	err = file_write_and_wait_range(file, start, end);
 	if (err)
 		return err;
@@ -347,6 +426,8 @@ static ssize_t ovnfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	struct inode *inode = file_inode(iocb->ki_filp);
 	int err;
 
+	if (test_bit(OVNFS_I_BAD, &OVNFS_I(inode)->flags))
+		return -EIO;
 	ovnfs_touch(OVNFS_SB(inode->i_sb));
 	err = ovnfs_revalidate_attr(inode);
 	if (err)
@@ -360,6 +441,8 @@ static ssize_t ovnfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct inode *inode = file_inode(iocb->ki_filp);
 	int err;
 
+	if (test_bit(OVNFS_I_BAD, &OVNFS_I(inode)->flags))
+		return -EIO;
 	ovnfs_touch(OVNFS_SB(inode->i_sb));
 	err = ovnfs_revalidate_attr(inode);
 	if (err)

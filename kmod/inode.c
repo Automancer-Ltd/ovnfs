@@ -62,6 +62,11 @@ struct inode *ovnfs_alloc_inode(struct super_block *sb)
 	oi->srv_mtime = 0;
 	oi->flags = 0;
 	atomic_set(&oi->opens, 0);
+	oi->jseq = 0;
+	oi->hold_seq = 0;
+	oi->zero_point = LLONG_MAX;
+	oi->wb_active = 0;
+	oi->data_ent = NULL;
 	oi->dir_ents = RB_ROOT;
 	oi->dir_count = 0;
 	oi->dir_gen = 0;
@@ -163,7 +168,18 @@ void ovnfs_own_change(struct inode *inode)
  * its local size is authoritative and is never shrunk. A REMOTE refresh is
  * discarded when this guest changed the inode after the refresh was sent
  * (own_seq > since), and drops the page cache when the size or mtime differs
- * from what the daemon last reported.
+ * from what the daemon last reported (srv_size, srv_mtime, which every reply
+ * updates).
+ *
+ * A DATA reply (write-back, journaled operations) is discarded the same way
+ * when overtaken (own_seq > since), but does not count as a change itself.
+ *
+ * Timestamps: mtime and ctime stamped by a local write (MTIME_LOCAL) stay
+ * the file's times. DATA replies never touch them (the write-back's own
+ * SETATTR sends them to the daemon); OWN replies keep them; a REMOTE
+ * refresh keeps them while local data is pending or while the daemon's
+ * size and mtime are what this guest last saw, and otherwise (a change made
+ * elsewhere) takes the daemon's times and ends the local authority.
  */
 void ovnfs_apply_attr(struct inode *inode, const struct ovnfs_attr *a, u64 gen,
 		      enum ovnfs_attr_src src, u64 since)
@@ -173,6 +189,8 @@ void ovnfs_apply_attr(struct inode *inode, const struct ovnfs_attr *a, u64 gen,
 	u64 size = le64_to_cpu(a->size);
 	s64 mtime = le64_to_cpu(a->mtime_ns);
 	bool drop = false;
+	bool keep_times;
+	bool changed;
 	bool local;
 
 	if (src != OVNFS_ATTR_NEW && ((inode->i_mode ^ mode) & S_IFMT)) {
@@ -181,14 +199,31 @@ void ovnfs_apply_attr(struct inode *inode, const struct ovnfs_attr *a, u64 gen,
 	}
 	spin_lock(&inode->i_lock);
 	if (test_bit(OVNFS_I_ORPHAN, &oi->flags) ||
-	    (src == OVNFS_ATTR_REMOTE && oi->own_seq > since)) {
+	    (src == OVNFS_ATTR_REMOTE && (oi->own_seq > since || ovnfs_pending(inode))) ||
+	    (src == OVNFS_ATTR_DATA && oi->own_seq > since)) {
 		spin_unlock(&inode->i_lock);
 		return;
 	}
 	local = S_ISREG(mode) && ovnfs_has_local_data(inode);
-	if (src == OVNFS_ATTR_REMOTE && S_ISREG(mode) && !local &&
-	    (size != oi->srv_size || mtime != oi->srv_mtime))
+	changed = size != oi->srv_size || mtime != oi->srv_mtime;
+	if (src == OVNFS_ATTR_REMOTE && S_ISREG(mode) && !local && changed) {
 		drop = true;
+		oi->zero_point = LLONG_MAX;
+	}
+	switch (src) {
+	case OVNFS_ATTR_NEW:
+		keep_times = false;
+		break;
+	case OVNFS_ATTR_DATA:
+		keep_times = true;
+		break;
+	case OVNFS_ATTR_OWN:
+		keep_times = test_bit(OVNFS_I_MTIME_LOCAL, &oi->flags);
+		break;
+	default:
+		keep_times = local || (test_bit(OVNFS_I_MTIME_LOCAL, &oi->flags) && !changed);
+		break;
+	}
 	oi->srv_size = size;
 	oi->srv_mtime = mtime;
 
@@ -199,17 +234,139 @@ void ovnfs_apply_attr(struct inode *inode, const struct ovnfs_attr *a, u64 gen,
 	if (!local || size > i_size_read(inode))
 		i_size_write(inode, size);
 	inode->i_blocks = le64_to_cpu(a->blocks);
-	inode_set_mtime_to_ts(inode, ns_to_timespec64(mtime));
-	inode_set_ctime_to_ts(inode, ns_to_timespec64(le64_to_cpu(a->ctime_ns)));
+	if (!keep_times) {
+		inode_set_mtime_to_ts(inode, ns_to_timespec64(mtime));
+		inode_set_ctime_to_ts(inode, ns_to_timespec64(le64_to_cpu(a->ctime_ns)));
+		clear_bit(OVNFS_I_MTIME_LOCAL, &oi->flags);
+	}
 	if (src == OVNFS_ATTR_NEW)
 		inode_set_atime_to_ts(inode, ns_to_timespec64(mtime));
 	if (src == OVNFS_ATTR_OWN)
 		ovnfs_own_change_locked(inode);
+	else if (src == OVNFS_ATTR_DATA)
+		set_bit(OVNFS_I_OWN, &oi->flags);
 	WRITE_ONCE(oi->attr_gen, gen);
 	spin_unlock(&inode->i_lock);
 
 	if (drop)
 		invalidate_inode_pages2(inode->i_mapping);
+}
+
+/*
+ * Stamps mtime/ctime for a write (file_update_time) and makes them the
+ * file's times until the daemon has them. Under i_lock, so a reply being
+ * applied concurrently cannot overwrite the stamp.
+ */
+static int ovnfs_update_time(struct inode *inode, int flags)
+{
+	spin_lock(&inode->i_lock);
+	if (flags & (S_MTIME | S_CTIME))
+		set_bit(OVNFS_I_MTIME_LOCAL, &OVNFS_I(inode)->flags);
+	inode_update_timestamps(inode, flags);
+	spin_unlock(&inode->i_lock);
+	return 0;
+}
+
+/*
+ * Fills the SETATTR that sends the file's local mtime after its data;
+ * returns the mtime sent, in nanoseconds.
+ */
+s64 ovnfs_mtime_req(struct inode *inode, struct ovnfs_setattr_req *req)
+{
+	struct timespec64 ts;
+	s64 ns;
+
+	spin_lock(&inode->i_lock);
+	ts = inode_get_mtime(inode);
+	spin_unlock(&inode->i_lock);
+	ns = timespec64_to_ns(&ts);
+	memset(req, 0, sizeof(*req));
+	req->valid = cpu_to_le32(OVNFS_SET_MTIME);
+	req->mtime_ns = cpu_to_le64(ns);
+	return ns;
+}
+
+/*
+ * Ends the local authority over the file's times once the daemon holds
+ * exactly the local mtime (sent) and no local data is pending; a later
+ * write stamps again.
+ */
+void ovnfs_mtime_synced(struct inode *inode, const struct ovnfs_attr *a, s64 sent)
+{
+	struct timespec64 ts;
+
+	spin_lock(&inode->i_lock);
+	ts = inode_get_mtime(inode);
+	if (timespec64_to_ns(&ts) == sent && (s64)le64_to_cpu(a->mtime_ns) == sent &&
+	    !ovnfs_has_local_data(inode))
+		clear_bit(OVNFS_I_MTIME_LOCAL, &OVNFS_I(inode)->flags);
+	spin_unlock(&inode->i_lock);
+}
+
+/*
+ * Sends the file's local mtime with one SETATTR after its data went out by
+ * WRITE (whose replies carry the daemon's clock, not the guest's stamp). A
+ * daemon refusal is a write-back error, recorded for fsync and close; the
+ * local times stay either way.
+ */
+int ovnfs_send_mtime(struct inode *inode)
+{
+	struct ovnfs_setattr_req req;
+	struct ovnfs_attr a;
+	struct ovnfs_msg m = {
+		.op = OVNFS_OP_SETATTR,
+		.arg = &req,
+		.arg_len = sizeof(req),
+		.res = &a,
+		.res_len = sizeof(a),
+	};
+	s64 sent = ovnfs_mtime_req(inode, &req);
+	u64 since = atomic64_read(&OVNFS_SB(inode->i_sb)->attr_seq);
+	int err;
+
+	err = ovnfs_icall_now(inode, &m);
+	if (err && !m.status)
+		ovnfs_writeback_error(inode, err);
+	if (err)
+		return err;
+	if (le64_to_cpu(a.id) != OVNFS_I(inode)->id)
+		return -EIO;
+	ovnfs_apply_written(inode, &a, m.gen, since);
+	ovnfs_mtime_synced(inode, &a, sent);
+	return 0;
+}
+
+/*
+ * Records the size and mtime a reply reports, when the rest of its
+ * attributes are not applied (later journal entries name the inode), so a
+ * later refresh does not mistake this guest's own changes for remote ones.
+ * A reply overtaken by a later change of this guest (own_seq > since) is
+ * ignored.
+ */
+void ovnfs_note_server(struct inode *inode, const struct ovnfs_attr *a, u64 since)
+{
+	struct ovnfs_inode *oi = OVNFS_I(inode);
+
+	spin_lock(&inode->i_lock);
+	if (oi->own_seq <= since) {
+		oi->srv_size = le64_to_cpu(a->size);
+		oi->srv_mtime = le64_to_cpu(a->mtime_ns);
+	}
+	spin_unlock(&inode->i_lock);
+}
+
+/*
+ * Applies the reply to a WRITE or mtime SETATTR sent outside the journal
+ * (writepages). While journal entries name the inode, the daemon has not
+ * seen everything the inode shows (a pending LINK, say), so only the size
+ * and mtime are recorded.
+ */
+void ovnfs_apply_written(struct inode *inode, const struct ovnfs_attr *a, u64 gen, u64 since)
+{
+	if (ovnfs_pending(inode))
+		ovnfs_note_server(inode, a, since);
+	else
+		ovnfs_apply_attr(inode, a, gen, OVNFS_ATTR_DATA, since);
 }
 
 /* Fills wire attributes from the cached inode (for directory listings). */
@@ -329,7 +486,8 @@ struct inode *ovnfs_iget_id(struct super_block *sb, u64 id)
 /*
  * Marks an inode whose id the daemon no longer knows: its attributes and
  * every dentry naming it become stale and the parents' listings incomplete,
- * so the path walk the VFS retries on ESTALE looks the names up again.
+ * so the path walk the VFS retries on ESTALE looks the names up again. The
+ * dentries of a bad inode (no daemon file at all) are dropped at once.
  */
 void ovnfs_mark_stale(struct inode *inode)
 {
@@ -347,20 +505,27 @@ void ovnfs_mark_stale(struct inode *inode)
 		parent = dentry->d_parent;
 		if (parent != dentry && d_really_is_positive(parent))
 			WRITE_ONCE(OVNFS_I(d_inode(parent))->dir_gen, 0);
+		if (test_bit(OVNFS_I_BAD, &oi->flags) && parent != dentry)
+			__d_drop(dentry);
 		spin_unlock(&dentry->d_lock);
 	}
 	spin_unlock(&inode->i_lock);
 }
 
 /*
- * Issues a call addressed to inode. ESTALE marks the inode stale; a call
- * whose reply never arrived may still have run, so the inode's attributes
- * are fetched again on next use.
+ * Issues a call addressed to inode at once, without waiting for the
+ * journal: for calls that do not depend on pending entries (journal.c rule
+ * 3) and for the journal worker itself. A bad inode (its journaled create
+ * failed) has no daemon file. ESTALE marks the inode stale; a call whose
+ * reply never arrived may still have run, so the inode's attributes are
+ * fetched again on next use.
  */
-int ovnfs_icall(struct inode *inode, struct ovnfs_msg *m)
+int ovnfs_icall_now(struct inode *inode, struct ovnfs_msg *m)
 {
 	int err;
 
+	if (test_bit(OVNFS_I_BAD, &OVNFS_I(inode)->flags))
+		return -ESTALE;
 	m->id = OVNFS_I(inode)->id;
 	err = ovnfs_call(OVNFS_SB(inode->i_sb), m);
 	if (err == -ESTALE)
@@ -368,6 +533,37 @@ int ovnfs_icall(struct inode *inode, struct ovnfs_msg *m)
 	else if (m->status)
 		WRITE_ONCE(OVNFS_I(inode)->attr_gen, 0);
 	return err;
+}
+
+/*
+ * Issues a call addressed to inode after the journal entries naming it have
+ * been answered (journal.c rule 3).
+ */
+int ovnfs_icall(struct inode *inode, struct ovnfs_msg *m)
+{
+	ovnfs_journal_wait_inode(inode);
+	return ovnfs_icall_now(inode, m);
+}
+
+/*
+ * Records a write-back error for fsync and close. A file the daemon no
+ * longer finds (ENOENT, ESTALE) while the guest still names it vanished on
+ * the host: it is revalidated and reported as EIO, like any vanished id.
+ */
+void ovnfs_writeback_error(struct inode *inode, int err)
+{
+	if (err == -ENOENT || err == -ESTALE) {
+		ovnfs_mark_stale(inode);
+		err = -EIO;
+	}
+	mapping_set_error(inode->i_mapping, err);
+}
+
+/* Says whether the inode's cached attributes may be trusted without a call. */
+bool ovnfs_attr_valid(struct inode *inode)
+{
+	return ovnfs_pending(inode) ||
+	       READ_ONCE(OVNFS_I(inode)->attr_gen) == ovnfs_gen(OVNFS_SB(inode->i_sb));
 }
 
 /* Says whether the inode's attributes need a refresh before use. */
@@ -379,7 +575,10 @@ bool ovnfs_attr_stale(struct inode *inode)
 	       READ_ONCE(oi->attr_gen) != ovnfs_gen(OVNFS_SB(inode->i_sb));
 }
 
-/* Refreshes attributes with one GETATTR. */
+/*
+ * Refreshes attributes with one GETATTR. An inode with pending journal
+ * entries answers from its cache: they will produce what it shows.
+ */
 int ovnfs_refresh(struct inode *inode)
 {
 	struct ovnfs_inode *oi = OVNFS_I(inode);
@@ -392,10 +591,10 @@ int ovnfs_refresh(struct inode *inode)
 	u64 since;
 	int err;
 
-	if (test_bit(OVNFS_I_ORPHAN, &oi->flags))
+	if (test_bit(OVNFS_I_ORPHAN, &oi->flags) || ovnfs_pending(inode))
 		return 0;
 	since = atomic64_read(&OVNFS_SB(inode->i_sb)->attr_seq);
-	err = ovnfs_icall(inode, &m);
+	err = ovnfs_icall_now(inode, &m);
 	if (err)
 		return err;
 	if (le64_to_cpu(a.id) != oi->id)
@@ -408,6 +607,61 @@ int ovnfs_refresh(struct inode *inode)
 int ovnfs_revalidate_attr(struct inode *inode)
 {
 	return ovnfs_attr_stale(inode) ? ovnfs_refresh(inode) : 0;
+}
+
+/*
+ * Lowers the zero point: the daemon's copy holds only zeros from pos on
+ * (a new file, a truncation to pos). Uncached pages there read as zeros
+ * without a call.
+ */
+void ovnfs_zero_from(struct inode *inode, loff_t pos)
+{
+	struct ovnfs_inode *oi = OVNFS_I(inode);
+
+	spin_lock(&inode->i_lock);
+	oi->zero_point = min(oi->zero_point, pos);
+	spin_unlock(&inode->i_lock);
+}
+
+/*
+ * Raises the zero point past data written back: called once the daemon has
+ * it (or the attempt is over) but before the pages end writeback and can
+ * leave the cache, so a later read of them goes to the daemon, and never
+ * before the daemon executed a pending truncation the data follows.
+ */
+void ovnfs_zero_past(struct inode *inode, loff_t end)
+{
+	struct ovnfs_inode *oi = OVNFS_I(inode);
+
+	if (READ_ONCE(oi->zero_point) >= end)
+		return;
+	spin_lock(&inode->i_lock);
+	oi->zero_point = max(oi->zero_point, end);
+	spin_unlock(&inode->i_lock);
+}
+
+/* Says whether the daemon's copy is known to hold only zeros from pos on. */
+bool ovnfs_is_zero(struct inode *inode, loff_t pos)
+{
+	struct ovnfs_inode *oi = OVNFS_I(inode);
+	bool zero;
+
+	spin_lock(&inode->i_lock);
+	zero = pos >= oi->zero_point;
+	spin_unlock(&inode->i_lock);
+	return zero;
+}
+
+/*
+ * Makes an open file that lost its last name an orphan: the daemon dropped
+ * its id, so its pages are its only store, kept resident (unevictable) and
+ * never written back.
+ */
+void ovnfs_make_orphan(struct inode *inode)
+{
+	set_bit(OVNFS_I_ORPHAN, &OVNFS_I(inode)->flags);
+	mapping_set_unevictable(inode->i_mapping);
+	clear_nlink(inode);
 }
 
 /*
@@ -430,9 +684,7 @@ void ovnfs_unlinked(struct inode *inode)
 	if (S_ISREG(inode->i_mode) && atomic_read(&oi->opens))
 		err = ovnfs_call(OVNFS_SB(inode->i_sb), &m);
 	if (err == -ESTALE) {
-		set_bit(OVNFS_I_ORPHAN, &oi->flags);
-		mapping_set_unevictable(inode->i_mapping);
-		clear_nlink(inode);
+		ovnfs_make_orphan(inode);
 		return;
 	}
 	if (!err && le64_to_cpu(a.id) == oi->id) {
@@ -472,9 +724,88 @@ static void ovnfs_set_size(struct inode *inode, loff_t size)
 }
 
 /*
- * Changes attributes with one SETATTR. Truncation writes dirty pages back
- * first, then sends SETATTR, then adjusts the page cache. An orphan has no
- * daemon state and changes locally only.
+ * Applies an attribute change locally, as the daemon will report it: the
+ * daemon keeps ctime equal to mtime, so does the guest.
+ */
+static void ovnfs_setattr_local(struct mnt_idmap *idmap, struct inode *inode, struct iattr *ia)
+{
+	if (ia->ia_valid & ATTR_SIZE) {
+		loff_t from = min_t(loff_t, ia->ia_size, i_size_read(inode));
+
+		/* After the wait for writeback in flight, whose end raises it. */
+		truncate_setsize(inode, ia->ia_size);
+		ovnfs_zero_from(inode, from);
+	}
+	setattr_copy(idmap, inode, ia);
+	spin_lock(&inode->i_lock);
+	inode_set_ctime_to_ts(inode, inode_get_mtime(inode));
+	spin_unlock(&inode->i_lock);
+}
+
+/*
+ * Changes attributes behind the caller when the daemon's answer is known:
+ * a regular file or directory whose attributes are current, on a mount
+ * that is not synchronous, a mode without setuid, setgid or sticky bits (a
+ * host may refuse or drop them) and no change of owner (the daemon cannot
+ * chown on the host). A truncation moves the file's queued data behind it,
+ * so data written before it cannot reappear after it. Returns false when the
+ * change must be synchronous.
+ */
+static bool ovnfs_setattr_ahead(struct mnt_idmap *idmap, struct inode *inode, struct iattr *ia,
+				u32 valid, int *err)
+{
+	struct ovnfs_sb *sbi = OVNFS_SB(inode->i_sb);
+	const unsigned long *flags = &OVNFS_I(inode)->flags;
+	struct ovnfs_jdesc d = { .op = OVNFS_J_SETATTR, .inode = inode };
+	struct ovnfs_jent *e;
+	bool queued = false;
+
+	if (!(S_ISREG(inode->i_mode) || S_ISDIR(inode->i_mode)) || IS_SYNC(inode) ||
+	    !ovnfs_attr_valid(inode) || test_bit(OVNFS_I_STALE, flags) ||
+	    test_bit(OVNFS_I_BAD, flags) || (valid & (OVNFS_SET_UID | OVNFS_SET_GID)) ||
+	    ((valid & OVNFS_SET_MODE) && (ia->ia_mode & (S_ISUID | S_ISGID | S_ISVTX))))
+		return false;
+	e = ovnfs_journal_prepare(sbi, NULL, NULL);
+	if (IS_ERR(e)) {
+		*err = PTR_ERR(e);
+		return true;
+	}
+	if (valid & OVNFS_SET_SIZE)
+		queued = ovnfs_journal_drop_data(inode);
+	d.valid = valid & (OVNFS_SET_MODE | OVNFS_SET_SIZE);
+	d.mode = ia->ia_mode & S_IALLUGO;
+	d.size = ia->ia_size;
+	/* The packer sends the mtime the guest shows then (journal.c rule 5). */
+	if (ia->ia_valid & (ATTR_MTIME | ATTR_SIZE))
+		d.valid |= OVNFS_SET_MTIME;
+	/*
+	 * Appended before the local change, so replies to the inode's earlier
+	 * entries no longer apply attributes to it, but packed only after it:
+	 * packing reads the mtime, size and pages it leaves.
+	 */
+	ovnfs_journal_commit_held(sbi, e, &d);
+	/*
+	 * Counted as an own change before the change itself: a reply being
+	 * applied finishes first (i_lock), later ones see it overtaken.
+	 */
+	ovnfs_own_change(inode);
+	ovnfs_setattr_local(idmap, inode, ia);
+	if (ia->ia_valid & (ATTR_MTIME | ATTR_SIZE))
+		set_bit(OVNFS_I_MTIME_LOCAL, &OVNFS_I(inode)->flags);
+	ovnfs_journal_release(sbi, e);
+	if (queued)
+		ovnfs_journal_data(inode);
+	*err = 0;
+	return true;
+}
+
+/*
+ * Changes attributes: behind the caller when the result is predictable,
+ * else with one SETATTR. A change of owner to the current owner is a no-op
+ * on the daemon and not sent. The synchronous path first gets the file's
+ * queued and dirty data to the daemon for truncation and mtime changes (a
+ * later WRITE would undo either), then sends SETATTR, then adjusts the page
+ * cache. An orphan has no daemon state and changes locally only.
  */
 int ovnfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *ia)
 {
@@ -495,10 +826,16 @@ int ovnfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *
 	err = setattr_prepare(idmap, dentry, ia);
 	if (err)
 		return err;
+	/*
+	 * A size change stamps mtime and ctime (truncate(2) leaves that to the
+	 * filesystem); the guest's clock decides, and the daemon is told.
+	 */
+	if ((ia->ia_valid & ATTR_SIZE) && !(ia->ia_valid & ATTR_MTIME) && ia->ia_size != oldsize) {
+		ia->ia_mtime = current_time(inode);
+		ia->ia_ctime = ia->ia_mtime;
+		ia->ia_valid |= ATTR_MTIME | ATTR_MTIME_SET | ATTR_CTIME;
+	}
 	if (ia->ia_valid & ATTR_SIZE) {
-		err = filemap_write_and_wait(inode->i_mapping);
-		if (err)
-			return err;
 		valid |= OVNFS_SET_SIZE;
 		req.size = cpu_to_le64(ia->ia_size);
 	}
@@ -509,13 +846,15 @@ int ovnfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *
 	if (ia->ia_valid & ATTR_UID) {
 		kuid_t uid = from_vfsuid(idmap, i_user_ns(inode), ia->ia_vfsuid);
 
-		valid |= OVNFS_SET_UID;
+		if (!uid_eq(uid, inode->i_uid))
+			valid |= OVNFS_SET_UID;
 		req.uid = cpu_to_le32(from_kuid(&init_user_ns, uid));
 	}
 	if (ia->ia_valid & ATTR_GID) {
 		kgid_t gid = from_vfsgid(idmap, i_user_ns(inode), ia->ia_vfsgid);
 
-		valid |= OVNFS_SET_GID;
+		if (!gid_eq(gid, inode->i_gid))
+			valid |= OVNFS_SET_GID;
 		req.gid = cpu_to_le32(from_kgid(&init_user_ns, gid));
 	}
 	if (ia->ia_valid & ATTR_MTIME) {
@@ -528,18 +867,27 @@ int ovnfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *
 	}
 
 	if (!valid || test_bit(OVNFS_I_ORPHAN, &OVNFS_I(inode)->flags)) {
-		if (ia->ia_valid & ATTR_SIZE)
-			truncate_setsize(inode, ia->ia_size);
-		setattr_copy(idmap, inode, ia);
+		ovnfs_setattr_local(idmap, inode, ia);
 		return 0;
 	}
+	if (ovnfs_setattr_ahead(idmap, inode, ia, valid, &err))
+		return err;
 
+	if (ia->ia_valid & (ATTR_SIZE | ATTR_MTIME)) {
+		err = ovnfs_sync_inode(inode);
+		/* A failed write-back only blocks a size change; fsync reports it. */
+		if (err && (ia->ia_valid & ATTR_SIZE))
+			return err;
+	}
 	req.valid = cpu_to_le32(valid);
 	err = ovnfs_icall(inode, &m);
 	if (err)
 		return err;
 	if (le64_to_cpu(a.id) != OVNFS_I(inode)->id)
 		return -EIO;
+	/* An explicit mtime replaces the one a write stamped. */
+	if (valid & (OVNFS_SET_MTIME | OVNFS_SET_MTIME_NOW))
+		clear_bit(OVNFS_I_MTIME_LOCAL, &OVNFS_I(inode)->flags);
 	ovnfs_apply_attr(inode, &a, m.gen, OVNFS_ATTR_OWN, 0);
 	if (ia->ia_valid & ATTR_ATIME)
 		inode_set_atime_to_ts(inode, ia->ia_atime);
@@ -548,6 +896,7 @@ int ovnfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *
 		if (ia->ia_size > oldsize)
 			pagecache_isize_extended(inode, oldsize, ia->ia_size);
 		truncate_pagecache(inode, ia->ia_size);
+		ovnfs_zero_from(inode, min_t(loff_t, ia->ia_size, oldsize));
 	}
 	return 0;
 }
@@ -593,7 +942,7 @@ static const char *ovnfs_get_link(struct dentry *dentry, struct inode *inode,
 		return ERR_PTR(-ENOMEM);
 	m.buf = buf;
 	m.buf_len = PATH_MAX - 1;
-	err = ovnfs_icall(inode, &m);
+	err = ovnfs_icall_now(inode, &m);
 	if (!err && (!m.data_got || memchr(buf, 0, m.data_got)))
 		err = -EIO;
 	if (err) {
@@ -620,6 +969,7 @@ static const char *ovnfs_get_link(struct dentry *dentry, struct inode *inode,
 const struct inode_operations ovnfs_file_iops = {
 	.getattr = ovnfs_getattr,
 	.setattr = ovnfs_setattr,
+	.update_time = ovnfs_update_time,
 };
 
 const struct inode_operations ovnfs_symlink_iops = {

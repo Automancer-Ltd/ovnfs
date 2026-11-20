@@ -50,7 +50,7 @@ MODULE_PARM_DESC(base, "guest-physical address of the ovnfs call page");
 #define OVNFS_REQ_OFF		ALIGN(OVNFS_REP_OFF + OVNFS_REP_BYTES, 64)
 #define OVNFS_AREA_BYTES	(OVNFS_REQ_OFF + OVNFS_REQ_MAX)
 
-#define OVNFS_NR_OPS		(OVNFS_OP_RENAME + 1)
+#define OVNFS_NR_OPS		(OVNFS_OP_ALLOC_IDS + 1)
 
 /* A full READ, WRITE or READDIR: request, reply header and max_io of pages. */
 static_assert(OVNFS_MAX_FOLIOS + 2 <= OVNFS_MAX_SEGS);
@@ -66,6 +66,7 @@ struct ovnfs_port {
 struct ovnfs_stats {
 	u64 calls[OVNFS_NR_OPS];
 	u64 ns[OVNFS_NR_OPS];
+	u64 counters[OVNFS_C_NR];	/* enum ovnfs_counter */
 };
 
 static void __iomem *ovnfs_mmio;
@@ -95,7 +96,27 @@ static const char *const ovnfs_op_names[OVNFS_NR_OPS] = {
 	[OVNFS_OP_UNLINK] = "unlink",
 	[OVNFS_OP_RMDIR] = "rmdir",
 	[OVNFS_OP_RENAME] = "rename",
+	[OVNFS_OP_COMPOUND] = "compound",
+	[OVNFS_OP_ALLOC_IDS] = "alloc_ids",
 };
+
+static const char *const ovnfs_counter_names[OVNFS_C_NR] = {
+	[OVNFS_C_BATCHED] = "batched",
+	[OVNFS_C_JOURNAL + OVNFS_J_CREATE] = "journal_create",
+	[OVNFS_C_JOURNAL + OVNFS_J_MKDIR] = "journal_mkdir",
+	[OVNFS_C_JOURNAL + OVNFS_J_UNLINK] = "journal_unlink",
+	[OVNFS_C_JOURNAL + OVNFS_J_RENAME] = "journal_rename",
+	[OVNFS_C_JOURNAL + OVNFS_J_LINK] = "journal_link",
+	[OVNFS_C_JOURNAL + OVNFS_J_RMDIR] = "journal_rmdir",
+	[OVNFS_C_JOURNAL + OVNFS_J_SETATTR] = "journal_setattr",
+	[OVNFS_C_JOURNAL + OVNFS_J_DATA] = "journal_data",
+	[OVNFS_C_CREATE_DATA] = "create_data",
+	[OVNFS_C_ID_REFILLS] = "id_refills",
+	[OVNFS_C_LATE_FAILURES] = "late_failures",
+};
+
+/* Most entries any journal held at once. */
+static atomic_t ovnfs_journal_high;
 
 /* Segment table under construction; merges physically adjacent pieces. */
 struct ovnfs_segs {
@@ -128,7 +149,7 @@ static bool ovnfs_seg_add(struct ovnfs_segs *s, phys_addr_t pa, u32 len)
 }
 
 /* Appends a kmalloc'ed or vmalloc'ed buffer page by page. */
-static bool ovnfs_seg_add_buf(struct ovnfs_segs *s, void *p, u32 len)
+static bool ovnfs_seg_add_buf(struct ovnfs_segs *s, const void *p, u32 len)
 {
 	while (len) {
 		u32 off = offset_in_page(p);
@@ -160,12 +181,6 @@ static bool ovnfs_seg_add_folios(struct ovnfs_segs *s, struct folio **folios,
 	return true;
 }
 
-/* Turns a positive errno from the device or the daemon into a kernel error. */
-static int ovnfs_errno(u32 err)
-{
-	return err < MAX_ERRNO ? -(int)err : -EIO;
-}
-
 /* Lays out the request, reply scratch and bulk segments of m in a call area. */
 static bool ovnfs_build(void *area, const struct ovnfs_msg *m, u32 req_len, u32 rep_len)
 {
@@ -191,6 +206,8 @@ static bool ovnfs_build(void *area, const struct ovnfs_msg *m, u32 req_len, u32 
 		memcpy(p, m->name2, m->name2_len);
 
 	if (!ovnfs_seg_add(&s, virt_to_phys(req), req_len))
+		return false;
+	if (m->obuf && !ovnfs_seg_add_buf(&s, m->obuf, m->obuf_len))
 		return false;
 	if (m->op == OVNFS_OP_WRITE &&
 	    !ovnfs_seg_add_folios(&s, m->folios, m->nr_folios, m->data_len))
@@ -218,8 +235,8 @@ static bool ovnfs_build(void *area, const struct ovnfs_msg *m, u32 req_len, u32 
 /*
  * Performs one call on the current CPU's port and maps the outcome: a
  * nonzero transport status, a short or oversized reply and a daemon error all
- * become negative errnos. Every delivered reply's epoch is fed to the cache
- * layer, errors included. Sleeps in the sense that it may take milliseconds
+ * become negative errnos. Every delivered reply's epoch (a compound's
+ * excepted) is fed to the cache layer, errors included. Sleeps in the sense that it may take milliseconds
  * with preemption disabled; never call it from atomic or RCU-walk context.
  */
 int ovnfs_call(struct ovnfs_sb *sbi, struct ovnfs_msg *m)
@@ -237,11 +254,14 @@ int ovnfs_call(struct ovnfs_sb *sbi, struct ovnfs_msg *m)
 	might_sleep();
 	m->status = 0;
 	m->data_got = 0;
-	if (req_len > OVNFS_REQ_MAX || m->res_len > OVNFS_RES_MAX)
+	if (req_len > OVNFS_REQ_MAX || m->res_len > OVNFS_RES_MAX ||
+	    m->obuf_len > OVNFS_MAX_FRAME - req_len)
 		return -EINVAL;
 	if (m->op != OVNFS_OP_POLL)
 		ovnfs_touch(sbi);
 	in_cap = rep_len + (m->op == OVNFS_OP_WRITE ? 0 : m->data_len) + (m->buf ? m->buf_len : 0);
+	if (in_cap > OVNFS_MAX_FRAME)
+		return -EINVAL;
 
 	preempt_disable();
 	idx = smp_processor_id() % ovnfs_nports;
@@ -276,7 +296,13 @@ int ovnfs_call(struct ovnfs_sb *sbi, struct ovnfs_msg *m)
 	}
 	if (reply_len < sizeof(rep) || reply_len > in_cap)
 		return -EIO;
-	m->gen = ovnfs_note_epoch(sbi, le64_to_cpu(rep.epoch));
+	/*
+	 * A compound's sub-replies carry their own epochs, fed in order by the
+	 * caller; feeding the outer one too could interleave an older epoch
+	 * behind a newer one and bump the generation for nothing.
+	 */
+	if (m->op != OVNFS_OP_COMPOUND)
+		m->gen = ovnfs_note_epoch(sbi, le64_to_cpu(rep.epoch));
 	if (rep.error)
 		return ovnfs_errno(le32_to_cpu(rep.error));
 	if (reply_len < rep_len)
@@ -285,10 +311,29 @@ int ovnfs_call(struct ovnfs_sb *sbi, struct ovnfs_msg *m)
 	return 0;
 }
 
-/* Prints one line per op: name, calls, total nanoseconds in calls. */
+/* Adds n to an event counter. */
+void ovnfs_count(enum ovnfs_counter c, unsigned int n)
+{
+	this_cpu_add(ovnfs_stats.counters[c], n);
+}
+
+/* Records a journal length for the high-water mark. */
+void ovnfs_note_journal_high(u32 entries)
+{
+	int high = atomic_read(&ovnfs_journal_high);
+
+	while ((int)entries > high && !atomic_try_cmpxchg(&ovnfs_journal_high, &high, entries))
+		;
+}
+
+/*
+ * Prints one line per op: name, calls, total nanoseconds in calls; then one
+ * line per event counter and the journal's high-water mark, as
+ * "<name> <count> 0".
+ */
 static int ovnfs_calls_show(struct seq_file *s, void *unused)
 {
-	unsigned int op;
+	unsigned int op, c;
 	int cpu;
 
 	for (op = 1; op < OVNFS_NR_OPS; op++) {
@@ -302,6 +347,14 @@ static int ovnfs_calls_show(struct seq_file *s, void *unused)
 		}
 		seq_printf(s, "%s %llu %llu\n", ovnfs_op_names[op], calls, ns);
 	}
+	for (c = 0; c < OVNFS_C_NR; c++) {
+		u64 n = 0;
+
+		for_each_possible_cpu(cpu)
+			n += READ_ONCE(per_cpu_ptr(&ovnfs_stats, cpu)->counters[c]);
+		seq_printf(s, "%s %llu 0\n", ovnfs_counter_names[c], n);
+	}
+	seq_printf(s, "journal_high %d 0\n", atomic_read(&ovnfs_journal_high));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(ovnfs_calls);

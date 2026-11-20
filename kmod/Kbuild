@@ -1,4 +1,4 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # ovnfs.ko: the ovnfs guest filesystem (see build.sh).
 obj-m := ovnfs.o
-ovnfs-y := call.o super.o inode.o dir.o file.o
+ovnfs-y := call.o super.o inode.o dir.o file.o journal.o

@@ -134,6 +134,8 @@ enum ovnfs_op {
 	OVNFS_OP_UNLINK		= 17,
 	OVNFS_OP_RMDIR		= 18,
 	OVNFS_OP_RENAME		= 19,
+	OVNFS_OP_COMPOUND	= 20,
+	OVNFS_OP_ALLOC_IDS	= 21,
 };
 
 /*
@@ -290,8 +292,22 @@ struct ovnfs_write_req {
 
 /*
  * CREATE: creates the regular file name in directory id, or opens an existing
- * one unless OVNFS_CREATE_EXCL (then EEXIST). Body is followed by the name.
- * Result: struct ovnfs_attr of the file.
+ * one unless OVNFS_CREATE_EXCL (then EEXIST). Body is followed by name_len
+ * bytes of name and data_len bytes of content. Result: struct ovnfs_attr of
+ * the file.
+ *
+ * A nonzero new_id is the id the guest chose for the file, from ALLOC_IDS.
+ * It requires OVNFS_CREATE_EXCL (EINVAL without), and the file is created
+ * with that id and with mtime_ns as its mtime, so the result equals what the
+ * guest already shows for a file it created ahead of the daemon. An id that
+ * was not handed out, or that names a file, is refused with EINVAL; the id is
+ * spent either way and the guest never offers it again. With new_id 0 the
+ * daemon chooses the id and stamps the file with its own clock.
+ *
+ * data_len bytes after the name become the new file's content, saving the
+ * WRITE and SETATTR a small file would otherwise need; the file keeps
+ * mtime_ns. Content needs new_id (EINVAL without) and is at most the max_io
+ * of HELLO.
  */
 #define OVNFS_CREATE_EXCL	(1U << 0)
 #define OVNFS_CREATE_TRUNC	(1U << 1)	/* empty an existing file */
@@ -299,12 +315,22 @@ struct ovnfs_write_req {
 struct ovnfs_create_req {
 	__le32 mode;		/* permission bits */
 	__le32 flags;		/* OVNFS_CREATE_* */
+	__le64 new_id;
+	__le64 mtime_ns;	/* with new_id */
+	__le32 data_len;	/* with new_id */
+	__le16 name_len;
+	__le16 pad;
 };
 
-/* MKDIR: body is followed by the name. Result: struct ovnfs_attr. */
+/*
+ * MKDIR: body is followed by the name. Result: struct ovnfs_attr. new_id and
+ * mtime_ns are as for CREATE.
+ */
 struct ovnfs_mkdir_req {
 	__le32 mode;		/* permission bits */
 	__le32 pad;
+	__le64 new_id;
+	__le64 mtime_ns;	/* with new_id */
 };
 
 /*
@@ -349,6 +375,49 @@ struct ovnfs_rename_req {
 	__le32 flags;		/* OVNFS_RENAME_* */
 	__le16 old_len;
 	__le16 new_len;
+};
+
+/*
+ * COMPOUND: several requests in one call, so a batch pays for one round trip.
+ * The outer request's id, uid and gid are ignored. Its body is a sequence of
+ * sub-requests, each a __le32 byte count followed by that many bytes holding
+ * one complete request (struct ovnfs_req and its body; never COMPOUND). The
+ * result is the sequence of their replies in the same order, each a __le32
+ * byte count followed by a complete reply (struct ovnfs_rep and its result).
+ * Sub-requests and replies are packed without padding, so their fields are
+ * not aligned.
+ *
+ * The daemon executes the sub-requests in order, as if they had arrived one
+ * by one on this connection, and continues past one that fails: each reply
+ * carries its own error. The outer reply's error is nonzero only when the
+ * compound itself is malformed (a truncated sub-request, a nested COMPOUND),
+ * and then nothing was executed. The whole compound must fit OVNFS_MAX_FRAME.
+ * So must its replies: before executing a sub-request the daemon bounds the
+ * size of its reply, and one whose reply could not fit what is left of the
+ * frame is answered with EMSGSIZE without being executed, while the
+ * sub-requests after it still run.
+ */
+
+/*
+ * ALLOC_IDS: hands the guest ids for files and directories it will create
+ * (new_id of CREATE and MKDIR), so that it can create them locally and send
+ * the requests later. The request's id is OVNFS_ROOT_ID.
+ *
+ * The result is a run of count consecutive ids starting at first; count is
+ * at least 1 and at most the count asked for. The daemon never gives these
+ * ids to anything else, and they stay usable after the daemon restarts and
+ * across epoch changes, until the VM is attached to another tree (HELLO's
+ * root id changes). Ids the guest never uses are simply lost.
+ */
+struct ovnfs_alloc_ids_req {
+	__le32 count;
+	__le32 pad;
+};
+
+struct ovnfs_alloc_ids_rep {
+	__le64 first;
+	__le32 count;
+	__le32 pad;
 };
 
 #endif /* OVNFS_WIRE_H */

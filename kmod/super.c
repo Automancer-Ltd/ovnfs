@@ -80,6 +80,21 @@ void ovnfs_arm_poll(struct ovnfs_sb *sbi)
 		queue_delayed_work(system_wq, &sbi->poll, 0);
 }
 
+/*
+ * Sends the journal; waits until it is answered when asked to (sync,
+ * syncfs, unmount, remount read-only). Late failures are in s_wb_err.
+ */
+static int ovnfs_sync_fs(struct super_block *sb, int wait)
+{
+	struct ovnfs_sb *sbi = OVNFS_SB(sb);
+
+	if (wait)
+		ovnfs_journal_drain(sbi);
+	else
+		ovnfs_journal_kick(sbi);
+	return 0;
+}
+
 /* Answers statfs with one STATFS call. */
 static int ovnfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
@@ -113,9 +128,15 @@ static const struct super_operations ovnfs_sops = {
 	.free_inode = ovnfs_free_inode,
 	.evict_inode = ovnfs_evict_inode,
 	.statfs = ovnfs_statfs,
+	.sync_fs = ovnfs_sync_fs,
 };
 
-/* Greets the daemon, sizes I/O and creates the root. */
+/*
+ * Greets the daemon, sizes I/O, stocks the id pool for creates ahead of the
+ * daemon and creates the root. Mount options are the generic ones: ro,
+ * sync (data and namespace operations synchronous), dirsync (namespace
+ * operations synchronous).
+ */
 static int ovnfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct ovnfs_hello_req req = { .version = cpu_to_le32(OVNFS_PROTO_VERSION) };
@@ -139,7 +160,11 @@ static int ovnfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	spin_lock_init(&sbi->epoch_lock);
 	sbi->gen = 1;
 	INIT_DELAYED_WORK(&sbi->poll, ovnfs_poll_work);
+	sbi->sb = sb;
 	sb->s_fs_info = sbi;
+	err = ovnfs_journal_init(sbi);
+	if (err)
+		return err;
 
 	err = ovnfs_call(sbi, &m);
 	if (err)
@@ -170,6 +195,8 @@ static int ovnfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		return err;
 	sb->s_bdi->ra_pages = max_io >> PAGE_SHIFT;
 	sb->s_bdi->io_pages = max_io >> PAGE_SHIFT;
+	if (!sb_rdonly(sb))
+		ovnfs_ids_fill(sbi);
 
 	root = ovnfs_iget(sb, &rep.root, m.gen, OVNFS_ATTR_NEW, 0);
 	if (IS_ERR(root))
@@ -186,15 +213,17 @@ static int ovnfs_get_tree(struct fs_context *fc)
 	return get_tree_single(fc, ovnfs_fill_super);
 }
 
-/* Applies ro/rw on remount; a read-only tree cannot become writable. */
+/*
+ * Applies the generic flags on remount after draining the journal; a
+ * read-only tree cannot become writable.
+ */
 static int ovnfs_reconfigure(struct fs_context *fc)
 {
 	struct super_block *sb = fc->root->d_sb;
 
 	if (!(fc->sb_flags & SB_RDONLY) && (OVNFS_SB(sb)->tree_flags & OVNFS_HELLO_RDONLY))
 		return -EROFS;
-	sync_filesystem(sb);
-	return 0;
+	return sync_filesystem(sb);
 }
 
 static const struct fs_context_operations ovnfs_context_ops = {
@@ -202,20 +231,27 @@ static const struct fs_context_operations ovnfs_context_ops = {
 	.reconfigure = ovnfs_reconfigure,
 };
 
-/* Sets up a mount context; ro and rw are generic superblock flags. */
+/* Sets up a mount context; all mount options are generic superblock flags. */
 static int ovnfs_init_fs_context(struct fs_context *fc)
 {
 	fc->ops = &ovnfs_context_ops;
 	return 0;
 }
 
-/* Tears the superblock down, then stops the poller that uses its state. */
+/*
+ * Drains the journal and lets the worker drop its inode references while
+ * the dcache still exists (late failures revisit dentries), tears the
+ * superblock down, then stops the workers that use its state.
+ */
 static void ovnfs_kill_sb(struct super_block *sb)
 {
 	struct ovnfs_sb *sbi = OVNFS_SB(sb);
 
+	if (sbi && sbi->batch)
+		ovnfs_journal_quiesce(sbi);
 	kill_anon_super(sb);
 	if (sbi) {
+		ovnfs_journal_exit(sbi);
 		cancel_delayed_work_sync(&sbi->poll);
 		kfree(sbi);
 	}

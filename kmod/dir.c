@@ -7,15 +7,24 @@
  * complete listing answers lookups, hits and misses alike, without a call;
  * lookup in a directory not listed under the current generation lists it
  * first (one READDIR sequence instead of one LOOKUP per name). The guest's
- * own namespace mutations edit the listing and the dcache from their replies
- * and keep the directory complete.
+ * own namespace mutations edit the listing and the dcache, from their
+ * replies or, when journaled (journal.c), ahead of the daemon, and keep the
+ * directory complete.
  *
  * Lock order (outermost first):
  *   1. VFS i_rwsem of directories (shared: lookup, readdir; exclusive:
  *      mutations; two directories: lock_rename order)
  *   2. in-lookup dentries (d_alloc_parallel waits for them)
  *   3. ovnfs_inode.dir_lock of one directory
- *   4. inode i_lock, then dentry d_lock (the dcache's order); port lock
+ *   4. inode i_lock, then dentry d_lock (the dcache's order); port lock;
+ *      jlock
+ * Waiting for the journal worker is allowed under any of 1-3 (READDIR waits
+ * for the directory's entries under dir_lock): the worker takes none of
+ * them. It clears a directory's completeness without dir_lock, by writing
+ * dir_gen = 0; a listing being filled concurrently cannot overwrite that
+ * with stale content, because the fill waited for every entry naming the
+ * directory and no new one can be appended while the fill holds its
+ * i_rwsem.
  * Rules that keep this acyclic:
  *   - dir_lock is never held while waiting for a dentry, taking an i_rwsem,
  *     taking another directory's dir_lock or locking a folio. READDIR calls
@@ -700,12 +709,42 @@ static int ovnfs_dir_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-/* Makes the directory's names durable with one FSYNC. */
+/*
+ * Makes the directory's names durable with one FSYNC, after the journal
+ * entries changing them; reports the late failures of operations on names
+ * in it (or on its attributes) since this file last looked.
+ */
 static int ovnfs_dir_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 {
 	struct ovnfs_msg m = { .op = OVNFS_OP_FSYNC };
+	int err = ovnfs_icall(file_inode(file), &m);
+	int werr = file_check_and_advance_wb_err(file);
 
-	return ovnfs_icall(file_inode(file), &m);
+	return err ?: werr;
+}
+
+/*
+ * Makes a name's dentry in dir revalidate on next use, after an operation
+ * on it failed behind its caller. Called by the journal worker: takes no
+ * directory lock.
+ */
+void ovnfs_forget_name(struct inode *dir, const char *name, u16 len)
+{
+	struct qstr q = QSTR_INIT(name, len);
+	struct dentry *parent, *child;
+
+	if (!dir || !len)
+		return;
+	parent = d_find_alias(dir);
+	if (!parent)
+		return;
+	q.hash = full_name_hash(parent, name, len);
+	child = d_lookup(parent, &q);
+	if (child) {
+		WRITE_ONCE(child->d_time, 0);
+		dput(child);
+	}
+	dput(parent);
 }
 
 /* Records name -> a in the directory's listing if it is current under gen. */
@@ -836,13 +875,136 @@ static struct inode *ovnfs_created(struct inode *dir, struct dentry *dentry,
 	return inode;
 }
 
+/*
+ * Says whether a namespace change in dir may go behind the caller: not in a
+ * synchronous directory (mount options sync, dirsync, or the inode flags),
+ * and only where the daemon's answer is predictable: the directory's
+ * attributes are current, and its owner write bit is set (the daemon acts
+ * on the host as the owner of the tree).
+ */
+static bool ovnfs_dir_journalable(struct inode *dir)
+{
+	const unsigned long *flags = &OVNFS_I(dir)->flags;
+
+	return !IS_DIRSYNC(dir) && (dir->i_mode & 0200) && ovnfs_attr_valid(dir) &&
+	       !test_bit(OVNFS_I_STALE, flags) && !test_bit(OVNFS_I_BAD, flags);
+}
+
+/* Says whether what a dentry says about its name is current. */
+static bool ovnfs_dentry_current(struct dentry *dentry)
+{
+	return READ_ONCE(dentry->d_time) == ovnfs_gen(OVNFS_SB(dentry->d_sb));
+}
+
+/* Says whether an inode's link count and state may be predicted locally. */
+static bool ovnfs_node_journalable(struct inode *inode)
+{
+	const unsigned long *flags = &OVNFS_I(inode)->flags;
+
+	return !S_ISDIR(inode->i_mode) && ovnfs_attr_valid(inode) &&
+	       !test_bit(OVNFS_I_STALE, flags) && !test_bit(OVNFS_I_BAD, flags);
+}
+
+/*
+ * Creates a regular file or directory ahead of the daemon: an id from the
+ * pool, an inode showing what the daemon will report (the guest's clock for
+ * the times, the directory's owner as the host does), the listing updated
+ * and the CREATE/MKDIR journaled. Returns the inode, NULL when the creation
+ * must be synchronous, or an error.
+ */
+static struct inode *ovnfs_create_ahead(struct inode *dir, struct dentry *dentry, umode_t mode)
+{
+	struct ovnfs_sb *sbi = OVNFS_SB(dir->i_sb);
+	u64 gen = ovnfs_gen(sbi);
+	struct ovnfs_jdesc d = {
+		.op = S_ISDIR(mode) ? OVNFS_J_MKDIR : OVNFS_J_CREATE,
+		.dir = dir,
+		.mode = mode & S_IALLUGO,
+	};
+	struct ovnfs_attr a = {};
+	struct timespec64 now;
+	struct ovnfs_jent *e;
+	struct inode *inode;
+	u64 id;
+
+	if (!ovnfs_dir_journalable(dir) || READ_ONCE(dentry->d_time) != gen)
+		return NULL;
+	e = ovnfs_journal_prepare(sbi, &dentry->d_name, NULL);
+	if (IS_ERR(e))
+		return ERR_CAST(e);
+	id = ovnfs_id_take(sbi);
+	if (!id) {
+		ovnfs_journal_abort(sbi, e);
+		return NULL;
+	}
+	now = current_time(dir);
+	d.mtime = timespec64_to_ns(&now);
+	a.id = cpu_to_le64(id);
+	a.mode = cpu_to_le32(mode);
+	a.nlink = cpu_to_le32(S_ISDIR(mode) ? 2 : 1);
+	a.uid = cpu_to_le32(i_uid_read(dir));
+	a.gid = cpu_to_le32(i_gid_read(dir));
+	a.mtime_ns = cpu_to_le64(d.mtime);
+	a.ctime_ns = a.mtime_ns;
+	inode = ovnfs_iget(dir->i_sb, &a, gen, OVNFS_ATTR_OWN, 0);
+	if (IS_ERR(inode)) {
+		ovnfs_journal_abort(sbi, e);
+		return inode;
+	}
+	if (S_ISREG(mode)) {
+		set_bit(OVNFS_I_MTIME_LOCAL, &OVNFS_I(inode)->flags);
+		ovnfs_zero_from(inode, 0);
+	}
+	ovnfs_own_change(inode);
+	if (S_ISDIR(mode))
+		ovnfs_dir_init_empty(inode, gen);
+	d.inode = inode;
+	ovnfs_journal_commit(sbi, e, &d);
+	ovnfs_dir_set(dir, &dentry->d_name, &a, gen);
+	ovnfs_dir_changed(dir);
+	WRITE_ONCE(dentry->d_time, gen);
+	return inode;
+}
+
+/*
+ * Accounts for a name of inode removed behind the caller, with a link count
+ * known to be current. A file losing its last name while open becomes an
+ * orphan (its pages are its only store); otherwise its queued data is
+ * dropped.
+ */
+static void ovnfs_name_removed(struct inode *inode)
+{
+	/* Before the change: a reply being applied finishes first (i_lock). */
+	ovnfs_own_change(inode);
+	if (inode->i_nlink > 1) {
+		drop_nlink(inode);
+	} else if (S_ISREG(inode->i_mode) && atomic_read(&OVNFS_I(inode)->opens)) {
+		ovnfs_make_orphan(inode);
+	} else {
+		ovnfs_journal_drop_data(inode);
+		clear_nlink(inode);
+	}
+}
+
+/*
+ * Drops the queued data of a file about to lose its last name by a
+ * synchronous call; returns whether there was some, to queue it again if
+ * the call fails.
+ */
+static bool ovnfs_last_name_drop(struct inode *inode)
+{
+	if (!inode || !S_ISREG(inode->i_mode) || inode->i_nlink > 1)
+		return false;
+	return ovnfs_journal_drop_data(inode);
+}
+
 /* Creates (or with excl only creates) a regular file with one CREATE. */
-static int ovnfs_create(struct mnt_idmap *idmap, struct inode *dir,
-			struct dentry *dentry, umode_t mode, bool excl)
+static int ovnfs_create_sync(struct inode *dir, struct dentry *dentry, umode_t mode, bool excl)
 {
 	struct ovnfs_create_req req = {
 		.mode = cpu_to_le32(mode & S_IALLUGO),
 		.flags = cpu_to_le32(excl ? OVNFS_CREATE_EXCL : 0),
+		.name_len = cpu_to_le16(dentry->d_name.len),
 	};
 	struct ovnfs_attr a;
 	struct ovnfs_msg m = {
@@ -869,7 +1031,24 @@ static int ovnfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	return 0;
 }
 
-/* Creates a directory with one MKDIR; it starts out completely listed. */
+/* Creates a regular file: behind the caller when possible, else with one CREATE. */
+static int ovnfs_create(struct mnt_idmap *idmap, struct inode *dir,
+			struct dentry *dentry, umode_t mode, bool excl)
+{
+	struct inode *inode = ovnfs_create_ahead(dir, dentry, S_IFREG | (mode & S_IALLUGO));
+
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+	if (!inode)
+		return ovnfs_create_sync(dir, dentry, mode, excl);
+	d_instantiate(dentry, inode);
+	return 0;
+}
+
+/*
+ * Creates a directory, behind the caller when possible, else with one
+ * MKDIR; it starts out completely (emptily) listed either way.
+ */
 static struct dentry *ovnfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 				  struct dentry *dentry, umode_t mode)
 {
@@ -888,6 +1067,14 @@ static struct dentry *ovnfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	struct dentry *alias;
 	int err;
 
+	inode = ovnfs_create_ahead(dir, dentry, S_IFDIR | (mode & S_IALLUGO));
+	if (IS_ERR(inode))
+		return ERR_CAST(inode);
+	if (inode) {
+		ovnfs_dir_nlink_add(dir, 1);
+		d_instantiate(dentry, inode);
+		return NULL;
+	}
 	err = ovnfs_icall(dir, &m);
 	if (err) {
 		ovnfs_dir_doubt(dir, dentry, &m, err);
@@ -905,7 +1092,7 @@ static struct dentry *ovnfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	return alias;
 }
 
-/* Creates a FIFO, socket or device node with one MKNOD (a regular file with CREATE). */
+/* Creates a FIFO, socket or device node with one MKNOD (a regular file as create does). */
 static int ovnfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 		       struct dentry *dentry, umode_t mode, dev_t rdev)
 {
@@ -979,7 +1166,38 @@ static int ovnfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	return 0;
 }
 
-/* Gives an existing file another name with one LINK. */
+/*
+ * Gives a file another name behind the caller, the link count raised
+ * locally; returns false when that is not predictable.
+ */
+static bool ovnfs_link_ahead(struct inode *inode, struct inode *dir, struct dentry *dentry)
+{
+	struct ovnfs_sb *sbi = OVNFS_SB(dir->i_sb);
+	u64 gen = ovnfs_gen(sbi);
+	struct ovnfs_jdesc d = { .op = OVNFS_J_LINK, .dir = dir, .inode = inode };
+	struct ovnfs_attr a;
+	struct ovnfs_jent *e;
+
+	if (!ovnfs_dir_journalable(dir) || !ovnfs_dentry_current(dentry) ||
+	    !ovnfs_node_journalable(inode) || !inode->i_nlink ||
+	    test_bit(OVNFS_I_ORPHAN, &OVNFS_I(inode)->flags))
+		return false;
+	e = ovnfs_journal_prepare(sbi, &dentry->d_name, NULL);
+	if (IS_ERR(e))
+		return false;
+	/* Packed after the local change: its reply's link count must not precede it. */
+	ovnfs_journal_commit_held(sbi, e, &d);
+	ovnfs_own_change(inode);
+	inc_nlink(inode);
+	ovnfs_journal_release(sbi, e);
+	ovnfs_attr_from_inode(inode, &a);
+	ovnfs_dir_set(dir, &dentry->d_name, &a, gen);
+	ovnfs_dir_changed(dir);
+	WRITE_ONCE(dentry->d_time, gen);
+	return true;
+}
+
+/* Gives an existing file another name: behind the caller when possible, else with one LINK. */
 static int ovnfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *dentry)
 {
 	struct inode *inode = d_inode(old_dentry);
@@ -996,49 +1214,157 @@ static int ovnfs_link(struct dentry *old_dentry, struct inode *dir, struct dentr
 	};
 	int err;
 
-	err = ovnfs_icall(inode, &m);
-	if (err) {
-		ovnfs_dir_doubt(dir, dentry, &m, err);
-		return err;
+	if (!ovnfs_link_ahead(inode, dir, dentry)) {
+		ovnfs_journal_wait_inode(dir);
+		err = ovnfs_icall(inode, &m);
+		if (err) {
+			ovnfs_dir_doubt(dir, dentry, &m, err);
+			return err;
+		}
+		if (le64_to_cpu(a.id) != OVNFS_I(inode)->id)
+			return -EIO;
+		ovnfs_apply_attr(inode, &a, m.gen, OVNFS_ATTR_OWN, 0);
+		ovnfs_dir_set(dir, &dentry->d_name, &a, m.gen);
+		ovnfs_dir_changed(dir);
+		WRITE_ONCE(dentry->d_time, m.gen);
 	}
-	if (le64_to_cpu(a.id) != OVNFS_I(inode)->id)
-		return -EIO;
-	ovnfs_apply_attr(inode, &a, m.gen, OVNFS_ATTR_OWN, 0);
-	ovnfs_dir_set(dir, &dentry->d_name, &a, m.gen);
-	ovnfs_dir_changed(dir);
-	WRITE_ONCE(dentry->d_time, m.gen);
 	ihold(inode);
 	d_instantiate(dentry, inode);
 	return 0;
 }
 
-/* Removes a name with one UNLINK. */
+/*
+ * Removes a name: behind the caller when the name and the file's link count
+ * are current, else with one UNLINK. Queued data of a file losing its last
+ * name is dropped, not sent (journal.c rule 4).
+ */
 static int ovnfs_unlink(struct inode *dir, struct dentry *dentry)
 {
+	struct ovnfs_sb *sbi = OVNFS_SB(dir->i_sb);
+	struct inode *inode = d_inode(dentry);
+	struct ovnfs_jdesc d = { .op = OVNFS_J_UNLINK, .dir = dir, .inode = inode };
 	struct ovnfs_msg m = {
 		.op = OVNFS_OP_UNLINK,
 		.name = dentry->d_name.name,
 		.name_len = dentry->d_name.len,
 	};
+	struct ovnfs_jent *e;
+	bool queued;
+	u64 gen;
 	int err;
 
+	if (ovnfs_dir_journalable(dir) && ovnfs_dentry_current(dentry) &&
+	    ovnfs_node_journalable(inode)) {
+		gen = ovnfs_gen(sbi);
+		e = ovnfs_journal_prepare(sbi, &dentry->d_name, NULL);
+		if (IS_ERR(e))
+			return PTR_ERR(e);
+		ovnfs_journal_commit(sbi, e, &d);
+		ovnfs_dir_unset(dir, &dentry->d_name, gen);
+		ovnfs_dir_changed(dir);
+		ovnfs_name_removed(inode);
+		WRITE_ONCE(dentry->d_time, gen);
+		return 0;
+	}
+	queued = ovnfs_last_name_drop(inode);
 	err = ovnfs_icall(dir, &m);
 	if (err) {
+		if (queued)
+			ovnfs_journal_data(inode);
 		ovnfs_dir_doubt(dir, dentry, &m, err);
 		return err;
 	}
 	ovnfs_dir_unset(dir, &dentry->d_name, m.gen);
 	ovnfs_dir_changed(dir);
-	ovnfs_unlinked(d_inode(dentry));
+	ovnfs_unlinked(inode);
 	WRITE_ONCE(dentry->d_time, m.gen);
 	return 0;
 }
 
-/* Removes an empty directory with one RMDIR. */
+/* What the guest knows about a directory's contents. */
+enum ovnfs_dir_state {
+	OVNFS_DIR_UNKNOWN,	/* no complete listing under the current generation */
+	OVNFS_DIR_EMPTY,
+	OVNFS_DIR_USED,
+};
+
+/*
+ * Tells whether a directory is known to be empty or not: its listing is
+ * complete under the current generation. Pending entries that changed it
+ * precede any operation journaled or sent after them.
+ */
+static enum ovnfs_dir_state ovnfs_dir_state_of(struct inode *dir)
+{
+	struct ovnfs_inode *di = OVNFS_I(dir);
+	enum ovnfs_dir_state state = OVNFS_DIR_UNKNOWN;
+
+	if (test_bit(OVNFS_I_STALE, &di->flags) || test_bit(OVNFS_I_BAD, &di->flags))
+		return state;
+	mutex_lock(&di->dir_lock);
+	if (di->dir_gen == ovnfs_gen(OVNFS_SB(dir->i_sb)))
+		state = di->dir_count ? OVNFS_DIR_USED : OVNFS_DIR_EMPTY;
+	mutex_unlock(&di->dir_lock);
+	return state;
+}
+
+/* Says whether a directory is known to be empty. */
+static bool ovnfs_dir_empty_current(struct inode *dir)
+{
+	return ovnfs_dir_state_of(dir) == OVNFS_DIR_EMPTY;
+}
+
+/* Drops a removed directory's link count and listing. */
+static void ovnfs_dir_gone(struct inode *victim)
+{
+	struct ovnfs_inode *vi = OVNFS_I(victim);
+
+	clear_nlink(victim);
+	mutex_lock(&vi->dir_lock);
+	ovnfs_dir_drop_table(vi);
+	mutex_unlock(&vi->dir_lock);
+}
+
+/* Accounts for an empty directory removed from dir, at generation gen. */
+static void ovnfs_dir_removed(struct inode *dir, struct dentry *dentry, u64 gen)
+{
+	ovnfs_dir_unset(dir, &dentry->d_name, gen);
+	ovnfs_dir_nlink_add(dir, -1);
+	ovnfs_dir_changed(dir);
+	ovnfs_dir_gone(d_inode(dentry));
+	WRITE_ONCE(dentry->d_time, gen);
+}
+
+/*
+ * Removes a directory behind the caller when its name is current and it is
+ * known to be empty; returns false otherwise.
+ */
+static bool ovnfs_rmdir_ahead(struct inode *dir, struct dentry *dentry)
+{
+	struct ovnfs_sb *sbi = OVNFS_SB(dir->i_sb);
+	struct inode *victim = d_inode(dentry);
+	struct ovnfs_jdesc d = { .op = OVNFS_J_RMDIR, .dir = dir, .inode = victim };
+	u64 gen = ovnfs_gen(sbi);
+	struct ovnfs_jent *e;
+
+	if (!ovnfs_dir_journalable(dir) || !ovnfs_dentry_current(dentry) ||
+	    !ovnfs_dir_empty_current(victim))
+		return false;
+	e = ovnfs_journal_prepare(sbi, &dentry->d_name, NULL);
+	if (IS_ERR(e))
+		return false;
+	ovnfs_journal_commit(sbi, e, &d);
+	ovnfs_dir_removed(dir, dentry, gen);
+	return true;
+}
+
+/*
+ * Removes an empty directory: behind the caller when that is predictable,
+ * else with one RMDIR after the entries naming either directory. A
+ * directory known to hold names is refused without a call.
+ */
 static int ovnfs_rmdir(struct inode *dir, struct dentry *dentry)
 {
 	struct inode *inode = d_inode(dentry);
-	struct ovnfs_inode *oi = OVNFS_I(inode);
 	struct ovnfs_msg m = {
 		.op = OVNFS_OP_RMDIR,
 		.name = dentry->d_name.name,
@@ -1046,35 +1372,121 @@ static int ovnfs_rmdir(struct inode *dir, struct dentry *dentry)
 	};
 	int err;
 
+	if (ovnfs_dir_state_of(inode) == OVNFS_DIR_USED)
+		return -ENOTEMPTY;
+	if (ovnfs_rmdir_ahead(dir, dentry))
+		return 0;
+	ovnfs_journal_wait_inode(inode);
 	err = ovnfs_icall(dir, &m);
 	if (err) {
 		ovnfs_dir_doubt(dir, dentry, &m, err);
 		return err;
 	}
-	ovnfs_dir_unset(dir, &dentry->d_name, m.gen);
-	ovnfs_dir_nlink_add(dir, -1);
-	ovnfs_dir_changed(dir);
-	clear_nlink(inode);
-	mutex_lock(&oi->dir_lock);
-	ovnfs_dir_drop_table(oi);
-	mutex_unlock(&oi->dir_lock);
-	WRITE_ONCE(dentry->d_time, m.gen);
+	ovnfs_dir_removed(dir, dentry, m.gen);
 	return 0;
 }
 
+/* Moves a name between the listings after a rename, at generation gen. */
+static void ovnfs_renamed(struct inode *old_dir, struct dentry *old_dentry, struct inode *new_dir,
+			  struct dentry *new_dentry, u64 gen)
+{
+	struct inode *inode = d_inode(old_dentry);
+	struct ovnfs_attr a;
+
+	ovnfs_attr_from_inode(inode, &a);
+	ovnfs_dir_unset(old_dir, &old_dentry->d_name, gen);
+	ovnfs_dir_set(new_dir, &new_dentry->d_name, &a, gen);
+	if (S_ISDIR(inode->i_mode) && old_dir != new_dir) {
+		ovnfs_dir_nlink_add(old_dir, -1);
+		ovnfs_dir_nlink_add(new_dir, 1);
+	}
+	ovnfs_dir_changed(old_dir);
+	if (new_dir != old_dir)
+		ovnfs_dir_changed(new_dir);
+	WRITE_ONCE(old_dentry->d_time, gen);
+	WRITE_ONCE(new_dentry->d_time, gen);
+}
+
 /*
- * Renames with one RENAME (RENAME_NOREPLACE supported, other flags EINVAL)
- * and moves the name between the listings; the VFS moves the dentry.
+ * Says whether a node may be moved behind the caller: a directory needs no
+ * current attributes (its link count does not change), a file does.
+ */
+static bool ovnfs_moved_journalable(struct inode *inode)
+{
+	const unsigned long *flags = &OVNFS_I(inode)->flags;
+
+	if (S_ISDIR(inode->i_mode))
+		return !test_bit(OVNFS_I_STALE, flags) && !test_bit(OVNFS_I_BAD, flags);
+	return ovnfs_node_journalable(inode);
+}
+
+/* Accounts for the node a rename replaced in new_dir, if any. */
+static void ovnfs_replaced(struct inode *new_dir, struct inode *target)
+{
+	if (!target)
+		return;
+	if (S_ISDIR(target->i_mode)) {
+		ovnfs_dir_gone(target);
+		ovnfs_dir_nlink_add(new_dir, -1);
+	} else {
+		ovnfs_name_removed(target);
+	}
+}
+
+/*
+ * Renames behind the caller when both names are current, a moved file's or
+ * a replaced file's link count is current, and a replaced directory is
+ * known to be empty; returns false otherwise.
+ */
+static bool ovnfs_rename_ahead(struct inode *old_dir, struct dentry *old_dentry,
+			       struct inode *new_dir, struct dentry *new_dentry, u32 flags)
+{
+	struct ovnfs_sb *sbi = OVNFS_SB(old_dir->i_sb);
+	struct inode *inode = d_inode(old_dentry);
+	struct inode *target = d_inode(new_dentry);
+	struct ovnfs_jdesc d = {
+		.op = OVNFS_J_RENAME,
+		.dir = old_dir,
+		.dir2 = new_dir,
+		.inode = inode,
+		.target = target,
+		.flags = flags,
+	};
+	u64 gen = ovnfs_gen(sbi);
+	struct ovnfs_jent *e;
+
+	if (!ovnfs_dir_journalable(old_dir) || !ovnfs_dir_journalable(new_dir) ||
+	    !ovnfs_dentry_current(old_dentry) || !ovnfs_dentry_current(new_dentry) ||
+	    !ovnfs_moved_journalable(inode) ||
+	    (target && !(S_ISDIR(target->i_mode) ? ovnfs_dir_empty_current(target) :
+			 ovnfs_node_journalable(target))))
+		return false;
+	e = ovnfs_journal_prepare(sbi, &old_dentry->d_name, &new_dentry->d_name);
+	if (IS_ERR(e))
+		return false;
+	ovnfs_journal_commit(sbi, e, &d);
+	ovnfs_replaced(new_dir, target);
+	ovnfs_renamed(old_dir, old_dentry, new_dir, new_dentry, gen);
+	return true;
+}
+
+/*
+ * Renames (RENAME_NOREPLACE supported, other flags EINVAL): behind the
+ * caller when the result is predictable, else with one RENAME after the
+ * entries naming the nodes involved. The VFS moves the dentry. A replaced
+ * file losing its last name is treated as unlinked; a replaced directory
+ * known to hold names is refused without a call.
  */
 static int ovnfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 			struct dentry *old_dentry, struct inode *new_dir,
 			struct dentry *new_dentry, unsigned int flags)
 {
-	struct inode *inode = d_inode(old_dentry);
 	struct inode *target = d_inode(new_dentry);
+	struct inode *const nodes[] = { old_dir, new_dir, d_inode(old_dentry), target };
+	u32 wire_flags = flags & RENAME_NOREPLACE ? OVNFS_RENAME_NOREPLACE : 0;
 	struct ovnfs_rename_req req = {
 		.new_dir = cpu_to_le64(OVNFS_I(new_dir)->id),
-		.flags = cpu_to_le32(flags & RENAME_NOREPLACE ? OVNFS_RENAME_NOREPLACE : 0),
+		.flags = cpu_to_le32(wire_flags),
 		.old_len = cpu_to_le16(old_dentry->d_name.len),
 		.new_len = cpu_to_le16(new_dentry->d_name.len),
 	};
@@ -1087,38 +1499,30 @@ static int ovnfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 		.name2 = new_dentry->d_name.name,
 		.name2_len = new_dentry->d_name.len,
 	};
-	struct ovnfs_attr a;
+	bool queued;
 	int err;
 
 	if (flags & ~RENAME_NOREPLACE)
 		return -EINVAL;
+	if (target && S_ISDIR(target->i_mode) && ovnfs_dir_state_of(target) == OVNFS_DIR_USED)
+		return -ENOTEMPTY;
+	if (ovnfs_rename_ahead(old_dir, old_dentry, new_dir, new_dentry, wire_flags))
+		return 0;
+	queued = ovnfs_last_name_drop(target);
+	ovnfs_journal_wait_nodes(nodes, ARRAY_SIZE(nodes));
 	err = ovnfs_icall(old_dir, &m);
 	if (err) {
+		if (queued)
+			ovnfs_journal_data(target);
 		ovnfs_dir_doubt(old_dir, old_dentry, &m, err);
 		ovnfs_dir_doubt(new_dir, new_dentry, &m, err);
 		return err;
 	}
-
-	ovnfs_attr_from_inode(inode, &a);
-	ovnfs_dir_unset(old_dir, &old_dentry->d_name, m.gen);
-	ovnfs_dir_set(new_dir, &new_dentry->d_name, &a, m.gen);
-	if (target) {
-		if (S_ISDIR(target->i_mode)) {
-			clear_nlink(target);
-			ovnfs_dir_nlink_add(new_dir, -1);
-		} else {
-			ovnfs_unlinked(target);
-		}
-	}
-	if (S_ISDIR(inode->i_mode) && old_dir != new_dir) {
-		ovnfs_dir_nlink_add(old_dir, -1);
-		ovnfs_dir_nlink_add(new_dir, 1);
-	}
-	ovnfs_dir_changed(old_dir);
-	if (new_dir != old_dir)
-		ovnfs_dir_changed(new_dir);
-	WRITE_ONCE(old_dentry->d_time, m.gen);
-	WRITE_ONCE(new_dentry->d_time, m.gen);
+	if (target && S_ISDIR(target->i_mode))
+		ovnfs_replaced(new_dir, target);
+	else if (target)
+		ovnfs_unlinked(target);
+	ovnfs_renamed(old_dir, old_dentry, new_dir, new_dentry, m.gen);
 	return 0;
 }
 
