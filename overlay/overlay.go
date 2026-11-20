@@ -1253,6 +1253,9 @@ func (f *FS) Rename(from, to string) error {
 	if err := update(parent(src)); err != nil {
 		return err
 	}
+	if parent(dst) == parent(src) {
+		return nil // a move within one directory updated it already
+	}
 	return update(parent(dst))
 }
 
