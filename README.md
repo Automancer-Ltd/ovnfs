@@ -120,6 +120,7 @@ ovnfs isolates files, not processes: it is not a sandbox.
 - [Remote checkouts](docs/remote.md): `attach`, `send`, `pull`, `push`, `share`
 - [Platforms](docs/platforms.md): NFS, FUSE, SMB and WinFsp frontends
 - [Internals](docs/internals.md): admin protocol for embedding, persistence, memory tiers
+- [Kernel client](docs/kernel-client.md): decisions, guest baseline and targets for the vibevmm guest filesystem driver
 - [Limitations](docs/limitations.md)
 - [Development](docs/development.md): tests and benchmarks
 - [Agent skill](skills/ovnfs/SKILL.md): teaches coding agents to work in checkouts; copy `skills/ovnfs` into your agent's skills directory
