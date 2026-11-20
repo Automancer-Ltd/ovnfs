@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v5"
+	"github.com/stencil-hq/ovnfs/internal/kept"
 )
 
 // heldWriteFS delays every write to a regular file and, with release set,
@@ -42,7 +43,7 @@ func (f heldFile) WriteAt(b []byte, off int64) (int, error) {
 		<-f.fs.release
 	}
 	time.Sleep(f.fs.delay)
-	return writeAt(f.File, b, off)
+	return kept.WriteAt(f.File, b, off)
 }
 
 // writeArgs encodes WRITE3args writing data at off to file id, FILE_SYNC.

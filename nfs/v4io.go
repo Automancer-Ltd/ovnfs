@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"github.com/go-git/go-billy/v5"
+	"github.com/stencil-hq/ovnfs/internal/kept"
 )
 
 // NFSv4.0 READ, WRITE, COMMIT and SETATTR.
@@ -103,11 +104,11 @@ func (x *v4compound) write() status {
 		return s
 	}
 	st := &x.s.v4
-	client, kept, s := st.checkIO(id, cur.id, true)
+	client, held, s := st.checkIO(id, cur.id, true)
 	if s != stOK {
 		return s
 	}
-	defer func() { st.release(kept) }()
+	defer func() { st.release(held) }()
 	x.note(client)
 	if s := x.conflict(cur.id); s != stOK {
 		return s
@@ -123,20 +124,20 @@ func (x *v4compound) write() status {
 		gen = x.handleGen(cur)
 	}
 	var f billy.File
-	if kept == nil {
+	if held == nil {
 		var err error
 		f, err = x.s.FS.OpenFile(cur.path, os.O_WRONLY, 0)
 		if errors.Is(err, os.ErrPermission) && client != 0 {
-			kept = st.kept(id, cur.id)
+			held = st.kept(id, cur.id)
 		}
-		if err != nil && kept == nil {
+		if err != nil && held == nil {
 			return statusOf(err)
 		}
 	}
-	if kept != nil {
-		f = kept.f
+	if held != nil {
+		f = held.f
 	}
-	n, err := writeAt(f, data, int64(offset))
+	n, err := kept.WriteAt(f, data, int64(offset))
 	if err == nil {
 		x.changed(cur.id)
 		if stable != stable4Unstable {
@@ -144,7 +145,7 @@ func (x *v4compound) write() status {
 			stable = stable4FileSync
 		}
 	}
-	if kept == nil {
+	if held == nil {
 		if cerr := f.Close(); err == nil {
 			err = cerr
 		}

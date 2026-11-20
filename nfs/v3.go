@@ -2,6 +2,8 @@ package nfs
 
 import (
 	"strings"
+
+	"github.com/stencil-hq/ovnfs/internal/kept"
 )
 
 // NFSv3 procedures (RFC 1813 section 3).
@@ -45,11 +47,16 @@ const (
 )
 
 // v3State is what the server remembers between NFSv3 calls, a stateless
-// protocol: cached writers and permission fallbacks (keptFiles), the
+// protocol: cached writers and permission fallbacks (kept), the
 // verifiers of EXCLUSIVE creates, the calls under way per file
 // (fileOrder) and the directories whose entries change (dirLocks).
 type v3State struct {
-	kept     keptFiles
+	// kept retains writers across bursts of WRITE requests instead of
+	// opening and closing a host descriptor for each small write. Files
+	// opened before CREATE or SETATTR removes write permission also stay
+	// here: clients may send their buffered writes afterwards. NFSv4 keeps
+	// those permission fallbacks per open instead (keepWritable).
+	kept     kept.Cache[keptKey]
 	verfs    createVerfs
 	maxSizes maxReportedSizes
 	order    fileOrder

@@ -227,20 +227,11 @@ func startServer(t testing.TB, s *Server) string {
 	return l.Addr().String()
 }
 
-// closeKept closes the files s keeps open for writes (keptFiles, v4Kept),
+// closeKept closes the files s keeps open for writes (v3State.kept, v4Kept),
 // as the server's process exiting would: Windows cannot remove the test's
 // directory while a file in it is open.
 func closeKept(s *Server) {
-	k := &s.v3.kept
-	k.mu.Lock()
-	var files []billy.File
-	for f := k.evictLocked(); f != nil; f = k.evictLocked() {
-		files = append(files, f)
-	}
-	k.mu.Unlock()
-	for _, f := range files {
-		f.Close()
-	}
+	s.v3.kept.Close()
 
 	st := &s.v4
 	st.mu.Lock()

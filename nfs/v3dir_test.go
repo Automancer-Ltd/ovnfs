@@ -380,7 +380,7 @@ func TestV3ReaddirPlusContinuationAfterRecall(t *testing.T) {
 	}
 	// The WRITE's file stays open until idle, which keeps Windows from
 	// removing the test's folder.
-	s.v3.kept.expire(s.v3.kept.files[keptKey{id: id, path: path.Join("d", last)}].Value.(*keptFile))
+	s.v3.kept.Drop(keptKey{id: id, path: path.Join("d", last)})
 }
 
 // TestV3ReaddirEvictedTwice checks that a continuation of a changed

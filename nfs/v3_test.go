@@ -759,7 +759,7 @@ func TestV3CreateModes(t *testing.T) {
 func TestV3WritesAfterOwnerWriteGoes(t *testing.T) {
 	fs := newTestFS(t)
 	srv := &Server{FS: fs}
-	srv.v3.kept.idle = 200 * time.Millisecond
+	srv.v3.kept.Idle = 200 * time.Millisecond
 	c := dial(t, startServer(t, srv))
 	setattr := func(id uint64, sattr func(*encoder)) status {
 		t.Helper()
@@ -803,7 +803,7 @@ func TestV3WritesAfterOwnerWriteGoes(t *testing.T) {
 	}
 
 	deadline := time.Now().Add(5 * time.Second)
-	for srv.v3.kept.has(keptKey{id: created}) || srv.v3.kept.has(keptKey{id: chmodded}) {
+	for srv.v3.kept.Has(keptKey{id: created}) || srv.v3.kept.Has(keptKey{id: chmodded}) {
 		if time.Now().After(deadline) {
 			t.Fatal("kept files never expired")
 		}

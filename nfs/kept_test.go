@@ -6,54 +6,9 @@ import (
 	"runtime"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/go-git/go-billy/v5"
-	"github.com/stencil-hq/ovnfs/overlay"
 )
-
-// TestKeptEvictionAfterOwnerClose covers cached writers whose checkout was
-// removed before cache pressure evicts them. keep reports eviction close errors
-// to the new WRITE, so a second-close error would fail unrelated compiler output.
-func TestKeptEvictionAfterOwnerClose(t *testing.T) {
-	for _, storage := range []string{"disk", "spilled"} {
-		t.Run(storage, func(t *testing.T) {
-			var memory *overlay.Memory
-			if storage == "spilled" {
-				memory = overlay.NewMemory(1<<20, 1<<20, 0)
-			}
-			fs, err := overlay.New(t.TempDir(), nil, nil, memory)
-			if err != nil {
-				t.Fatal(err)
-			}
-			file, err := fs.OpenFile("output", os.O_CREATE|os.O_WRONLY, 0o755)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer file.Close()
-			if _, err := file.Write([]byte("compiler output")); err != nil {
-				t.Fatal(err)
-			}
-			if err := fs.Flush(); err != nil {
-				t.Fatal(err)
-			}
-			cache := keptFiles{idle: time.Hour}
-			if err := cache.keep(keptKey{id: 1, path: "removed/output"}, file); err != nil {
-				t.Fatal(err)
-			}
-			fs.CloseFiles()
-			cache.mu.Lock()
-			evicted := cache.evictLocked()
-			cache.mu.Unlock()
-			if evicted == nil {
-				t.Fatal("idle writer was not evicted")
-			}
-			if err := evicted.Close(); err != nil {
-				t.Fatalf("evicting a retired writer would fail the next WRITE: %v", err)
-			}
-		})
-	}
-}
 
 // seekWriteFS exposes only billy's sequential file API to the NFS writer.
 type seekWriteFS struct{ *testFS }

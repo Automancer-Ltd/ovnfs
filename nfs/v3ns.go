@@ -103,7 +103,7 @@ const (
 // UNCHECKED and O_EXCL would not be exclusive.
 //
 // A file created without its owner's write permission stays open for the
-// creator's writes (keptFiles).
+// creator's writes (v3State.kept).
 func (s *Server) create3(d *decoder, res *encoder) status {
 	id, gen, ok := d.fh(maxFH3)
 	name := d.str(maxPath3)
@@ -154,7 +154,7 @@ func (s *Server) create3(d *decoder, res *encoder) status {
 		s.v3.verfs.put(fid, verf)
 	}
 	if perm&0o200 == 0 {
-		if err := s.v3.kept.keep(keptKey{id: fid}, f); err != nil {
+		if err := s.v3.kept.Keep(keptKey{id: fid}, f); err != nil {
 			return statusOf(err)
 		}
 	} else if err := f.Close(); err != nil {

@@ -8,6 +8,7 @@ import (
 	"path"
 
 	"github.com/go-git/go-billy/v5"
+	"github.com/stencil-hq/ovnfs/internal/kept"
 )
 
 // getattr3 answers GETATTR (RFC 1813 section 3.3.1).
@@ -292,19 +293,19 @@ func (s *Server) writeAt3(id, gen uint64, p string, data []byte, off int64, stab
 	key := keptKey{id: id, path: p}
 	var n int
 	write := func(f billy.File) (err error) {
-		n, err = writeAt(f, data, off)
+		n, err = kept.WriteAt(f, data, off)
 		if err == nil && stable {
 			err = s.FS.SyncFile(p, id, gen, f)
 		}
 		return err
 	}
-	if ok, err := s.v3.kept.with(key, write); ok {
+	if ok, err := s.v3.kept.With(key, write); ok {
 		return n, err
 	}
 	f, err := s.FS.OpenFile(p, os.O_WRONLY, 0)
 	if err != nil {
 		if errors.Is(err, os.ErrPermission) {
-			if ok, kerr := s.v3.kept.with(keptKey{id: id}, write); ok {
+			if ok, kerr := s.v3.kept.With(keptKey{id: id}, write); ok {
 				return n, kerr
 			}
 		}
@@ -314,7 +315,7 @@ func (s *Server) writeAt3(id, gen uint64, p string, data []byte, off int64, stab
 		f.Close()
 		return n, err
 	}
-	return n, s.v3.kept.keep(key, f)
+	return n, s.v3.kept.Keep(key, f)
 }
 
 // commit3 answers COMMIT (section 3.3.21), syncing the whole file even when
@@ -331,9 +332,9 @@ func (s *Server) commit3(d *decoder, res *encoder) status {
 		return st
 	}
 	flush := func(f billy.File) error { return s.FS.SyncFile(p, id, gen, f) }
-	found, err := s.v3.kept.with(keptKey{id: id, path: p}, flush)
+	found, err := s.v3.kept.With(keptKey{id: id, path: p}, flush)
 	if !found {
-		found, err = s.v3.kept.with(keptKey{id: id}, flush)
+		found, err = s.v3.kept.With(keptKey{id: id}, flush)
 	}
 	if !found {
 		err = flush(nil)

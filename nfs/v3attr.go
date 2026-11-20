@@ -356,18 +356,18 @@ func (s *Server) apply3(p string, a *sattr3) status {
 }
 
 // keepWritable3 keeps file id, at p, open for writing before it loses its
-// owner's write permission, for writes the client still sends (keptFiles).
+// owner's write permission, for writes the client still sends (v3State.kept).
 func (s *Server) keepWritable3(id uint64, p string) {
-	if s.v3.kept.has(keptKey{id: id}) {
+	if s.v3.kept.Has(keptKey{id: id}) {
 		return
 	}
 	if f, err := s.FS.OpenFile(p, os.O_WRONLY, 0); err == nil {
-		s.v3.kept.keep(keptKey{id: id}, f)
+		s.v3.kept.Keep(keptKey{id: id}, f)
 	}
 }
 
 // truncate3 sets the size of file id, at p, through its kept file when the
-// backend refuses to open it for writing (keptFiles). Size 0 opens with
+// backend refuses to open it for writing (v3State.kept). Size 0 opens with
 // O_TRUNC, so a file from a lower layer is not copied up only to be emptied.
 func (s *Server) truncate3(id uint64, p string, size uint64) status {
 	if size > math.MaxInt64 {
@@ -379,7 +379,7 @@ func (s *Server) truncate3(id uint64, p string, size uint64) status {
 	}
 	f, err := s.FS.OpenFile(p, flag, 0)
 	if errors.Is(err, os.ErrPermission) {
-		if ok, kerr := s.v3.kept.with(keptKey{id: id}, func(f billy.File) error { return f.Truncate(int64(size)) }); ok {
+		if ok, kerr := s.v3.kept.With(keptKey{id: id}, func(f billy.File) error { return f.Truncate(int64(size)) }); ok {
 			return statusOf(kerr)
 		}
 	}
