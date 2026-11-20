@@ -5,6 +5,6 @@
 // write cache and costs tens of milliseconds per call. ovnfs's metadata must
 // survive a crash of the server process or the kernel, not a power cut, so
 // Sync uses plain fsync(2) there, as SQLite does by default. Other platforms
-// keep (*os.File).Sync. Client data written through the mounts is not
-// affected: its fsync and NFS COMMIT still reach (*os.File).Sync.
+// keep (*os.File).Sync. Mount data syncs, including NFS stable writes and
+// COMMIT, still use (*os.File).Sync for the backing file.
 package durable

@@ -234,12 +234,14 @@ func (s *Server) read3(d *decoder, res *encoder) status {
 	return stOK
 }
 
-// fileSync3 is FILE_SYNC, the highest stable_how.
-const fileSync3 = 2
+// stable_how3 values. DATA_SYNC is implemented as FILE_SYNC.
+const (
+	unstable3 = 0
+	fileSync3 = 2
+)
 
-// write3 answers WRITE (section 3.3.7). Data reaches the backend before the
-// reply, so every write is committed FILE_SYNC with this instance's
-// verifier.
+// write3 answers WRITE (section 3.3.7). An unstable write may stay buffered;
+// a stable write reaches stable storage before the reply.
 func (s *Server) write3(d *decoder, res *encoder) status {
 	id, gen, ok := d.fh(maxFH3)
 	off := d.u64()
@@ -274,26 +276,32 @@ func (s *Server) write3(d *decoder, res *encoder) status {
 		return stInval
 	}
 	pre := attrsOf(id, info)
-	s.recallAttrs(id, typ)
-	n, err := s.writeAt3(id, p, data[:min(len(data), int(count))], int64(off))
-	s.recallAttrs(id, typ)
+	s.Recall(id)
+	n, err := s.writeAt3(id, gen, p, data[:min(len(data), int(count))], int64(off), how != unstable3)
+	s.Recall(id)
 	if err != nil {
 		return statusOf(err)
 	}
 	s.wcc3(res, &pre, id, p)
 	res.u32(uint32(n))
-	res.u32(fileSync3)
+	if how != unstable3 {
+		how = fileSync3
+	}
+	res.u32(how)
 	res.fixed(s.verf[:])
 	return stOK
 }
 
 // writeAt3 reuses the writer for id at p, falling back to a descriptor kept
 // before write permission was removed when a fresh open is denied.
-func (s *Server) writeAt3(id uint64, p string, data []byte, off int64) (int, error) {
+func (s *Server) writeAt3(id, gen uint64, p string, data []byte, off int64, stable bool) (int, error) {
 	key := keptKey{id: id, path: p}
 	var n int
 	write := func(f billy.File) (err error) {
 		n, err = writeAt(f, data, off)
+		if err == nil && stable {
+			err = s.FS.SyncFile(p, id, gen, f)
+		}
 		return err
 	}
 	if ok, err := s.v3.kept.with(key, write); ok {
@@ -315,8 +323,8 @@ func (s *Server) writeAt3(id uint64, p string, data []byte, off int64) (int, err
 	return n, s.v3.kept.keep(key, f)
 }
 
-// commit3 answers COMMIT (section 3.3.21): writes are already stable, so
-// it only confirms the verifier.
+// commit3 answers COMMIT (section 3.3.21), syncing the whole file even when
+// only a range was requested. A kept writer still works after a chmod.
 func (s *Server) commit3(d *decoder, res *encoder) status {
 	id, gen, ok := d.fh(maxFH3)
 	d.u64() // offset
@@ -327,6 +335,17 @@ func (s *Server) commit3(d *decoder, res *encoder) status {
 	p, st := s.path3(id, gen, ok)
 	if st != stOK {
 		return st
+	}
+	flush := func(f billy.File) error { return s.FS.SyncFile(p, id, gen, f) }
+	found, err := s.v3.kept.with(keptKey{id: id, path: p}, flush)
+	if !found {
+		found, err = s.v3.kept.with(keptKey{id: id}, flush)
+	}
+	if !found {
+		err = flush(nil)
+	}
+	if err != nil {
+		return statusOf(err)
 	}
 	s.wcc3(res, nil, id, p)
 	res.fixed(s.verf[:])

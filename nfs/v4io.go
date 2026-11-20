@@ -11,9 +11,9 @@ import (
 
 // NFSv4.0 READ, WRITE, COMMIT and SETATTR.
 
-// stable_how4 values. Every WRITE is answered FILE_SYNC: the backend has no
-// unstable writes to commit.
+// stable_how4 values. DATA_SYNC is implemented as FILE_SYNC.
 const (
+	stable4Unstable = 0
 	stable4FileSync = 2
 )
 
@@ -118,51 +118,60 @@ func (x *v4compound) write() status {
 	if offset > math.MaxInt64-uint64(len(data)) {
 		return stFBig
 	}
-	var n int
-	var err error
-	if kept != nil {
-		n, err = writeAt(kept.f, data, int64(offset))
-	} else {
-		n, err = x.s.writeFile4(cur.path, data, int64(offset))
+	var gen uint64
+	if stable != stable4Unstable {
+		gen = x.handleGen(cur)
+	}
+	var f billy.File
+	if kept == nil {
+		var err error
+		f, err = x.s.FS.OpenFile(cur.path, os.O_WRONLY, 0)
 		if errors.Is(err, os.ErrPermission) && client != 0 {
-			if kept = st.kept(id, cur.id); kept != nil {
-				n, err = writeAt(kept.f, data, int64(offset))
-			}
+			kept = st.kept(id, cur.id)
+		}
+		if err != nil && kept == nil {
+			return statusOf(err)
+		}
+	}
+	if kept != nil {
+		f = kept.f
+	}
+	n, err := writeAt(f, data, int64(offset))
+	if err == nil {
+		x.changed(cur.id)
+		if stable != stable4Unstable {
+			err = x.s.FS.SyncFile(cur.path, cur.id, gen, f)
+			stable = stable4FileSync
+		}
+	}
+	if kept == nil {
+		if cerr := f.Close(); err == nil {
+			err = cerr
 		}
 	}
 	if err != nil {
 		return statusOf(err)
 	}
-	x.changed(cur.id)
 	x.e.u32(uint32(n))
-	x.e.u32(stable4FileSync)
+	x.e.u32(stable)
 	x.e.fixed(x.s.verf[:])
 	return stOK
 }
 
-// writeFile4 writes data at offset of the file at p.
-func (s *Server) writeFile4(p string, data []byte, offset int64) (int, error) {
-	f, err := s.FS.OpenFile(p, os.O_WRONLY, 0)
-	if err != nil {
-		return 0, err
-	}
-	n, err := writeAt(f, data, offset)
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	return n, err
-}
-
-// commit answers COMMIT: every WRITE was FILE_SYNC, so there is nothing to
-// commit and the verifier is all it returns.
+// commit answers COMMIT, syncing the whole file even when only a range
+// was requested.
 func (x *v4compound) commit() status {
 	x.d.u64() // offset
 	x.d.u32() // count
 	if x.d.err != nil {
 		return stBadXDR
 	}
-	if _, s := x.current(); s != stOK {
+	cur, s := x.current()
+	if s != stOK {
 		return s
+	}
+	if err := x.s.FS.SyncFile(cur.path, cur.id, x.handleGen(cur), nil); err != nil {
+		return statusOf(err)
 	}
 	x.e.fixed(x.s.verf[:])
 	return stOK

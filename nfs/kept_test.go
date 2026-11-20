@@ -84,7 +84,7 @@ func TestV3CachedWritesPreserveOffsets(t *testing.T) {
 	id := fs.FileID("file")
 	const workers, block = 16, 64
 	want := make([]byte, workers*block)
-	if _, err := s.writeAt3(id, "file", want, 0); err != nil {
+	if _, err := s.writeAt3(id, 0, "file", want, 0, false); err != nil {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
@@ -93,7 +93,7 @@ func TestV3CachedWritesPreserveOffsets(t *testing.T) {
 		copy(want[i*block:], data)
 		wg.Go(func() {
 			for range 32 {
-				n, err := s.writeAt3(id, "file", data, int64(i*block))
+				n, err := s.writeAt3(id, 0, "file", data, int64(i*block), false)
 				if err != nil || n != len(data) {
 					t.Errorf("write at %d: %d bytes, %v", i*block, n, err)
 					return

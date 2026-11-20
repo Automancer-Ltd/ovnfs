@@ -78,7 +78,11 @@ NFSv3 retains up to 4096 writable descriptors across write bursts, expiring
 them after 10 s idle instead of reopening a host file for every small write.
 Cached writers are keyed by file id and path, so renames reopen at the current
 path; the export's generation-aware handles preserve snapshot isolation.
-This does not change NFS's [fsync limitations](configuration.md#where-the-daemon-lives).
+
+NFSv3 and NFSv4 mark `UNSTABLE` writes as buffered. `DATA_SYNC`, `FILE_SYNC`
+and `COMMIT` spill the addressed file if needed and sync its data and the
+directories needed to recover its name before acknowledging success. A
+failed sync returns an error. This does not require `serve --fsync`.
 
 Calls on one file keep their arrival order wherever replies show it. WRITE
 and SETATTR run one at a time per file, each reporting the attributes from
