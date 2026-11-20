@@ -364,9 +364,10 @@ cannot name two entries: its new holder was made after the fence, which
 hides it (a directory, where the filesystem records birth times). `Locate`
 maps an identity back to its path with `fsgetpath(2)` on
 macOS. On Linux and Windows a snapshot remembers paths in a bounded table
-of 32,768 slots and rechecks a path before returning it. On Windows a local
-or cache entry's State identity uses the NTFS record number, without the
-file reference's sequence bits. WinFsp uses it to resolve open directories.
+of 32,768 slots and rechecks a path before returning it. On NTFS a local
+or cache entry's State identity uses the record number without the file
+reference's sequence bits. On other Windows filesystems it requires the full
+file index to fit. WinFsp uses the identity to resolve open directories.
 
 Two names of one folder file, as cargo links an artifact into `deps/` and
 beside it, share that identity, where a clone gave each name a file of its

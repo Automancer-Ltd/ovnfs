@@ -7,7 +7,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"sync"
 	"syscall"
@@ -398,17 +397,6 @@ func TestBaseIdentities(t *testing.T) {
 		if at < 0 {
 			t.Fatalf("missing %s in listing", p)
 		}
-		listed, ok := ident.Of(entries[at])
-		if !ok {
-			t.Fatalf("listed %s has no identity", p)
-		}
-		if got, ok := view.Locate(listed); !ok || got != p {
-			t.Fatalf("listed %s resolves to %q, %v", p, got, ok)
-		}
-		info, err := view.Lstat(p)
-		if err != nil {
-			t.Fatal(err)
-		}
 		root := dir
 		if p == ".env" {
 			root = c.tree
@@ -421,12 +409,25 @@ func TestBaseIdentities(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if runtime.GOOS == "windows" {
+		if isNTFS(root) {
 			ino = ident.NTFSRecord(ino)
 		}
 		want, fits := ident.New(ident.State, ino)
-		if id, ok := ident.Of(info); !fits || !ok || id != want || listed != want {
-			t.Errorf("%s: lookup %v, listing %v, want State identity %v", p, id, listed, want)
+		listed, ok := ident.Of(entries[at])
+		if ok != fits || listed != want {
+			t.Fatalf("listed %s has identity %v, %v; want %v, %v", p, listed, ok, want, fits)
+		}
+		if fits {
+			if got, ok := view.Locate(listed); !ok || got != p {
+				t.Fatalf("listed %s resolves to %q, %v", p, got, ok)
+			}
+		}
+		info, err := view.Lstat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if id, ok := ident.Of(info); ok != fits || id != want {
+			t.Errorf("%s: lookup identity %v, %v; want %v, %v", p, id, ok, want, fits)
 		}
 	}
 	hidden, _ := ident.New(ident.Capture, uint64(b.index.nodes))

@@ -98,7 +98,7 @@ func (c *Caches) Wait() { <-c.done }
 func (b *Base) newCaches(id string) *Caches {
 	dir := filepath.Join(b.config.StateDir, cachesDir, id)
 	t := filepath.Join(dir, treeDir)
-	c := &Caches{id: id, dir: dir, tree: t, files: newTree(t), listed: make(chan struct{}), done: make(chan struct{})}
+	c := &Caches{id: id, dir: dir, tree: t, files: newTree(t), locator: newLocator(b.config.StateDir), listed: make(chan struct{}), done: make(chan struct{})}
 	folder, errFolder := volumeID(b.meta.Dir)
 	if state, errState := volumeID(b.config.StateDir); errFolder == nil && errState == nil && folder == state {
 		c.fence.volume = folder

@@ -4,18 +4,46 @@ import (
 	"os"
 
 	"github.com/stencil-hq/ovnfs/internal/ident"
+	"golang.org/x/sys/windows"
 )
 
 // locator remembers the paths of State identities handed to clients. WinFsp
 // resolves open handles by ID, including when enumerating a directory.
-type locator struct{ memo memo }
+type locator struct {
+	memo memo
+	ntfs bool
+}
+
+// newLocator identifies the state volume once per snapshot. Local copies live
+// on that volume, and the fence admits cache entries only on the same volume.
+func newLocator(state string) locator { return locator{ntfs: isNTFS(state)} }
+
+func isNTFS(dir string) bool {
+	f, err := os.Open(dir)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	var name [windows.MAX_PATH + 1]uint16
+	return windows.GetVolumeInformationByHandle(windows.Handle(f.Fd()), nil, 0, nil, nil, nil, &name[0], uint32(len(name))) == nil &&
+		windows.UTF16ToString(name[:]) == "NTFS"
+}
+
+// stateID preserves every file-index bit on other or unrecognized volumes.
+// Unlike NTFS record references, their high bits may distinguish live files.
+func (l *locator) stateID(index uint64) (ident.ID, bool) {
+	if l.ntfs {
+		index = ident.NTFSRecord(index)
+	}
+	return ident.New(ident.State, index)
+}
 
 func (l *locator) lookupInfo(info os.FileInfo, host, p string) os.FileInfo {
-	return snapshotInfo{FileInfo: info, host: host, view: p, paths: &l.memo}
+	return snapshotInfo{FileInfo: info, host: host, view: p, loc: l}
 }
 
 func (l *locator) listedInfo(info os.FileInfo, host, dir string) os.FileInfo {
-	return snapshotInfo{FileInfo: info, host: host, view: dir, listed: true, paths: &l.memo}
+	return snapshotInfo{FileInfo: info, host: host, view: dir, listed: true, loc: l}
 }
 
 // locate checks the remembered name against the current fenced or snapshot view.
@@ -29,7 +57,7 @@ type snapshotInfo struct {
 	os.FileInfo
 	host   string
 	view   string // the view path, or its parent for a listed entry
-	paths  *memo
+	loc    *locator
 	listed bool
 }
 
@@ -40,14 +68,13 @@ func (i snapshotInfo) Identity() ident.ID {
 	if err != nil {
 		return 0
 	}
-	record := ident.NTFSRecord(ino)
-	id, ok := ident.New(ident.State, record)
+	id, ok := i.loc.stateID(ino)
 	if ok {
 		p := i.view
 		if i.listed {
 			p += "/" + i.Name() // only directories below a root use listedInfo
 		}
-		i.paths.put(record, p)
+		i.loc.memo.put(id.Value(), p)
 	}
 	return id
 }
