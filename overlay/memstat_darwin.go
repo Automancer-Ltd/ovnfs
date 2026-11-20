@@ -11,7 +11,7 @@ import (
 
 // memStat builds darwin stat data for a memory file.
 func memStat(i memInfo) any {
-	s := &syscall.Stat_t{Nlink: 1, Uid: i.uid, Gid: i.gid, Ino: uint64(i.id), Size: i.size, Blocks: (i.size + 511) / 512, Blksize: 4096}
+	s := &syscall.Stat_t{Nlink: uint16(i.nlink), Uid: i.uid, Gid: i.gid, Ino: uint64(i.id), Size: i.size, Blocks: (i.size + 511) / 512, Blksize: 4096}
 	s.Mode = uint16(unixMode(i.mode))
 	s.Atimespec = syscall.NsecToTimespec(i.atime.UnixNano())
 	s.Mtimespec = syscall.NsecToTimespec(i.mtime.UnixNano())
@@ -65,7 +65,7 @@ func birthTime(info os.FileInfo) (time.Time, bool) {
 // effective uid, and the directory's group, which BSD semantics always
 // inherit.
 func newOwner(dir os.FileInfo) (uid, gid uint32) {
-	uid, gid = uint32(os.Geteuid()), uint32(os.Getegid())
+	uid, gid = euid, egid
 	if st, ok := dirStat(dir); ok {
 		gid = st.Gid
 	}

@@ -35,3 +35,13 @@ func decodeSys(data []byte) (any, error) {
 	}
 	return st, nil
 }
+
+// renameFile renames host file oldpath, never a directory, over newpath,
+// which is no directory either: one rename(2), without the lstat of
+// newpath with which [os.Rename] refuses to replace a directory.
+func renameFile(oldpath, newpath string) error {
+	if err := syscall.Rename(oldpath, newpath); err != nil {
+		return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: err}
+	}
+	return nil
+}

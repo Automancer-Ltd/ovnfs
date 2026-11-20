@@ -9,3 +9,6 @@ func encodeSys(os.FileInfo) ([]byte, error) { return nil, nil }
 
 // decodeSys restores no native record on this platform.
 func decodeSys([]byte) (any, error) { return nil, nil }
+
+// renameFile renames host file oldpath over newpath.
+func renameFile(oldpath, newpath string) error { return os.Rename(oldpath, newpath) }

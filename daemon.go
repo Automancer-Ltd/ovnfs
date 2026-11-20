@@ -466,6 +466,9 @@ func statusRows(st api.Status, clientVersion string) [][2]string {
 	if st.MemoryParked != 0 {
 		rows = append(rows, [2]string{"memory error", fmt.Sprintf("%d parked: %s", st.MemoryParked, st.MemoryError)})
 	}
+	if st.QueueParked != 0 {
+		rows = append(rows, [2]string{"queue error", fmt.Sprintf("%d checkouts parked: %s", st.QueueParked, st.QueueError)})
+	}
 	rows = append(rows, [][2]string{
 		{"blob cache", usage(st.BlobCache, "off")},
 		{"go heap", humanBytes(st.HeapLive) + " live, " + humanBytes(st.HeapInUse) + " in use, " + humanBytes(st.GoHeld) + " held"},

@@ -90,6 +90,10 @@ func (f *FS) unregister(p string) {
 	delete(f.paths, id)
 	if other := f.otherAlias(p); other != "" {
 		f.paths[id] = other
+	} else if m := f.files[p]; m != nil {
+		if other := m.otherName(p); other != "" {
+			f.paths[id] = other
+		}
 	}
 }
 
@@ -126,11 +130,12 @@ func (f *FS) dropIndex(p string) {
 	for n := range f.index.children[p] {
 		f.dropIndex(path.Join(p, n))
 	}
-	if m := f.files[p]; m != nil {
-		f.detach(m)
-	}
 	f.unregister(p)
+	if m := f.files[p]; m != nil {
+		f.unname(m, p)
+	}
 	f.untrack(p)
+	delete(f.unsettled, p)
 	f.index.drop(p)
 }
 
@@ -199,6 +204,7 @@ func (f *FS) cacheAliases(p string, info os.FileInfo) {
 		return
 	}
 	names := f.aliases[key]
+	info = unalias(info)
 	if names.first != p {
 		f.setInfo(names.first, aliasInfo{FileInfo: info, name: path.Base(names.first)})
 	}
@@ -209,7 +215,8 @@ func (f *FS) cacheAliases(p string, info os.FileInfo) {
 	}
 }
 
-// aliasInfo is a hard link's metadata read through another of its names.
+// aliasInfo is a file's metadata read through another of its names: a hard
+// link's, or a spilled file's staged before a rename gave it its name.
 type aliasInfo struct {
 	os.FileInfo
 	name string

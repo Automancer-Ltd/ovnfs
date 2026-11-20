@@ -133,6 +133,8 @@ func TestSlowBottomOpenDoesNotBlockOtherOperations(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			// The mkdir below may still be queued (queue.go) when the test ends.
+			t.Cleanup(func() { f.Settle() })
 			opened := make(chan error, 1)
 			go func() {
 				h, err := f.OpenFile(tc.path, tc.flag, 0)

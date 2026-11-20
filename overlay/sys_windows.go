@@ -7,6 +7,8 @@ import (
 	"encoding/binary"
 	"os"
 	"syscall"
+
+	"github.com/stencil-hq/ovnfs/internal/hostfile"
 )
 
 // encodeSys serializes the native attribute record of host metadata for a
@@ -35,3 +37,6 @@ func decodeSys(data []byte) (any, error) {
 	}
 	return attrs, nil
 }
+
+// renameFile renames host file oldpath over newpath with POSIX semantics.
+func renameFile(oldpath, newpath string) error { return hostfile.Rename(oldpath, newpath) }

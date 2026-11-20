@@ -19,22 +19,42 @@ import (
 func (f *FS) SyncFile(name string, id ident.ID, opened billy.File) error {
 	p := Clean(name)
 	f.await(p)
-	f.mu.RLock()
-	p, src, err := f.syncSource(p, id)
-	for err == nil && f.files[p] != nil {
-		f.mu.RUnlock()
-		p, err = f.spillForSync(p, id)
-		if err != nil {
-			return err
-		}
-		f.mu.RLock()
+	err := f.rlockPaths(p)
+	var src source
+	if err == nil {
 		p, src, err = f.syncSource(p, id)
+	}
+	for err == nil {
+		if f.files[p] != nil {
+			f.mu.RUnlock()
+			if p, err = f.spillForSync(p, id); err != nil {
+				return err
+			}
+		} else if op := f.busy(p); op != nil {
+			// The entry moved to a name a host operation is changing.
+			f.mu.RUnlock()
+			f.mu.Lock()
+			err = f.waitOp(op)
+			f.mu.Unlock()
+			if err != nil {
+				return err
+			}
+		} else {
+			break
+		}
+		if err = f.rlockPaths(p); err == nil {
+			p, src, err = f.syncSource(p, id)
+		}
 	}
 	defer f.mu.RUnlock()
 	if err != nil {
 		return err
 	}
 	if src.upper {
+		// The directories synced below carry the times the index shows.
+		if err := f.settleAncestors(p); err != nil {
+			return err
+		}
 		var h *file
 		switch v := opened.(type) {
 		case *file:
@@ -90,12 +110,15 @@ func (f *FS) syncSource(p string, id ident.ID) (string, source, error) {
 // spillForSync takes the exclusive lock only for the spill, not for the
 // host sync. Recheck the identity since the name may have moved meanwhile.
 func (f *FS) spillForSync(p string, id ident.ID) (string, error) {
-	f.mu.Lock()
+	err := f.lockPaths(p)
 	defer f.mu.Unlock()
-	p, _, err := f.syncSource(p, id)
+	if err != nil {
+		return p, err
+	}
+	p, _, err = f.syncSource(p, id)
 	if err == nil {
 		if m := f.files[p]; m != nil {
-			err = f.spill(m)
+			err = f.spillAs(m, p)
 		}
 	}
 	return p, err

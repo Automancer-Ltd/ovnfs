@@ -757,6 +757,7 @@ func (r *Registry) Counts(s *api.Status) {
 	if r.config.Memory != nil {
 		s.Memory.Used, s.Memory.Limit = r.config.Memory.Usage()
 		s.MemoryParked, s.MemoryError = r.config.Memory.Parked()
+		s.QueueParked, s.QueueError = r.config.Memory.QueuesParked()
 	}
 	s.BlobCache.Used, s.BlobCache.Limit = r.store.CacheUsage()
 	r.mu.RLock()

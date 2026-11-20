@@ -74,6 +74,8 @@ type Status struct {
 	Memory       Usage   `json:"memory"`                  // checkouts' written files held in memory before they spill to disk
 	MemoryParked int     `json:"memory_parked,omitempty"` // memory files whose write to disk failed, retried every second
 	MemoryError  string  `json:"memory_error,omitempty"`  // the latest such failure while MemoryParked is not 0
+	QueueParked  int     `json:"queue_parked,omitempty"`  // checkouts whose queued changes of the upper on disk failed, retried every second
+	QueueError   string  `json:"queue_error,omitempty"`   // one such failure while QueueParked is not 0
 	BlobCache    Usage   `json:"blob_cache"`              // content-addressed blobs served from memory
 	HeapLive     int64   `json:"heap_live"`               // Go heap the last collection found reachable
 	HeapInUse    int64   `json:"heap_in_use"`             // Go heap spans holding objects: live, not yet collected garbage and fragmentation

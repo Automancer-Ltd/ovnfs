@@ -6,9 +6,14 @@ import (
 	"time"
 )
 
+// setCount stores n in a stat field whose width differs between
+// architectures, such as Nlink.
+func setCount[T ~uint16 | ~uint32 | ~uint64](field *T, n uint32) { *field = T(n) }
+
 // memStat builds linux stat data for a memory file.
 func memStat(i memInfo) any {
-	s := &syscall.Stat_t{Nlink: 1, Uid: i.uid, Gid: i.gid, Ino: uint64(i.id), Size: i.size, Blocks: (i.size + 511) / 512, Blksize: 4096}
+	s := &syscall.Stat_t{Uid: i.uid, Gid: i.gid, Ino: uint64(i.id), Size: i.size, Blocks: (i.size + 511) / 512, Blksize: 4096}
+	setCount(&s.Nlink, i.nlink)
 	s.Mode = unixMode(i.mode)
 	s.Atim = syscall.NsecToTimespec(i.atime.UnixNano())
 	s.Mtim = syscall.NsecToTimespec(i.mtime.UnixNano())
@@ -30,7 +35,7 @@ func birthTime(os.FileInfo) (time.Time, bool) { return time.Time{}, false }
 // effective uid, and the effective gid unless dir is setgid, whose group it
 // then inherits.
 func newOwner(dir os.FileInfo) (uid, gid uint32) {
-	uid, gid = uint32(os.Geteuid()), uint32(os.Getegid())
+	uid, gid = euid, egid
 	if st, ok := dirStat(dir); ok && st.Mode&syscall.S_ISGID != 0 {
 		gid = st.Gid
 	}

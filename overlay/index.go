@@ -196,6 +196,14 @@ func (f *FS) loadIndex() error {
 	if err != nil {
 		return err
 	}
+	// The data wins over a marker beside it; dropping the marker keeps the
+	// index the record of every marker ([FS.mayHoldMarker]).
+	for _, p := range index.shadowed {
+		if err := removeMarker(f.whiteoutPath(p)); err != nil {
+			return err
+		}
+	}
+	index.shadowed = nil
 	if !f.ids.table.empty() {
 		live := make(map[uint64]bool, len(index.entries))
 		for _, e := range index.entries {
@@ -211,6 +219,9 @@ func (f *FS) loadIndex() error {
 		}
 	}
 	index.addOrigins(f.origins)
+	if f.volume.folds() {
+		index.foldNames(f.volume.key)
+	}
 	f.index = index
 	f.pathIDs = make(map[string]inodeKey)
 	f.aliases = make(map[inodeKey]inodeNames)
@@ -259,7 +270,11 @@ func (f *FS) Cool(before time.Time) {
 	}
 	defer f.mu.Unlock()
 	if f.index == nil || f.upper == "" || f.lastAccess.Load() >= before.UnixNano() ||
-		len(f.hosts) != 0 || len(f.files) != 0 || f.memoryHandles != 0 {
+		len(f.hosts) != 0 || len(f.files) != 0 || f.memoryHandles != 0 || len(f.ops) != 0 {
+		return
+	}
+	// A cold lookup reads directory times from the host.
+	if f.settleDirs(f.upper) != nil {
 		return
 	}
 	f.rootInfo, f.origins = f.index.entries[""].Info, f.index.origins()

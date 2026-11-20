@@ -69,7 +69,7 @@ func backing(info os.FileInfo) (idInfo, bool) {
 	if a, ok := info.(aliasInfo); ok {
 		info = a.FileInfo
 	}
-	i, ok := info.(idInfo)
+	i, ok := untimed(info).(idInfo)
 	return i, ok
 }
 
@@ -362,6 +362,36 @@ func (s *synthetic) allocate() (ident.ID, error) {
 	id, _ := ident.New(ident.Synthetic, s.next)
 	s.next++
 	return id, nil
+}
+
+// allocateRun returns the first of up to n consecutive new Synthetic
+// identities and how many there are, persisting a mark past all of them
+// first, so they are never handed out again, after a restart too.
+func (s *synthetic) allocateRun(n uint64) (ident.ID, uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n = min(n, syntheticLimit-s.next)
+	if n == 0 {
+		return 0, 0, errors.New("overlay: synthetic identities exhausted")
+	}
+	if s.next+n > s.reserved {
+		mark := min(s.next+n+syntheticBlock, syntheticLimit)
+		if err := writeAttr(s.root, nextAttr, mark); err != nil && !errors.Is(err, errNoAttr) {
+			return 0, 0, err
+		}
+		s.reserved = mark
+	}
+	id, _ := ident.New(ident.Synthetic, s.next)
+	s.next += n
+	return id, n, nil
+}
+
+// issued reports whether Synthetic identity id was handed out already, by
+// this allocator or one before it on the same upper or its layers.
+func (s *synthetic) issued(id ident.ID) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return id.Space() == ident.Synthetic && id.Value() < s.next
 }
 
 // mark returns the high-water mark a layer frozen from this upper keeps.

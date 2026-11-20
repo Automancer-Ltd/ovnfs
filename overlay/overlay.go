@@ -54,12 +54,27 @@ type FS struct {
 	staging     sync.RWMutex        // shared by an unlocked writeback, see [FS.writeBack]
 	spillLogged atomic.Bool         // the first failed spill is logged, see [Memory.park]
 
-	rootInfo      os.FileInfo       // root attributes while the index is cold
-	cold          coldDirs          // upper directories cold lookups listed, see [FS.lookupRead]
-	origins       map[string]string // rename hints kept while the index is cold
-	lastAccess    atomic.Int64      // Unix nanoseconds of the last index use, see [FS.Cool]
-	memoryHandles int               // open memory handles, including unlinked files'
-	names         atomic.Uint64     // see [FS.Names]
+	rootInfo      os.FileInfo         // root attributes while the index is cold
+	cold          coldDirs            // upper directories cold lookups listed, see [FS.lookupRead]
+	origins       map[string]string   // rename hints kept while the index is cold
+	lastAccess    atomic.Int64        // Unix nanoseconds of the last index use, see [FS.Cool]
+	memoryHandles int                 // open memory handles, including unlinked files'
+	names         atomic.Uint64       // see [FS.Names]
+	volume        nameRule            // what the upper's volume does with names, see names.go
+	unsettled     map[string]struct{} // upper directories whose host time differs from the index's, see [FS.lazyDirs]
+	ops           []*hostOp           // host changes in flight outside mu or queued, oldest first, see [FS.lockPaths]
+	byPath        opIndex             // ops by the names they touch
+	byChange      opIndex             // ops by the names they change
+
+	// The queue of host changes the index made already, see queue.go.
+	queued     int             // queued changes in ops
+	appliers   int             // workers making queued changes, see [FS.applier]
+	parkedOp   *hostOp         // a queued change that failed and is retried
+	parkedErr  error           // its failure
+	parkSignal chan struct{}   // closed and replaced when the queue parks
+	applyLimit *int            // a test's count of changes the applier may still make; nil: any
+	urgent     map[*hostOp]int // queued changes calls wait for, made first, see [FS.next]
+	ready      []*hostOp       // queued changes no older one must precede, oldest first
 }
 
 // Names returns the generation of the overlay's namespace, which advances
@@ -85,7 +100,7 @@ var (
 // read-only. With mem, small written files stay in memory under its budget
 // until they spill into upper (see [Memory]); nil keeps every write on disk.
 func New(upper string, layers []*Layer, bottom Bottom, mem *Memory) (*FS, error) {
-	f := &FS{layers: slices.Clone(layers), bottom: bottom, hosts: make(map[*file]struct{}), writers: make(map[inodeKey]int)}
+	f := &FS{layers: slices.Clone(layers), bottom: bottom, hosts: make(map[*file]struct{}), writers: make(map[inodeKey]int), unsettled: make(map[string]struct{}), parkSignal: make(chan struct{}), urgent: make(map[*hostOp]int)}
 	for _, l := range layers {
 		if l == nil {
 			return nil, errors.New("overlay: nil layer")
@@ -123,6 +138,9 @@ func New(upper string, layers []*Layer, bottom Bottom, mem *Memory) (*FS, error)
 		return nil, err
 	}
 	if err := os.Mkdir(f.work, 0o700); err != nil {
+		return nil, err
+	}
+	if f.volume, err = probeNames(f.work); err != nil {
 		return nil, err
 	}
 	f.index, err = walkLayer(f.upper, true, false, "", f.ids)
@@ -222,8 +240,16 @@ func (f *FS) UpperFile(name string) (os.FileInfo, bool) {
 	if m := f.files[p]; m != nil {
 		return m.info(path.Base(p)), true
 	}
+	if f.changing(p) != nil {
+		// A host operation is changing the name; the index holds it until done.
+		return entry.Info, entry.Info.Mode().IsRegular()
+	}
 	info, err := lstatIndexed(f.up(p), entry.Info)
-	return info, err == nil && info.Mode().IsRegular()
+	if err != nil {
+		return nil, false
+	}
+	info = linksOf(info, entry.Info)
+	return info, info.Mode().IsRegular()
 }
 
 // Stack returns an independent slice of immutable layers, top first.
@@ -240,6 +266,9 @@ func (f *FS) Stack() []*Layer {
 func (f *FS) Freeze(dir string) (*Layer, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.drainLocked(); err != nil {
+		return nil, err
+	}
 	if f.upper == "" {
 		return nil, &fs.PathError{Op: "freeze", Path: dir, Err: syscall.EROFS}
 	}
@@ -248,6 +277,9 @@ func (f *FS) Freeze(dir string) (*Layer, error) {
 	}
 	root, err := filepath.Abs(dir)
 	if err != nil {
+		return nil, err
+	}
+	if err := f.settleDirs(root); err != nil {
 		return nil, err
 	}
 	info, err := statHost(root, f.ids)
@@ -289,13 +321,17 @@ func (f *FS) Freeze(dir string) (*Layer, error) {
 // Empty reports whether the upper has no data or markers outside its work
 // dir and its identity table.
 func (f *FS) Empty() (bool, error) {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.upper == "" {
 		return true, nil
 	}
 	if len(f.files) != 0 {
 		return false, nil
+	}
+	// The upper on disk is complete only once the queue is made.
+	if err := f.drainLocked(); err != nil {
+		return false, err
 	}
 	items, err := os.ReadDir(f.upper)
 	if err != nil {
@@ -441,9 +477,13 @@ func (f *FS) Readlink(name string) (string, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	p := Clean(name)
-	s, _, err := f.lookupRead(p)
+	s, info, err := f.lookupRead(p)
 	if err != nil {
 		return "", err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		// As readlink(2) answers, also for a file held in memory, which no host path holds.
+		return "", &fs.PathError{Op: "readlink", Path: name, Err: syscall.EINVAL}
 	}
 	return f.readlink(s, p)
 }
@@ -626,10 +666,19 @@ func (f *FS) OpenFile(name string, flag int, perm os.FileMode) (billy.File, erro
 	}
 	f.staging.RLock()
 	defer f.staging.RUnlock()
-	f.mu.Lock()
+	// A memory file needs no host state; every other branch waits for the
+	// queue on its name first ([FS.queuedOn]).
+	f.lockSync(Clean(name))
 	defer f.mu.Unlock()
 retry:
 	p := Clean(name)
+	if op := f.busySync(p); op != nil {
+		// Released mu while copying up; another call's host change runs on p.
+		if err := f.waitOp(op); err != nil {
+			return nil, err
+		}
+		goto retry
+	}
 	if !writing && f.index == nil {
 		if h, ok, err := f.openUpperCold(p, flag); ok {
 			return h, err
@@ -676,7 +725,22 @@ retry:
 			return open(target, original, flag, perm, nil)
 		}
 		p = Clean(path.Join(parent(p), target))
+		if op := f.busySync(p); op != nil {
+			if err := f.waitOp(op); err != nil {
+				return nil, err
+			}
+			goto retry
+		}
 		s, info, err = f.lookup(p)
+	}
+	if err == nil && s.upper && f.files[p] == nil && info.Mode().IsRegular() && flag&os.O_TRUNC == 0 && f.lazyDirs() {
+		if op := f.changing(p); op != nil && op.queued {
+			if err := f.waitOp(op); err != nil {
+				return nil, err
+			}
+			goto retry
+		}
+		return f.openOutside(p, original, flag)
 	}
 	if !writing {
 		if err != nil {
@@ -684,6 +748,12 @@ retry:
 		}
 		if m := f.files[p]; m != nil {
 			return f.openMem(m, original, flag)
+		}
+		if op := f.changing(p); op != nil && op.queued && s.upper {
+			if err := f.waitOp(op); err != nil {
+				return nil, err
+			}
+			goto retry
 		}
 		if s.upper {
 			h, err := open(f.up(p), original, flag, 0, nil)
@@ -725,7 +795,20 @@ retry:
 		if m := f.files[p]; m != nil {
 			return f.openMem(m, original, flag)
 		}
+		if op := f.queuedOn(p); op != nil {
+			if err := f.waitOp(op); err != nil {
+				return nil, err
+			}
+			goto retry
+		}
 		if !s.upper {
+			// A refused open must leave the file as it was, so a copy, and a
+			// truncated one, is published only for an open that succeeds.
+			if info.Mode().IsRegular() {
+				if err := ownerAccess(info.Mode(), original, flag); err != nil {
+					return nil, err
+				}
+			}
 			if info.Mode().IsRegular() && flag&os.O_TRUNC != 0 {
 				if err := f.ensureDir(parent(p)); err != nil {
 					return nil, err
@@ -779,17 +862,33 @@ retry:
 		if !errors.Is(err, fs.ErrNotExist) || flag&os.O_CREATE == 0 {
 			return nil, err
 		}
+		if err := f.claimName("open", p, ""); err != nil {
+			return nil, err
+		}
+		if op := f.queuedOn(parent(p)); op != nil && f.index.entries[parent(p)].Kind != KindDir {
+			if err := f.waitOp(op); err != nil {
+				return nil, err
+			}
+			goto retry
+		}
 		if err := f.ensureDir(parent(p)); err != nil {
 			return nil, err
 		}
 		if m := startMem(perm&memModeBits&^umask, 0); m != nil {
 			// A new name changes the parent like a host create; the creating open skips the permission check.
-			if err := f.touchDir(parent(p)); err != nil {
+			if err := f.touchDir(parent(p), false); err != nil {
 				return nil, err
 			}
 			return f.newHandle(m, original, flag), nil
 		}
 	}
+	if op := f.queuedOn(p); op != nil {
+		if err := f.waitOp(op); err != nil {
+			return nil, err
+		}
+		goto retry
+	}
+	marked := f.mayHoldMarker(p)
 	fh, err := open(f.up(p), p, flag, perm, f)
 	if err != nil {
 		return nil, err
@@ -801,13 +900,13 @@ retry:
 		}
 	}
 	if err == nil {
-		err = f.clearWhiteout(p)
+		err = f.clearWhiteout(p, marked)
 	}
 	if err == nil {
 		err = f.refresh(p)
 	}
-	if err == nil {
-		err = f.refresh(parent(p))
+	if err == nil && creating {
+		err = f.touchDir(parent(p), true)
 	}
 	if err != nil {
 		delete(f.hosts, fh)
@@ -822,9 +921,12 @@ retry:
 // TempFile creates a uniquely named upper file in an existing merged directory.
 func (f *FS) TempFile(dir, prefix string) (billy.File, error) {
 	f.await(dir)
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	d := Clean(dir)
+	err := f.lockPaths(d)
+	defer f.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
 	if err := f.mutable("createtemp", d); err != nil {
 		return nil, err
 	}
@@ -847,7 +949,7 @@ func (f *FS) TempFile(dir, prefix string) (billy.File, error) {
 		fh.Close()
 		return nil, err
 	}
-	if err := f.clearWhiteout(p); err != nil {
+	if err := f.clearWhiteout(p, f.mayHoldMarker(p)); err != nil {
 		fh.Close()
 		return nil, err
 	}
@@ -855,7 +957,7 @@ func (f *FS) TempFile(dir, prefix string) (billy.File, error) {
 		fh.Close()
 		return nil, err
 	}
-	if err := f.refresh(d); err != nil {
+	if err := f.touchDir(d, true); err != nil {
 		fh.Close()
 		return nil, err
 	}
@@ -867,9 +969,10 @@ func (f *FS) TempFile(dir, prefix string) (billy.File, error) {
 // MkdirAll creates missing directories, making recreated lower names opaque.
 func (f *FS) MkdirAll(name string, perm os.FileMode) error {
 	f.await(name)
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	p := Clean(name)
+	f.lockSync(p)
+	defer f.mu.Unlock()
+retry:
 	if err := f.mutable("mkdir", p); err != nil {
 		return err
 	}
@@ -891,9 +994,32 @@ func (f *FS) MkdirAll(name string, perm os.FileMode) error {
 		if !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
+		if err := f.claimName("mkdir", q, ""); err != nil {
+			return err
+		}
+		if f.queueable() && f.index.entries[parent(q)].Kind == KindDir && !f.mayHoldMarker(q) {
+			lower, err := f.lowerHas(q)
+			if err != nil {
+				return err
+			}
+			if !lower {
+				if err := f.queueMkdir(q, perm); err == nil {
+					continue
+				} else if !errors.Is(err, errNotQueued) {
+					return err
+				}
+			}
+		}
+		if op := f.queuedOn(q); op != nil {
+			if err := f.waitOp(op); err != nil {
+				return err
+			}
+			goto retry
+		}
 		if err := f.ensureDir(parent(q)); err != nil {
 			return err
 		}
+		marked := f.mayHoldMarker(q)
 		if err := os.Mkdir(f.up(q), perm); err != nil {
 			return err
 		}
@@ -906,10 +1032,10 @@ func (f *FS) MkdirAll(name string, perm os.FileMode) error {
 		if err := f.refresh(q); err != nil {
 			return err
 		}
-		if err := f.placeDir(q, false); err != nil {
+		if err := f.placeDir(q, false, marked); err != nil {
 			return err
 		}
-		if err := f.refresh(parent(q)); err != nil {
+		if err := f.refreshDir(parent(q)); err != nil {
 			return err
 		}
 	}
@@ -919,9 +1045,12 @@ func (f *FS) MkdirAll(name string, perm os.FileMode) error {
 // Mknod creates a socket or FIFO in the writable upper.
 func (f *FS) Mknod(name string, mode os.FileMode) error {
 	f.await(name)
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	p := Clean(name)
+	err := f.lockPaths(p)
+	defer f.mu.Unlock()
+	if err != nil {
+		return err
+	}
 	if err := f.mutable("mknod", p); err != nil {
 		return err
 	}
@@ -933,9 +1062,13 @@ func (f *FS) Mknod(name string, mode os.FileMode) error {
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
+	if err := f.claimName("mknod", p, ""); err != nil {
+		return err
+	}
 	if err := f.ensureDir(parent(p)); err != nil {
 		return err
 	}
+	marked := f.mayHoldMarker(p)
 	if err := makeNode(f.up(p), f.stagingName(), mode); err != nil {
 		return err
 	}
@@ -943,21 +1076,24 @@ func (f *FS) Mknod(name string, mode os.FileMode) error {
 		f.ids.discard(f.up(p))
 		return err
 	}
-	if err := f.clearWhiteout(p); err != nil {
+	if err := f.clearWhiteout(p, marked); err != nil {
 		return err
 	}
 	if err := f.refresh(p); err != nil {
 		return err
 	}
-	return f.refresh(parent(p))
+	return f.touchDir(parent(p), true)
 }
 
 // Symlink creates a symlink without modifying any immutable source.
 func (f *FS) Symlink(target, link string) error {
 	f.await(link)
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	p := Clean(link)
+	err := f.lockPaths(p)
+	defer f.mu.Unlock()
+	if err != nil {
+		return err
+	}
 	if err := f.mutable("symlink", p); err != nil {
 		return err
 	}
@@ -969,9 +1105,13 @@ func (f *FS) Symlink(target, link string) error {
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
+	if err := f.claimName("symlink", p, ""); err != nil {
+		return err
+	}
 	if err := f.ensureDir(parent(p)); err != nil {
 		return err
 	}
+	marked := f.mayHoldMarker(p)
 	if err := os.Symlink(target, f.up(p)); err != nil {
 		return err
 	}
@@ -979,22 +1119,23 @@ func (f *FS) Symlink(target, link string) error {
 		f.ids.discard(f.up(p))
 		return err
 	}
-	if err := f.clearWhiteout(p); err != nil {
+	if err := f.clearWhiteout(p, marked); err != nil {
 		return err
 	}
 	if err := f.refresh(p); err != nil {
 		return err
 	}
-	return f.refresh(parent(p))
+	return f.touchDir(parent(p), true)
 }
 
 // Remove removes a file or merged-empty directory and masks all lower copies.
 func (f *FS) Remove(name string) error {
 	defer f.names.Add(1) // after the removal, see [FS.Names]
 	f.await(name)
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	p := Clean(name)
+	f.lockSync(p)
+	defer f.mu.Unlock()
+retry:
 	if err := f.mutable("remove", p); err != nil {
 		return err
 	}
@@ -1018,12 +1159,45 @@ func (f *FS) Remove(name string) error {
 	if err != nil {
 		return err
 	}
+	// Another name of the file shows its new link count afterwards.
+	alias := f.otherAlias(p)
+	if op := f.busySync(alias); alias != "" && op != nil {
+		if err := f.waitOp(op); err != nil {
+			return err
+		}
+		goto retry
+	}
+	if !lower && f.queueable() {
+		switch {
+		case f.hostFile(p):
+			return f.queueRemove(p, info, alias)
+		case s.upper && info.IsDir() && f.index.entries[p].Kind == KindDir:
+			if err := f.queueRmdir(p, info); !errors.Is(err, errNotQueued) {
+				return err
+			}
+		}
+	}
+	if op := f.queuedOn(nonEmpty(p, alias)...); op != nil && !(f.files[p] != nil && !lower) {
+		// The host change below follows the queued ones on these names.
+		if err := f.waitOp(op); err != nil {
+			return err
+		}
+		goto retry
+	}
+	if !lower && f.hostFile(p) && f.lazyDirs() {
+		return f.removeOutside(p, info, alias)
+	}
+	// A memory file's name may keep a marker on disk, which then stays.
+	marked := f.files[p] != nil && f.files[p].markedAt(p)
+	if s.upper {
+		// Before the marker replaces the entry: another name takes the identity.
+		f.unregister(p)
+	}
 	if lower {
 		if err := f.whiteout(p); err != nil {
 			return err
 		}
 	}
-	alias := f.otherAlias(p)
 	inMem := f.files[p] != nil
 	if s.upper {
 		switch {
@@ -1052,22 +1226,23 @@ func (f *FS) Remove(name string) error {
 			return err
 		}
 	}
-	if lower {
+	if lower || marked {
 		f.index.set(p, Entry{Kind: KindWhiteout})
 	}
-	if inMem {
-		return f.touchDir(parent(p))
+	if info.IsDir() {
+		return f.refreshDir(parent(p))
 	}
-	return f.refresh(parent(p))
+	return f.touchDir(parent(p), !inMem)
 }
 
 // Link creates a hard link after copying an immutable source into upper.
 func (f *FS) Link(oldname, newname string) error {
 	f.await(oldname)
 	f.await(newname)
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	src, dst := Clean(oldname), Clean(newname)
+	f.lockSync(src, dst)
+	defer f.mu.Unlock()
+retry:
 	if err := f.mutable("link", dst); err != nil {
 		return err
 	}
@@ -1086,27 +1261,54 @@ func (f *FS) Link(oldname, newname string) error {
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
+	if err := f.claimName("link", dst, ""); err != nil {
+		return err
+	}
+	inPlace := f.index.entries[parent(dst)].Kind == KindDir
+	if inPlace && f.hostFile(src) && f.queueable() {
+		if err := f.queueLink(src, dst); !errors.Is(err, errNotQueued) {
+			return err
+		}
+	}
+	if m := f.files[src]; m != nil && inPlace && f.queueable() {
+		// Both names reach disk when the file spills.
+		return f.linkMem(m, dst)
+	}
+	if op := f.queuedOn(src, dst); op != nil {
+		if err := f.waitOp(op); err != nil {
+			return err
+		}
+		goto retry
+	}
+	if m := f.files[src]; (f.hostFile(src) || m != nil && len(m.handles) == 0 && len(m.others) == 0) && inPlace && f.lazyDirs() {
+		return f.linkOutside(src, dst)
+	}
 	if err := f.copyUp(src); err != nil {
 		return err
 	}
 	if m := f.files[src]; m != nil {
-		if err := f.spill(m); err != nil {
+		linked := len(m.others) != 0
+		if err := f.spillAs(m, src); err != nil {
 			return err
+		}
+		if linked {
+			goto retry // after the queued links of its other names
 		}
 	}
 	if err := f.ensureDir(parent(dst)); err != nil {
 		return err
 	}
+	marked := f.mayHoldMarker(dst)
 	if err := os.Link(f.up(src), f.up(dst)); err != nil {
 		return err
 	}
-	if err := f.clearWhiteout(dst); err != nil {
+	if err := f.clearWhiteout(dst, marked); err != nil {
 		return err
 	}
 	if err := f.refresh(dst); err != nil {
 		return err
 	}
-	return f.refresh(parent(dst))
+	return f.touchDir(parent(dst), true)
 }
 
 // Rename materializes a merged source tree before moving it entirely in upper.
@@ -1114,9 +1316,10 @@ func (f *FS) Rename(from, to string) error {
 	defer f.names.Add(1) // after the move, see [FS.Names]
 	f.await(from)
 	f.await(to)
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	src, dst := Clean(from), Clean(to)
+	f.lockSync(src, dst)
+	defer f.mu.Unlock()
+retry:
 	if err := f.mutable("rename", src); err != nil {
 		return err
 	}
@@ -1136,6 +1339,11 @@ func (f *FS) Rename(from, to string) error {
 	ds, dinfo, derr := f.lookup(dst)
 	if derr != nil && !errors.Is(derr, fs.ErrNotExist) {
 		return derr
+	}
+	if derr != nil {
+		if err := f.claimName("rename", dst, src); err != nil {
+			return err
+		}
 	}
 	if derr == nil && sameEntry(sinfo, dinfo) {
 		return nil
@@ -1161,6 +1369,29 @@ func (f *FS) Rename(from, to string) error {
 	if err != nil {
 		return err
 	}
+	// Another name of a file it replaces shows the new link count afterwards.
+	dstAlias := f.otherAlias(dst)
+	if op := f.busySync(dstAlias); dstAlias != "" && op != nil {
+		if err := f.waitOp(op); err != nil {
+			return err
+		}
+		goto retry
+	}
+	inPlace := !lower && f.index.entries[parent(dst)].Kind == KindDir
+	if inPlace && f.hostFile(src) && (derr != nil || f.hostFile(dst) && dstAlias == "") && f.queueable() {
+		return f.queueRename(src, dst, dinfo)
+	}
+	// Moving a memory file to a free name or over another changes the index alone.
+	indexOnly := inPlace && f.files[src] != nil && (derr != nil || f.files[dst] != nil)
+	if op := f.queuedOn(nonEmpty(src, dst, dstAlias)...); op != nil && !indexOnly {
+		if err := f.waitOp(op); err != nil {
+			return err
+		}
+		goto retry
+	}
+	if inPlace && f.hostFile(src) && f.lazyDirs() && (derr != nil || f.hostFile(dst) && dstAlias == "") {
+		return f.renameOutside(src, dst, dinfo)
+	}
 	if sinfo.IsDir() {
 		err = f.copyUpTree(src)
 	} else {
@@ -1172,7 +1403,6 @@ func (f *FS) Rename(from, to string) error {
 	if err := f.ensureDir(parent(dst)); err != nil {
 		return err
 	}
-	dstAlias := f.otherAlias(dst)
 	if derr == nil && dinfo.IsDir() && ds.upper {
 		if err := f.ids.release(dinfo); err != nil {
 			return err
@@ -1185,8 +1415,12 @@ func (f *FS) Rename(from, to string) error {
 	// A memory file over an upper file on disk spills first, so the host
 	// rename replaces the old copy atomically and a crash finds one of the two.
 	if m := f.files[src]; m != nil && derr == nil && ds.upper && !dinfo.IsDir() && f.files[dst] == nil {
-		if err := f.spill(m); err != nil {
+		linked := len(m.others) != 0
+		if err := f.spillAs(m, src); err != nil {
 			return err
+		}
+		if linked {
+			goto retry // after the queued links of its other names
 		}
 	}
 	// Any other memory file moves only in the index.
@@ -1202,37 +1436,26 @@ func (f *FS) Rename(from, to string) error {
 			return err
 		}
 	}
-	// Move indexed descendants without traversing the renamed directory on disk.
-	var move func(string, string)
-	move = func(a, b string) {
-		e := f.index.entries[a]
-		if (e.Kind == KindFile || e.Kind == KindSymlink) && e.Origin == "" {
-			e.Origin = a
-		}
-		f.index.set(b, e)
-		f.moveIdentity(a, b)
-		if m := f.files[a]; m != nil {
-			delete(f.files, a)
-			f.files[b], m.path = m, b
-		}
-		for n := range f.index.children[a] {
-			move(path.Join(a, n), path.Join(b, n))
-		}
-	}
+	// A marker of either name stays on disk unless replaced below; a memory
+	// file keeps the one at its new name until it spills ([FS.installed]).
+	dstMarked := f.mayHoldMarker(dst)
+	srcMarked := srcMem && f.files[src].markedAt(src)
 	f.dropIndex(dst)
-	move(src, dst)
+	f.moveEntry(src, dst)
 	f.dropIndex(src)
+	if m := f.files[dst]; m != nil && !sinfo.IsDir() {
+		m.setMarked(dst, dstMarked)
+	}
 	if dstAlias != "" {
 		if err := f.refresh(dstAlias); err != nil {
 			return err
 		}
 	}
 	if sinfo.IsDir() {
-		err = f.placeDir(dst, true)
+		err = f.placeDir(dst, true, dstMarked)
 	} else {
-		// A memory file keeps the marker until it spills ([FS.installed]).
 		if f.files[dst] == nil {
-			err = f.clearWhiteout(dst)
+			err = f.clearWhiteout(dst, dstMarked)
 		}
 		if err == nil {
 			err = f.refresh(dst)
@@ -1245,10 +1468,13 @@ func (f *FS) Rename(from, to string) error {
 		if err := f.whiteout(src); err != nil {
 			return err
 		}
+	} else if srcMarked {
+		f.index.set(src, Entry{Kind: KindWhiteout})
 	}
-	update := f.refresh
-	if srcMem {
-		update = f.touchDir
+	// Moving a directory changes its parents' link counts, which the host keeps.
+	update := func(d string) error { return f.touchDir(d, !srcMem) }
+	if sinfo.IsDir() {
+		update = f.refreshDir
 	}
 	if err := update(parent(src)); err != nil {
 		return err
@@ -1320,9 +1546,13 @@ func (f *FS) Chtimes(name string, atime, mtime time.Time) error {
 // for f.mu.
 func (f *FS) change(name, op string, host func(string) error, mem func(*memFile)) error {
 	f.await(name)
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	p := Clean(name)
+	err := f.lockPaths(p)
+	defer f.mu.Unlock()
+	if err != nil {
+		return err
+	}
+retry:
 	if err := f.mutable(op, p); err != nil {
 		return err
 	}
@@ -1336,7 +1566,20 @@ func (f *FS) change(name, op string, host func(string) error, mem func(*memFile)
 			m.version++
 			return f.refresh(p)
 		}
-		if err := f.spill(m); err != nil {
+		if err := f.spillAs(m, p); err != nil {
+			return err
+		}
+		if op := f.queuedOn(p); op != nil {
+			// The links of its other names come first.
+			if err := f.waitOp(op); err != nil {
+				return err
+			}
+			goto retry
+		}
+	}
+	if _, ok := f.unsettled[p]; ok {
+		// The host change re-reads the directory, whose time must be the index's.
+		if err := f.settleDir(p, f.up(p)); err != nil {
 			return err
 		}
 	}
@@ -1354,8 +1597,12 @@ func (f *FS) mutable(op, p string) error {
 	return f.loadIndex()
 }
 
-// refresh synchronizes one upper entry's metadata without forgetting opacity.
+// refresh synchronizes one upper entry's metadata without forgetting
+// opacity. An unsettled directory keeps its indexed time (see [FS.lazyDirs]).
 func (f *FS) refresh(p string) error {
+	if _, ok := f.unsettled[p]; ok {
+		return f.refreshUnsettled(p)
+	}
 	if m := f.files[p]; m != nil {
 		info := m.info(path.Base(p))
 		f.index.set(p, Entry{Kind: KindFile, Info: info})
@@ -1373,8 +1620,9 @@ func (f *FS) refresh(p string) error {
 // stat reads upper entry p's host metadata with its identity.
 func (f *FS) stat(p string) (os.FileInfo, error) { return statHost(f.up(p), f.ids) }
 
-// placeDir isolates a new or renamed directory from old content beneath it.
-func (f *FS) placeDir(p string, complete bool) error {
+// placeDir isolates a new or renamed directory from old content beneath it;
+// marked is [FS.mayHoldMarker] of p before p took its new entry.
+func (f *FS) placeDir(p string, complete, marked bool) error {
 	lower, err := f.lowerHas(p)
 	if err != nil {
 		return err
@@ -1397,7 +1645,7 @@ func (f *FS) placeDir(p string, complete bool) error {
 			return err
 		}
 	}
-	if err := f.clearWhiteout(p); err != nil {
+	if err := f.clearWhiteout(p, marked); err != nil {
 		return err
 	}
 	return f.refresh(p)
@@ -1421,18 +1669,47 @@ func (f *FS) whiteout(p string) error {
 	return nil
 }
 
-// clearWhiteout drops the deletion marker after a data entry has replaced it.
-func (f *FS) clearWhiteout(p string) error {
-	if p == "" {
+// clearWhiteout drops the deletion marker after a data entry has replaced
+// it; marked is [FS.mayHoldMarker] of p before p took the new entry, and
+// without it there is no marker to remove.
+func (f *FS) clearWhiteout(p string, marked bool) error {
+	if p == "" || !marked {
 		return nil
 	}
-	if err := os.Remove(f.whiteoutPath(p)); err != nil && !missing(err) {
+	if err := removeMarker(f.whiteoutPath(p)); err != nil {
 		return err
 	}
 	if e, ok := f.index.entries[p]; ok && e.Kind == KindWhiteout {
 		f.dropIndex(p)
 	}
 	return nil
+}
+
+// removeMarker removes the deletion marker at host path real, if any.
+func removeMarker(real string) error {
+	if err := os.Remove(real); err != nil && !missing(err) {
+		return err
+	}
+	return nil
+}
+
+// mayHoldMarker reports whether a deletion marker for p may be on disk, for
+// a caller about to give p a new entry. The index records every marker as a
+// whiteout entry, except one a memory file keeps until it spills
+// ([memFile.marked]); loading the index removes markers a crash left beside
+// a data entry.
+func (f *FS) mayHoldMarker(p string) bool {
+	e, ok := f.index.entries[p]
+	switch {
+	case !ok:
+		return false
+	case e.Kind == KindWhiteout:
+		return true
+	}
+	if m := f.files[p]; m != nil {
+		return m.markedAt(p)
+	}
+	return false
 }
 
 // whiteoutPath gives the host path of a name's AUFS marker.
@@ -1477,24 +1754,6 @@ func (f *FS) ensureDir(p string) error {
 		return err
 	}
 	return f.refresh(p)
-}
-
-// preserveDirTime prevents copy-up from invalidating unchanged directory caches.
-func (f *FS) preserveDirTime(d string, fn func() error) error {
-	info, err := os.Lstat(f.up(d))
-	if err != nil {
-		return err
-	}
-	opErr := fn()
-	timeErr := os.Chtimes(f.up(d), info.ModTime(), info.ModTime())
-	refreshErr := f.refresh(d)
-	if opErr != nil {
-		return opErr
-	}
-	if timeErr != nil {
-		return timeErr
-	}
-	return refreshErr
 }
 
 // copyUpBottomForOpen stages an immutable bottom file without holding mu.
@@ -1639,10 +1898,42 @@ func (f *FS) upperInfo(p string, e Entry) (os.FileInfo, error) {
 		return e.Info, nil
 	}
 	// A cold listing's transient view (no pathIDs) has no open descriptors.
-	if key, ok := f.pathIDs[p]; f.pathIDs == nil || ok && f.writers[key] == 0 {
+	key, ok := f.pathIDs[p]
+	if f.pathIDs == nil || ok && f.writers[key] == 0 {
 		return e.Info, nil
 	}
-	return lstatIndexed(f.up(p), e.Info)
+	if f.changing(p) == nil {
+		info, err := lstatIndexed(f.up(p), e.Info)
+		if err != nil {
+			return nil, err
+		}
+		return linksOf(info, e.Info), nil
+	}
+	// The host name is changing or trails the index (queue.go); a writer's
+	// descriptor still reaches the file.
+	if ok && queueHost {
+		for h := range f.hosts {
+			if h.tracked && h.writable && h.inode == key {
+				if info, err := h.File.Stat(); err == nil {
+					return aliasInfo{FileInfo: linksOf(keepIdentity(info, e.Info), e.Info), name: path.Base(p)}, nil
+				}
+			}
+		}
+	}
+	return e.Info, nil
+}
+
+// linksOf returns host metadata info of an upper file with the link count
+// of indexed, the index's metadata of the same file: the index counts the
+// names it shows, which a queued link or unlink has not reached the host
+// with yet (queue.go).
+func linksOf(info, indexed os.FileInfo) os.FileInfo {
+	if d := int(hardLinks(indexed)) - int(hardLinks(info)); d != 0 && queueHost {
+		if relinked, ok := relinked(info, d); ok {
+			return relinked
+		}
+	}
+	return info
 }
 
 // file exposes an OS file with an overlay name. A writable upper descriptor
@@ -1688,7 +1979,7 @@ func (f *FS) adopt(h *file) *file {
 // next generation. Their eventual Close consumes the original close result,
 // so retiring a cached protocol writer does not report a second-close error.
 func (f *FS) CloseFiles() {
-	f.mu.Lock()
+	f.lockSync("")
 	defer f.mu.Unlock()
 	for h := range f.hosts {
 		h.closeErr = h.File.Close()
@@ -1708,7 +1999,8 @@ func (f *file) Close() error {
 	if f.fs == nil {
 		return f.File.Close()
 	}
-	f.fs.mu.Lock()
+	// A parked queued change on its name skips only the metadata refresh.
+	parked := f.fs.lockNames(f)
 	defer f.fs.mu.Unlock()
 	if _, open := f.fs.hosts[f]; !open {
 		if f.ownerClosed {
@@ -1723,7 +2015,9 @@ func (f *file) Close() error {
 		if f.fs.writers[f.inode]--; f.fs.writers[f.inode] <= 0 {
 			delete(f.fs.writers, f.inode)
 		}
-		f.syncInfo()
+		if parked == nil {
+			f.syncInfo()
+		}
 	}
 	return err
 }
@@ -1760,7 +2054,10 @@ func (f *file) Chmod(mode os.FileMode) error {
 	if f.fs == nil {
 		return f.File.Chmod(mode)
 	}
-	f.fs.mu.Lock()
+	if err := f.fs.lockNames(f); err != nil {
+		f.fs.mu.Unlock()
+		return err
+	}
 	defer f.fs.mu.Unlock()
 	err := f.File.Chmod(mode)
 	if err == nil {
@@ -1779,7 +2076,10 @@ func (f *file) Chown(uid, gid int) error {
 	if f.fs == nil {
 		return f.File.Chown(uid, gid)
 	}
-	f.fs.mu.Lock()
+	if err := f.fs.lockNames(f); err != nil {
+		f.fs.mu.Unlock()
+		return err
+	}
 	defer f.fs.mu.Unlock()
 	err := f.File.Chown(uid, gid)
 	f.syncInfo()

@@ -66,7 +66,12 @@ type Layer struct {
 	dir      string
 	entries  map[string]Entry
 	children map[string]map[string]Entry
-	gits     map[string]bool   // paths of entries named .git, see [Layer.GitEntries]
+	gits     map[string]bool // paths of entries named .git, see [Layer.GitEntries]
+	// fold, set on a mutable upper whose volume takes different names for
+	// one entry, gives the form of a name under which the volume finds it;
+	// folded maps each entry's [foldedPath] to its path, see [FS.claimName].
+	fold     func(string) string
+	folded   map[string]string
 	storing  sync.Mutex        // serializes [Layer.Store]
 	mu       sync.RWMutex      // guards blobs, ids and tree; held shared while raw files are read, see [Layer.Content]
 	blobs    Blobs             // nil while every entry is raw
@@ -82,6 +87,8 @@ type Layer struct {
 
 	synthetic uint64 // Synthetic high-water mark of the upper the layer was, see [synthetic]
 	legacy    uint64 // key of hashed identities of a version 1 manifest, see [legacyIdentity]
+
+	shadowed []string // a live upper's names whose deletion marker a crash left beside their data, see [FS.loadIndex]
 
 	locating sync.Once             // builds byID and moreIDs on the index's first [Layer.locate]
 	byID     map[ident.ID]string   // a path of each identity
@@ -169,12 +176,17 @@ func walkLayer(dir string, live, recursive bool, listing string, ids *idStore) (
 		case strings.HasPrefix(n, metaPrefix):
 		case strings.HasPrefix(n, whPrefix):
 			q := path.Join(parent(p), strings.TrimPrefix(n, whPrefix))
-			if _, ok := l.entries[q]; !ok {
+			if e, ok := l.entries[q]; !ok {
 				l.set(q, Entry{Kind: KindWhiteout})
+			} else if live && e.Kind != KindWhiteout {
+				l.shadowed = append(l.shadowed, q)
 			}
 		default:
 			if info, err = describe(real, info, ids); err != nil {
 				return err
+			}
+			if live && l.entries[p].Kind == KindWhiteout {
+				l.shadowed = append(l.shadowed, p)
 			}
 			l.set(p, entry(info))
 			if info.IsDir() && !recursive && p != listing && !strings.HasPrefix(listing, p+"/") {
@@ -299,6 +311,14 @@ func (l *Layer) set(p string, e Entry) {
 		e.Origin = l.entries[p].Origin
 	}
 	l.entries[p] = e
+	if l.fold != nil && p != "" {
+		k := foldedPath(parent(p), l.fold(path.Base(p)))
+		if e.Kind != KindWhiteout {
+			l.folded[k] = p
+		} else if l.folded[k] == p {
+			delete(l.folded, k)
+		}
+	}
 	if path.Base(p) == ".git" {
 		if l.gits == nil {
 			l.gits = make(map[string]bool)
@@ -314,6 +334,18 @@ func (l *Layer) set(p string, e Entry) {
 	}
 }
 
+// foldNames makes the index of a mutable upper find its entries by the
+// form fold gives their names, see [FS.claimName].
+func (l *Layer) foldNames(fold func(string) string) {
+	l.fold = fold
+	l.folded = make(map[string]string, len(l.entries))
+	for p, e := range l.entries {
+		if p != "" && e.Kind != KindWhiteout {
+			l.folded[foldedPath(parent(p), fold(path.Base(p)))] = p
+		}
+	}
+}
+
 // drop removes a mutable upper subtree from both indexes.
 func (l *Layer) drop(p string) {
 	for n := range l.children[p] {
@@ -322,6 +354,11 @@ func (l *Layer) drop(p string) {
 	delete(l.children, p)
 	delete(l.entries, p)
 	delete(l.gits, p)
+	if l.fold != nil && p != "" {
+		if k := foldedPath(parent(p), l.fold(path.Base(p))); l.folded[k] == p {
+			delete(l.folded, k)
+		}
+	}
 	if p != "" {
 		delete(l.children[parent(p)], path.Base(p))
 	}
