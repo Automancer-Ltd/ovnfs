@@ -4,43 +4,15 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"testing"
 
 	"github.com/stencil-hq/ovnfs/api"
 	"github.com/stencil-hq/ovnfs/base"
-	"github.com/stencil-hq/ovnfs/internal/clone"
+	"github.com/stencil-hq/ovnfs/internal/ident"
 	"github.com/stencil-hq/ovnfs/watch"
 )
-
-// sharesBlocks reports whether the test's folders and state can share blocks:
-// where they cannot, cache roots of snapshots start empty.
-func sharesBlocks(t *testing.T) bool {
-	t.Helper()
-	dir := t.TempDir()
-	write(t, filepath.Join(dir, "probe"), "probe")
-	in, err := os.Open(filepath.Join(dir, "probe"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer in.Close()
-	err = clone.Reflink(in, filepath.Join(dir, "clone"), 0o644)
-	if errors.Is(err, errors.ErrUnsupported) {
-		return false
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-	return true
-}
-
-// cached is want where cache roots hold the folder's content, else "<absent>".
-func cached(t *testing.T, want string) string {
-	if sharesBlocks(t) {
-		return want
-	}
-	return "<absent>"
-}
 
 // checkoutCaches returns the cache snapshot checkout name reads, its base's
 // folder and the snapshots on the base's disk.
@@ -59,17 +31,16 @@ func (f *fixture) checkoutCaches(name string) (id, dir string, onDisk []string) 
 	return h.meta.Caches, h.base.view.Meta().Dir, ids
 }
 
-// TestCacheSnapshotsIsolateCheckouts keeps a checkout's cache roots as its
-// snapshot holds them however the folder changes; a checkout opened after the
-// folder changed there gets a newer snapshot while older checkouts keep
-// theirs, those opened without further changes share one, and a snapshot no
-// checkout uses is removed. A folder change never invalidates a checkout.
+// TestCacheSnapshotsIsolateCheckouts fences a checkout's cache roots at its
+// snapshot however the folder changes: what the folder rewrites or removes
+// leaves the checkout, never changes in it, and nothing it adds appears. A
+// checkout opened after the folder changed there gets a newer snapshot while
+// older checkouts keep theirs, those opened without further changes share
+// one, and a snapshot no checkout uses is removed. A folder change never
+// invalidates a checkout.
 func TestCacheSnapshotsIsolateCheckouts(t *testing.T) {
 	f := newFixture(t)
-	if !sharesBlocks(t) {
-		t.Skip("the volume cannot clone: cache roots start empty")
-	}
-	dir := folder(t, map[string]string{"src/main": "one", "target/out": "one", "target/gone": "gone"})
+	dir := folder(t, map[string]string{"src/main": "one", "target/out": "one", "target/kept": "kept", "target/gone": "gone"})
 	f.newCheckout(dir, "a", "cache dir & target")
 	first, root, _ := f.checkoutCaches("a")
 	invalidated := len(f.invalidations())
@@ -80,7 +51,7 @@ func TestCacheSnapshotsIsolateCheckouts(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.reg.folderChanged([]watch.Change{{Path: filepath.Join(root, "target", "out")}})
-	for p, want := range map[string]string{"target/out": "one", "target/new": "<absent>", "target/gone": "gone", "src/main": "one"} {
+	for p, want := range map[string]string{"target/out": "<absent>", "target/new": "<absent>", "target/gone": "<absent>", "target/kept": "kept", "src/main": "one"} {
 		if got := f.read("a", p); got != want {
 			t.Errorf("a: %s = %q after the folder changed, want %q", p, got, want)
 		}
@@ -94,13 +65,13 @@ func TestCacheSnapshotsIsolateCheckouts(t *testing.T) {
 	if second == first {
 		t.Fatal("a checkout opened after the folder changed its cache root shares the older snapshot")
 	}
-	for p, want := range map[string]string{"target/out": "two", "target/new": "new", "target/gone": "<absent>"} {
+	for p, want := range map[string]string{"target/out": "two", "target/new": "new", "target/kept": "kept", "target/gone": "<absent>"} {
 		if got := f.read("b", p); got != want {
 			t.Errorf("b: %s = %q, want %q", p, got, want)
 		}
 	}
-	if got := f.read("a", "target/out"); got != "one" {
-		t.Errorf("a: target/out = %q after b opened, want its own one", got)
+	if got := f.read("a", "target/out"); got != "<absent>" {
+		t.Errorf("a: target/out = %q after b opened, want it to stay gone", got)
 	}
 
 	// Checkouts opened while the folder does not change share one snapshot.
@@ -127,11 +98,111 @@ func TestCacheSnapshotsIsolateCheckouts(t *testing.T) {
 	})
 }
 
+// TestCheckoutOwnsWhatItChangedBelowACacheRoot checks that a cache file a
+// checkout wrote to is its own from then on, a copy in its upper that
+// starts from the folder's content, and that one it removed stays removed:
+// what the folder does to its files afterwards reaches neither.
+func TestCheckoutOwnsWhatItChangedBelowACacheRoot(t *testing.T) {
+	f := newFixture(t)
+	dir := folder(t, map[string]string{"src/main": "one", "target/log": "built\n", "target/dropped": "x"})
+	f.newCheckout(dir, "a", "cache dir & target")
+	var s Session
+	if err := f.reg.Enter("a", &s); err != nil {
+		t.Fatal(err)
+	}
+	log, err := s.FS.OpenFile("target/log", os.O_WRONLY|os.O_APPEND, 0)
+	if err == nil {
+		_, err = log.Write([]byte("checked\n"))
+		err = errors.Join(err, log.Close())
+	}
+	s.Done()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.remove("a", "target/dropped")
+
+	write(t, filepath.Join(dir, "target/log"), "rebuilt\n")
+	write(t, filepath.Join(dir, "target/dropped"), "back")
+	for p, want := range map[string]string{"target/log": "built\nchecked\n", "target/dropped": "<absent>"} {
+		if got := f.read("a", p); got != want {
+			t.Errorf("%s = %q after the folder changed its own, want %q", p, got, want)
+		}
+	}
+}
+
+// TestHardLinksBelowACacheRootPartOnWrite checks two names of one folder
+// file below a cache root, as cargo links an artifact into deps/ and beside
+// it. A checkout shows them as the one file they are, with one identity. The
+// first name it writes to takes that identity into its copy, so a handle on
+// the file follows it; the second is by then another file, and its copy gets
+// an identity of its own instead of a second claim to the first's.
+func TestHardLinksBelowACacheRootPartOnWrite(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows file information has no link count or identity to share")
+	}
+	f := newFixture(t)
+	dir := folder(t, map[string]string{"src/main": "one", "target/deps/app-1a2b": "built\n"})
+	if err := os.Link(filepath.Join(dir, "target/deps/app-1a2b"), filepath.Join(dir, "target/app")); err != nil {
+		t.Fatal(err)
+	}
+	f.newCheckout(dir, "a", "cache dir & target")
+	var s Session
+	if err := f.reg.Enter("a", &s); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Done()
+	identity := func(p string) ident.ID {
+		t.Helper()
+		info, err := s.FS.Lstat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, ok := ident.Of(info)
+		if !ok {
+			t.Fatalf("%s has no identity", p)
+		}
+		return id
+	}
+	extend := func(p, data string) {
+		t.Helper()
+		file, err := s.FS.OpenFile(p, os.O_WRONLY|os.O_APPEND, 0)
+		if err == nil {
+			_, err = file.Write([]byte(data))
+			err = errors.Join(err, file.Close())
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	shared := identity("target/app")
+	if got := identity("target/deps/app-1a2b"); got != shared {
+		t.Fatalf("two names of one folder file have identities %v and %v", shared, got)
+	}
+
+	extend("target/app", "stripped\n")
+	if got := identity("target/app"); got != shared {
+		t.Errorf("the first name written has identity %v, want the %v a handle on it holds", got, shared)
+	}
+	if p, ok := s.FS.Locate(shared); !ok || p != "target/app" {
+		t.Errorf("the shared identity resolves to %q, %v; want the copy that took it", p, ok)
+	}
+	extend("target/deps/app-1a2b", "signed\n")
+	if got := identity("target/deps/app-1a2b"); got == shared {
+		t.Errorf("the second name written claims identity %v, which the first holds", got)
+	}
+	for p, want := range map[string]string{"target/app": "built\nstripped\n", "target/deps/app-1a2b": "built\nsigned\n"} {
+		if got := f.read("a", p); got != want {
+			t.Errorf("%s = %q, want %q", p, got, want)
+		}
+	}
+}
+
 // TestCacheSnapshotsSurviveRestart reopens a checkout on its own snapshot, not
-// the folder as it is then, and removes snapshots on disk no checkout names.
+// the folder as it is then: its local roots as copied and its cache roots
+// behind the same fence. It removes snapshots on disk no checkout names.
 func TestCacheSnapshotsSurviveRestart(t *testing.T) {
 	f := newFixture(t)
-	dir := folder(t, map[string]string{"src/main": "one", "target/out": "one", ".env": "SECRET=1"})
+	dir := folder(t, map[string]string{"src/main": "one", "target/out": "one", "target/kept": "kept", ".env": "SECRET=1"})
 	f.newCheckout(dir, "a", "cache dir & target")
 	id, _, _ := f.checkoutCaches("a")
 	if id == "" {
@@ -153,7 +224,7 @@ func TestCacheSnapshotsSurviveRestart(t *testing.T) {
 	if got, _, _ := f.checkoutCaches("a"); got != id {
 		t.Fatalf("reopened checkout reads snapshot %q, want %q", got, id)
 	}
-	for p, want := range map[string]string{"target/out": cached(t, "one"), ".env": "SECRET=1"} {
+	for p, want := range map[string]string{"target/out": "<absent>", "target/kept": "kept", ".env": "SECRET=1"} {
 		if got := f.read("a", p); got != want {
 			t.Errorf("%s = %q after a restart, want the snapshot's %q", p, got, want)
 		}

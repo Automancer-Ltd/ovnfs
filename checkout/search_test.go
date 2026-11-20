@@ -62,9 +62,6 @@ func TestSearchMergedCheckoutWithoutMount(t *testing.T) {
 // checkout's cache snapshot holds them, not the folder as it is now.
 func TestSearchIgnoreRulesAndSnapshotPaths(t *testing.T) {
 	f := newFixture(t)
-	if !sharesBlocks(t) {
-		t.Skip("the volume cannot clone: cache roots start empty")
-	}
 	dir := folder(t, map[string]string{
 		".gitignore": "ignored/\n", "keep.txt": "needle\n", "ignored/local.txt": "needle\n",
 		".hidden.txt": "needle\n", "secret.txt": "needle\n", "node_modules/pkg/index.js": "needle\n",
