@@ -266,20 +266,13 @@ func (s *Server) write3(d *decoder, res *encoder) status {
 	if err != nil {
 		return statusOf(err)
 	}
-	typ := typeOf(info.Mode())
-	if typ == typeLnk {
-		// A write through a symlink changes its target, not the handle's id.
-		if info, err = s.FS.Stat(p); err != nil {
-			return statusOf(err)
-		}
-	}
 	if !info.Mode().IsRegular() {
 		return stInval
 	}
 	pre := attrsOf(id, info)
-	s.Recall(id)
+	s.recallAttrs(id, pre.typ)
 	n, err := s.writeAt3(id, gen, p, data[:min(len(data), int(count))], int64(off), how != unstable3)
-	s.Recall(id)
+	s.recallAttrs(id, pre.typ)
 	if err != nil {
 		return statusOf(err)
 	}
