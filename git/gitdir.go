@@ -267,12 +267,16 @@ type configEntry struct{ key, value string }
 // editConfig rewrites git config text as git config --file would: every
 // occurrence of set's and unset's variables in section (no subsection, names
 // compared case-insensitively) is removed, then set's entries are placed right
-// after the section's first header, or in a new section at the end. Every other
-// line, comments and subsections included, is kept; "[section] key = old" keeps
-// its header and loses the old value.
+// after the first header of section that no other section's header follows on
+// its line, or in a new section at the end. Every other line, comments and
+// subsections included, is kept; "[section] key = old" keeps its header and
+// loses the old value.
+//
+// It reads the text the way git does (see configItems), so a variable is the
+// physical lines from its name to the end of its value. It never fails: text git
+// would reject is kept as is.
 func editConfig(config, section string, set []configEntry, unset ...string) string {
-	drop := func(line string) bool {
-		key := configKey(line)
+	drop := func(key string) bool {
 		for _, e := range set {
 			if strings.EqualFold(key, e.key) {
 				return true
@@ -285,74 +289,56 @@ func editConfig(config, section string, set []configEntry, unset ...string) stri
 		}
 		return false
 	}
-	var out []string
-	insert, inSection, continued := -1, false, false
-	for _, line := range strings.SplitAfter(config, "\n") {
-		if line == "" {
-			continue
-		}
-		if continued {
-			continued = continuesLine(line)
-			continue
-		}
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "[") {
-			end := strings.IndexByte(trimmed, ']')
-			if end < 0 {
-				inSection = false
-				out = append(out, line)
-				continue
-			}
-			inSection = strings.EqualFold(strings.TrimSpace(trimmed[1:end]), section)
-			if inSection && drop(trimmed[end+1:]) {
-				continued = continuesLine(line)
-				line = trimmed[:end+1] + "\n"
-			}
-			out = append(out, line)
-			if inSection && insert < 0 {
-				insert = len(out)
-			}
-			continue
-		}
-		if inSection && drop(trimmed) {
-			continued = continuesLine(line)
-			continue
-		}
-		out = append(out, line)
-	}
-	if len(set) == 0 {
-		return strings.Join(out, "")
-	}
-	entries := make([]string, 0, len(set))
+	var entries strings.Builder
 	for _, e := range set {
-		entries = append(entries, "\t"+e.key+" = "+configValue(e.value)+"\n")
+		entries.WriteString("\t" + e.key + " = " + configValue(e.value) + "\n")
 	}
-	if insert < 0 {
-		if n := len(out); n != 0 && !strings.HasSuffix(out[n-1], "\n") {
-			out[n-1] += "\n"
+	var edits []configEdit
+	inSection, found := false, false
+	// The entries go after the first target header and whatever shares its lines
+	// (a variable after it, a continued value): the group runs to groupEnd. With
+	// no such header they go into a new section at the end.
+	groupEnd := -1
+	insertAfterGroup := func() {
+		if len(set) > 0 {
+			edits = append(edits, configEdit{from: groupEnd, to: groupEnd, repl: entries.String(), insert: true})
 		}
-		out = append(append(out, "["+section+"]\n"), entries...)
-	} else {
-		out = append(out[:insert], append(entries, out[insert:]...)...)
+		groupEnd = -1
 	}
-	return strings.Join(out, "")
-}
-
-// configKey returns the variable name a config line inside a section sets.
-func configKey(line string) string {
-	line = strings.TrimSpace(line)
-	if i := strings.IndexAny(line, "= \t"); i >= 0 {
-		return line[:i]
+	for it := range configItems(config) {
+		if groupEnd >= 0 {
+			if it.at >= groupEnd {
+				insertAfterGroup()
+			} else {
+				groupEnd = max(groupEnd, it.endOfLine(config))
+			}
+		}
+		switch it.kind {
+		case configHeader:
+			inSection = it.plainSection(section)
+			if groupEnd >= 0 && !inSection {
+				// Another header shares the first target header's line: the entries
+				// would land inside it, so a later target header takes them instead,
+				// or a new section at the end.
+				found, groupEnd = false, -1
+			}
+			if inSection && !found {
+				found, groupEnd = true, it.endOfLine(config)
+			}
+		case configVariable:
+			if inSection && drop(it.name) {
+				edits = append(edits, dropConfigVariable(config, it))
+			}
+		}
 	}
-	return line
-}
-
-// continuesLine reports whether a config line ends in an unescaped backslash, which
-// continues its value on the next line.
-func continuesLine(line string) bool {
-	line = strings.TrimRight(line, "\r\n")
-	n := len(line) - len(strings.TrimRight(line, `\`))
-	return n%2 == 1
+	if groupEnd >= 0 {
+		insertAfterGroup()
+	}
+	text := applyConfigEdits(config, edits)
+	if len(set) == 0 || found {
+		return text
+	}
+	return endConfigText(text) + "[" + section + "]\n" + entries.String()
 }
 
 // configValue spells a git config value, quoting and escaping it when git would

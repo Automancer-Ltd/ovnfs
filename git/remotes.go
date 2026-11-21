@@ -146,66 +146,63 @@ func (r *Repo) deleteTracking(ctx context.Context, names []string) error {
 // includeConfig returns git config text with an "[include] path = value"
 // entry, appended unless one exists, when want is set, and without any when it
 // is not; an [include] section the removal leaves empty goes too. Every other
-// line is kept.
+// line is kept. The text is read the way git reads it (see configItems).
 func includeConfig(config, value string, want bool) string {
-	var out []string
-	found, continued := false, false
-	inInclude, removed, kept, header := false, false, 0, 0
+	var edits []configEdit
+	found, inInclude := false, false
+	var removed, kept int
+	// header is the span of the section's header line; inline is the index of the
+	// edit that removed a path from that line, or -1.
+	var header configEdit
+	var droppable bool
+	inline := -1
 	closeSection := func() {
-		if inInclude && removed && kept == 0 {
-			out = slices.Delete(out, header, header+1)
+		if !inInclude || removed == 0 || kept != 0 || !droppable {
+			return
+		}
+		if inline >= 0 {
+			edits[inline].repl = ""
+		} else {
+			edits = append(edits, header)
 		}
 	}
-	for line := range strings.Lines(config) {
-		if continued {
-			continued = continuesLine(line)
-			kept++
-			out = append(out, line)
-			continue
-		}
-		continued = continuesLine(line)
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "[") {
+	for it := range configItems(config) {
+		switch it.kind {
+		case configHeader:
 			closeSection()
-			end := strings.IndexByte(trimmed, ']')
-			inInclude = end > 0 && strings.EqualFold(strings.TrimSpace(trimmed[1:end]), "include") && strings.TrimSpace(trimmed[end+1:]) == ""
-			removed, kept, header = false, 0, len(out)
-			out = append(out, line)
-			continue
-		}
-		if inInclude && strings.EqualFold(configKey(trimmed), "path") && entryValue(trimmed) == value {
-			found = true
-			if !want {
-				removed = true
-				continue
+			inInclude = it.plainSection("include")
+			removed, kept, inline = 0, 0, -1
+			from := configLineStart(config, it.at)
+			header = configEdit{from: from, to: it.endOfLine(config)}
+			droppable = isConfigBlank(config[from:it.at])
+		case configComment:
+			if inInclude {
+				kept++
+			}
+		case configVariable:
+			if inInclude && strings.EqualFold(it.name, "path") && configVariableValue(config, it) == value {
+				found = true
+				if !want {
+					removed++
+					edit := dropConfigVariable(config, it)
+					if edit.repl != "" {
+						inline = len(edits)
+					}
+					edits = append(edits, edit)
+					continue
+				}
+			}
+			if inInclude {
+				kept++
 			}
 		}
-		if trimmed != "" {
-			kept++
-		}
-		out = append(out, line)
 	}
 	closeSection()
+	text := applyConfigEdits(config, edits)
 	if want && !found {
-		if n := len(out); n != 0 && !strings.HasSuffix(out[n-1], "\n") {
-			out[n-1] += "\n"
-		}
-		out = append(out, "[include]\n", "\tpath = "+configValue(value)+"\n")
+		text = endConfigText(text) + "[include]\n\tpath = " + configValue(value) + "\n"
 	}
-	return strings.Join(out, "")
-}
-
-// entryValue returns the value a "key = value" config line sets, unquoted when
-// the whole value is one quoted string.
-func entryValue(line string) string {
-	_, value, _ := strings.Cut(line, "=")
-	value = strings.TrimSpace(value)
-	if unquoted, ok := strings.CutPrefix(value, `"`); ok {
-		if unquoted, ok = strings.CutSuffix(unquoted, `"`); ok {
-			return unquoted
-		}
-	}
-	return value
+	return text
 }
 
 // writeIfChanged replaces file name with data, mode 0644, unless it holds data already.

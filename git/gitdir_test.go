@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -17,7 +18,7 @@ func TestMarkCheckout(t *testing.T) {
 	}
 	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
-	get := func(config string, args ...string) string {
+	get := func(t *testing.T, config string, args ...string) string {
 		t.Helper()
 		out, err := exec.Command("git", append([]string{"config", "--file", config}, args...)...).CombinedOutput()
 		if err != nil {
@@ -30,6 +31,21 @@ func TestMarkCheckout(t *testing.T) {
 		"inherited marker":             "[core]\n\tbare = false\n[ovnfs]\n\tcheckout = parent\n[user]\n\tname = me\n",
 		"inline and continued marker":  "[OVNFS] Checkout = parent\n[core]\n\tbare = false\n[ovnfs]\n\tcheckout = par\\\nent\n\tother = kept\n",
 		"subsection kept":              "[ovnfs \"sub\"]\n\tcheckout = other\n[ovnfs]\n\t; checkout = commented\n\tcheckout = parent\n",
+		"comment ending in backslash":  "[ovnfs]\n\tcheckout = /x ; old \\\n\tfoo = keep\n",
+		"kept continuation":            "[ovnfs]\n\tnote = a\\\n\tcheckout = b\n[core]\n\tbare = false\n",
+		"continued quoted value":       "[ovnfs]\n\tnote = \"a \\\n; b # c\"\n\tcheckout = parent\n[core]\n\tbare = false\n",
+		"escaped backslash at end":     "[ovnfs]\n\tnote = a\\\\\n\tcheckout = parent\n[core]\n\tbare = false\n",
+		"quoted bracket in header":     "[ovnfs \"a]b\"] checkout = x\n[ovnfs]\n\tcheckout = parent\n[core]\n\tbare = false\n",
+		"inline variable after header": "[ovnfs] checkout = x\n\tfoo = keep\n[core]\n\tbare = false\n",
+		"header value continued":       "[ovnfs] note = a \\\n\tcheckout = b\n[core]\n\tbare = false\n",
+		"continued to end of file":     "[alias]\n\tst = status --short\\\n",
+		"backslash at end of file":     "[alias]\n\tst = status --short\\",
+		"header value to end of file":  "[ovnfs] note = a\\\n",
+		"two headers on a line":        "[user]\n\tname = me\n[core][ovnfs] checkout = old\n",
+		"target header before another": "[ovnfs][core] bare = true\n",
+		"target header between others": "[ovnfs][core][ovnfs] checkout = x\n",
+		"byte order mark":              "\xef\xbb\xbf[ovnfs]\n\tcheckout = old\n[core]\n\tbare = false\n",
+		"CRLF continuation":            "[ovnfs]\r\n\tcheckout = par\\\r\nent\r\n\tfoo = keep\r\n[core]\r\n\tbare = false\r\n",
 	}
 	for name, config := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -44,24 +60,26 @@ func TestMarkCheckout(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				before := get(file, "--list")
+				before := get(t, file, "--list")
 				if err := MarkCheckout(dir, marker); err != nil {
 					t.Fatal(err)
 				}
-				if got := get(file, "--get-all", "ovnfs.checkout"); got != marker {
+				if got := get(t, file, "--get-all", "ovnfs.checkout"); got != marker {
 					t.Fatalf("marker = %q, want %q", got, marker)
 				}
-				var kept []string
-				for _, line := range strings.Split(before, "\n") {
-					if !strings.HasPrefix(line, "ovnfs.checkout=") {
-						kept = append(kept, line)
+				withoutMarker := func(list string) []string {
+					var rest []string
+					for _, line := range strings.Split(list, "\n") {
+						if !strings.HasPrefix(line, "ovnfs.checkout=") {
+							rest = append(rest, line)
+						}
 					}
+					return rest
 				}
-				after := get(file, "--list")
-				for _, line := range kept {
-					if !strings.Contains(after, line) {
-						t.Fatalf("lost %q:\n%s", line, after)
-					}
+				kept := withoutMarker(before)
+				after := get(t, file, "--list")
+				if got := withoutMarker(after); !slices.Equal(got, kept) {
+					t.Fatalf("variables changed:\nbefore %q\nafter  %q", kept, got)
 				}
 				info, err := os.Stat(file)
 				if err != nil || info.Mode().Perm() != created.Mode().Perm() {
