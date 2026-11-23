@@ -426,7 +426,6 @@ type approx struct {
 	yesterday    bool
 	today        bool
 	backIfFuture bool // "noon"/"tea" without a day mean the last one passed
-	monthNamed   bool // month set by name or loose number: future means last year
 }
 
 func parseApproxDate(toks []dateTok, now time.Time) time.Time {
@@ -462,11 +461,7 @@ func (a *approx) flush() {
 	}
 	n, l := a.pending, a.pendingLen
 	a.pending = -1
-	month := a.f.month
 	a.f.number(n, l, a.now)
-	if a.f.month != month {
-		a.monthNamed = true
-	}
 }
 
 func (a *approx) numberTok(t dateTok) {
@@ -545,7 +540,6 @@ func (a *approx) word(w string) {
 	a.flush()
 	if m := monthIndex(w); m > 0 {
 		a.f.month = m
-		a.monthNamed = true
 		return
 	}
 	switch w {
@@ -607,7 +601,10 @@ func (a *approx) result() time.Time {
 		a.dateSet = true
 	}
 	if f.month >= 0 {
-		if f.year < 0 && a.monthNamed && f.month > int(month) {
+		// A month after now's without a year is last year's, as git's
+		// update_tm has it: named, loose or in a slash date, which the
+		// ten-day rule lets past a month's end ("12/1" late in November).
+		if f.year < 0 && f.month > int(month) {
 			year--
 		}
 		month = time.Month(f.month)

@@ -45,6 +45,16 @@ var dateInputs = []string{
 	"1/1/38", "1/1/70", "1/1/00", "05",
 }
 
+// TestParseDateSlashDateLastYear pins, whatever the calendar, git's reading of
+// a slash date that the ten-day rule lets past the month's end: "12/1" on 23
+// November is last December's first, at now's time of day.
+func TestParseDateSlashDateLastYear(t *testing.T) {
+	now := time.Date(2026, 11, 23, 10, 0, 0, 0, time.UTC)
+	if got, want := ParseDate("12/1", now), time.Date(2025, 12, 1, 10, 0, 0, 0, time.UTC); !got.Equal(want) {
+		t.Fatalf("ParseDate(%q) = %v, want %v", "12/1", got, want)
+	}
+}
+
 // TestParseDateMatchesGit compares ParseDate with the timestamp git prints for
 // `git rev-parse --since=<date>`, in zones with and without DST. Git reads the
 // clock itself, so the result must lie between ParseDate at the instants just
