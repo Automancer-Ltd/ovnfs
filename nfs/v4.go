@@ -2,8 +2,11 @@ package nfs
 
 import (
 	"bytes"
+	"os"
 	"path"
 	"strings"
+
+	"github.com/go-git/go-billy/v5"
 )
 
 // NFSv4.0 (RFC 7530): NULL and COMPOUND. A COMPOUND's operations run in
@@ -353,6 +356,29 @@ func (x *v4compound) handleGen(cur *v4fh) uint64 {
 	return cur.gen
 }
 
+// follow describes the file filehandle fh names, following it when a rename
+// moved it from fh.path ([Server.describe]); fh.path becomes where it is,
+// for the COMPOUND's later operations.
+func (x *v4compound) follow(fh *v4fh) (os.FileInfo, status) {
+	p, info, err := x.s.describe(fh.id, x.handleGen(fh), fh.path)
+	if err != nil {
+		return nil, statusOf(err)
+	}
+	fh.path = p
+	return info, stOK
+}
+
+// openFollowed opens the file filehandle fh names with flag, which neither
+// creates nor truncates, following it as follow does
+// ([Server.openHandle]), and describes the open file.
+func (x *v4compound) openFollowed(fh *v4fh, flag int) (billy.File, os.FileInfo, error) {
+	f, p, info, err := x.s.openHandle(fh.id, x.handleGen(fh), fh.path, flag)
+	if err == nil {
+		fh.path = p
+	}
+	return f, info, err
+}
+
 // setCurrent makes file id, at p, the current filehandle. An id of 0 (none
 // could be determined) fails the operation IO (see compound).
 func (x *v4compound) setCurrent(id uint64, p string) {
@@ -507,9 +533,9 @@ func (x *v4compound) access() status {
 	if st != stOK {
 		return st
 	}
-	info, err := x.s.FS.Lstat(cur.path)
-	if err != nil {
-		return statusOf(err)
+	info, st := x.follow(cur)
+	if st != stOK {
+		return st
 	}
 	supported, granted := accessOf(info, want)
 	x.e.u32(supported)
@@ -527,10 +553,11 @@ func (x *v4compound) getattr() status {
 	if st != stOK {
 		return st
 	}
-	a, err := x.s.stat(cur.id, cur.path)
-	if err != nil {
-		return statusOf(err)
+	info, st := x.follow(cur)
+	if st != stOK {
+		return st
 	}
+	a := attrsOf(cur.id, info)
 	var fs v4fsstat
 	return x.s.putAttrs4(x.e, &a, x.handleGen(cur), req, &fs)
 }
@@ -553,10 +580,11 @@ func (x *v4compound) verify(same bool) status {
 	if extra || !mask.within(attr4Supported) {
 		return stAttrNotSupp
 	}
-	a, err := x.s.stat(cur.id, cur.path)
-	if err != nil {
-		return statusOf(err)
+	info, st := x.follow(cur)
+	if st != stOK {
+		return st
 	}
+	a := attrsOf(cur.id, info)
 	// Encode the current values where the result goes, compare and drop
 	// them: VERIFY and NVERIFY results carry only the status.
 	at := x.e.len()

@@ -468,7 +468,7 @@ func (s *Server) link3(d *decoder, res *encoder) status {
 	if st != stOK {
 		return st
 	}
-	info, err := s.FS.Lstat(p)
+	p, info, err := s.describe(id, gen, p)
 	if err != nil {
 		return statusOf(err)
 	}

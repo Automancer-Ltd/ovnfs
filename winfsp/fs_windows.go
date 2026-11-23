@@ -130,17 +130,23 @@ func fill(out *gowinfsp.FSP_FSCTL_FILE_INFO, ino uint64, info os.FileInfo) {
 	}
 }
 
-// stat describes h's node by its current name, falling back to its open file
-// once the name is gone (deleted or replaced while open). The caller holds h.mu.
+// find returns where h's node is now and its description
+// ([export.Nodes.Describe]): STATUS_FILE_DELETED once no visible entry has
+// it (deleted or replaced while open).
+func (x *fileSystem) find(h *handle) (string, os.FileInfo, error) {
+	p, info, err := x.nodes.Describe(h.ino)
+	if errors.Is(err, syscall.ESTALE) {
+		return "", nil, windows.STATUS_FILE_DELETED
+	}
+	return p, info, status(err)
+}
+
+// stat describes h's node where its name is now, falling back to its open
+// file once the name is gone. The caller holds h.mu.
 func (x *fileSystem) stat(h *handle) (os.FileInfo, error) {
-	p, ok := x.nodes.Path(h.ino)
-	var err error = windows.STATUS_FILE_DELETED
-	if ok {
-		var info os.FileInfo
-		if info, err = x.nodes.Lstat(p); err == nil {
-			return info, nil
-		}
-		err = status(err)
+	_, info, err := x.find(h)
+	if err == nil {
+		return info, nil
 	}
 	if s, ok := h.file.(interface{ Stat() (os.FileInfo, error) }); ok {
 		info, serr := s.Stat()
@@ -343,13 +349,9 @@ func (x *fileSystem) Overwrite(_ *gowinfsp.FileSystemRef, fc uintptr, attributes
 // setReadOnly maps FILE_ATTRIBUTE_READONLY onto the owner write bit, as the SMB
 // server does for Windows clients. The caller holds h.mu.
 func (x *fileSystem) setReadOnly(h *handle, readOnly bool) error {
-	p, ok := x.nodes.Path(h.ino)
-	if !ok {
-		return windows.STATUS_FILE_DELETED
-	}
-	info, err := x.nodes.Lstat(p)
+	p, info, err := x.find(h)
 	if err != nil {
-		return status(err)
+		return err
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
 		return nil
@@ -505,9 +507,9 @@ func (x *fileSystem) SetBasicInfo(_ *gowinfsp.FileSystemRef, fc uintptr, flags g
 		mt, changed = ntinfo.FromFiletime(mtime), true
 	}
 	if changed && info.Mode()&os.ModeSymlink == 0 {
-		p, ok := x.nodes.Path(h.ino)
-		if !ok {
-			return windows.STATUS_FILE_DELETED
+		p, _, err := x.find(h)
+		if err != nil {
+			return err
 		}
 		if err := x.nodes.Chtimes(p, at, mt); err != nil {
 			return status(err)

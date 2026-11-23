@@ -302,11 +302,17 @@ A path resolved for a handle can stop holding its file before the request
 uses it: a rename moves the file or puts another one there. A client that
 renames a file over the name of one it keeps open does both, moving the open
 file to a silly name (`.nfs…`) whose handle must keep working, as a page-in
-of a mapped file needs. So NFSv3 GETATTR, SETATTR, ACCESS, READ and WRITE
+of a mapped file needs. So GETATTR, SETATTR, ACCESS, READ, WRITE and LINK's
+source, in both NFS versions, and NFSv4's VERIFY and the reclaiming OPEN,
 take a file's attributes and bytes only from an entry, or descriptor, with
 the handle's identity, and resolve the id again, past the export's cache of
-resolutions, when the path holds another file or none. Other replies leave
-out attributes of a path that no longer holds the handle's file.
+resolutions, when the path holds another file or none; within an NFSv4
+COMPOUND the filehandle then names the new path. Other NFSv3 replies leave
+out attributes of a path that no longer holds the handle's file. The
+frontends that address files by id resolve them the same way
+(`export.Nodes.Describe` and `OpenID`): FUSE for GETATTR, SETATTR, OPEN,
+LINK and READLINK, WinFsp for a handle's attributes, read-only bit and
+times, and the guest kernel client for every operation on a file id.
 
 Builds that kept a node id table left `STATE/nodes.log*` behind; the daemon
 deletes those files in the background when it starts.

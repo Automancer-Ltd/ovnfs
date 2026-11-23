@@ -96,6 +96,43 @@ func TestV4ReadWriteCommit(t *testing.T) {
 	}
 }
 
+// TestV4HandleFollowsItsFile resolves a filehandle to a path another file
+// holds now (trailingPathFS). GETATTR, READ, WRITE, SETATTR and LINK must
+// reach the handle's own file, and the one in its old place stay as it was.
+func TestV4HandleFollowsItsFile(t *testing.T) {
+	fs := &trailingPathFS{testFS: newTestFS(t)}
+	v4write(t, fs.testFS, "kept", "12345678")
+	v4write(t, fs.testFS, "other", "abc")
+	id := fs.FileID("kept")
+	fs.FileID("other")
+	fs.trail = map[uint64]string{id: "other"}
+	_, addr := v4serve(t, fs, nil)
+	c := v4dial(t, addr)
+
+	r := c.run(v4PutFH(id), v4GetAttr(attr4Size), v4Read(stateid4Anon, 0, 100))
+	r.skip(op4PutFH)
+	d := r.next(op4GetAttr, stOK)
+	if mask, _ := getBitmap4(d); mask != bitmap4(attr4Size) || d.u32() != 8 || d.u64() != 8 {
+		t.Fatal("GETATTR did not describe the handle's file")
+	}
+	d = r.next(op4Read, stOK)
+	if eof, data := d.bool(), d.opaque(100); !eof || string(data) != "12345678" {
+		t.Fatalf("READ: eof %v data %q, want the handle's bytes", eof, data)
+	}
+	r.end()
+	if s := c.run(v4PutFH(id), v4Write(stateid4Bypass, 0, "XY"), v4SetAttr(stateid4Anon, v4Size(4))).status; s != stOK {
+		t.Fatalf("WRITE, SETATTR: status %d", s)
+	}
+	if s := c.run(v4PutFH(id), v4Save(), v4Root(), v4Link("linked")).status; s != stOK {
+		t.Fatalf("LINK: status %d", s)
+	}
+	for p, want := range map[string]string{"kept": "XY34", "linked": "XY34", "other": "abc"} {
+		if got, err := os.ReadFile(fs.host(p)); err != nil || string(got) != want {
+			t.Fatalf("%s holds %q (%v), want %q", p, got, err, want)
+		}
+	}
+}
+
 // TestV4StateFromAnotherServerIsStale checks that client ids and stateids
 // of another server instance are stale.
 func TestV4StateFromAnotherServerIsStale(t *testing.T) {

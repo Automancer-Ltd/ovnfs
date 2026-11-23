@@ -355,7 +355,6 @@ func (x *v4compound) link() status {
 	if !x.saved.ok {
 		return stNoFileHandle
 	}
-	src := x.saved
 	cur, s := x.current()
 	if s != stOK {
 		return s
@@ -367,10 +366,11 @@ func (x *v4compound) link() status {
 	if s := x.s.dir4(dir.path); s != stOK {
 		return s
 	}
-	info, err := x.s.FS.Lstat(src.path)
-	if err != nil {
-		return statusOf(err)
+	info, s := x.follow(&x.saved)
+	if s != stOK {
+		return s
 	}
+	src := x.saved
 	if info.IsDir() {
 		return stIsDir
 	}
@@ -379,7 +379,7 @@ func (x *v4compound) link() status {
 	}
 	unlock := x.s.v4.dirs.lock(dir.id, dir.id)
 	cinfo := v4cinfo{atomic: true, before: x.s.changeAt4(dir.path)}
-	err = x.s.FS.Link(src.path, v4Join(dir.path, name))
+	err := x.s.FS.Link(src.path, v4Join(dir.path, name))
 	cinfo.after = x.s.changeAt4(dir.path)
 	unlock()
 	if err != nil {

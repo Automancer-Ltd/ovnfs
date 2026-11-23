@@ -342,13 +342,9 @@ func (x *exportFS) openFile(ino uint64) *fileHandle {
 	return nil
 }
 
-// stat describes the node's current name.
+// stat describes the node's entry where its name is now ([export.Nodes.Describe]).
 func (x *exportFS) stat(ino uint64) (os.FileInfo, gofuse.Status) {
-	p, st := x.path(ino)
-	if !st.Ok() {
-		return nil, st
-	}
-	info, err := x.nodes.Lstat(p)
+	_, info, err := x.nodes.Describe(ino)
 	return info, errno(err)
 }
 
@@ -356,12 +352,13 @@ func (x *exportFS) stat(ino uint64) (os.FileInfo, gofuse.Status) {
 // truncation works through an open file once the node's name is gone.
 func (x *exportFS) SetAttr(_ <-chan struct{}, in *gofuse.SetAttrIn, out *gofuse.AttrOut) gofuse.Status {
 	fh, hasFh := in.GetFh()
-	p, st := x.path(in.NodeId)
 	if size, ok := in.GetSize(); ok {
-		if err := x.truncate(fh, hasFh, p, st, int64(size)); err != nil {
+		if err := x.truncate(in.NodeId, fh, hasFh, int64(size)); err != nil {
 			return errno(err)
 		}
 	}
+	p, _, err := x.nodes.Describe(in.NodeId)
+	st := errno(err)
 	if !st.Ok() && in.Valid&^(gofuse.FATTR_SIZE|gofuse.FATTR_FH|gofuse.FATTR_LOCKOWNER) != 0 {
 		return st
 	}
@@ -394,17 +391,15 @@ func (x *exportFS) SetAttr(_ <-chan struct{}, in *gofuse.SetAttrIn, out *gofuse.
 	return x.attr(in.NodeId, fh, hasFh, out)
 }
 
-// truncate resizes through the caller's open file when given, else by path.
-func (x *exportFS) truncate(fh uint64, hasFh bool, p string, st gofuse.Status, size int64) error {
+// truncate resizes node ino through the caller's open file when given, else
+// through one it opens ([export.Nodes.OpenID]).
+func (x *exportFS) truncate(ino, fh uint64, hasFh bool, size int64) error {
 	if hasFh {
 		if f := x.file(fh); f != nil {
 			return f.file.Truncate(size)
 		}
 	}
-	if !st.Ok() {
-		return syscall.Errno(st)
-	}
-	f, err := x.nodes.OpenFile(p, os.O_WRONLY, 0)
+	f, _, _, err := x.nodes.OpenID(ino, os.O_WRONLY)
 	if err != nil {
 		return err
 	}
@@ -531,9 +526,9 @@ func (x *exportFS) Rename(_ <-chan struct{}, in *gofuse.RenameIn, oldName, newNa
 
 // Link creates a hard link within one checkout.
 func (x *exportFS) Link(_ <-chan struct{}, in *gofuse.LinkIn, name string, out *gofuse.EntryOut) gofuse.Status {
-	from, st := x.path(in.Oldnodeid)
-	if !st.Ok() {
-		return st
+	from, _, err := x.nodes.Describe(in.Oldnodeid)
+	if err != nil {
+		return errno(err)
 	}
 	to, st := x.child(in.NodeId, name)
 	if !st.Ok() {
@@ -562,9 +557,9 @@ func (x *exportFS) Symlink(_ <-chan struct{}, in *gofuse.InHeader, target, name 
 
 // Readlink returns a symlink's stored target.
 func (x *exportFS) Readlink(_ <-chan struct{}, in *gofuse.InHeader) ([]byte, gofuse.Status) {
-	p, st := x.path(in.NodeId)
-	if !st.Ok() {
-		return nil, st
+	p, _, err := x.nodes.Describe(in.NodeId)
+	if err != nil {
+		return nil, errno(err)
 	}
 	target, err := x.nodes.Readlink(p)
 	if err != nil {
@@ -606,12 +601,8 @@ func (x *exportFS) Create(_ <-chan struct{}, in *gofuse.CreateIn, name string, o
 // Open opens an existing file. The kernel drops its page cache on every open
 // (no FOPEN_KEEP_CACHE), since snapshots and forks change files underneath.
 func (x *exportFS) Open(_ <-chan struct{}, in *gofuse.OpenIn, out *gofuse.OpenOut) gofuse.Status {
-	p, st := x.path(in.NodeId)
-	if !st.Ok() {
-		return st
-	}
 	flags := int(in.Flags) & openMask
-	f, err := x.nodes.OpenFile(p, flags, 0)
+	f, _, _, err := x.nodes.OpenID(in.NodeId, flags)
 	if err != nil {
 		return errno(err)
 	}

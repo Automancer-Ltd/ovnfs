@@ -23,7 +23,7 @@ func (s *Server) getattr3(d *decoder, res *encoder) status {
 		if st != stOK {
 			return st
 		}
-		_, info, err := s.describe3(id, gen, p)
+		_, info, err := s.describe(id, gen, p)
 		if err != nil {
 			return statusOf(err)
 		}
@@ -59,7 +59,7 @@ func (s *Server) setattr3(d *decoder, res *encoder) status {
 	if st != stOK {
 		return st
 	}
-	p, info, err := s.describe3(id, gen, p)
+	p, info, err := s.describe(id, gen, p)
 	if err != nil {
 		return statusOf(err)
 	}
@@ -157,7 +157,7 @@ func (s *Server) access3(d *decoder, res *encoder) status {
 	if st != stOK {
 		return st
 	}
-	_, info, err := s.describe3(id, gen, p)
+	_, info, err := s.describe(id, gen, p)
 	if err != nil {
 		return statusOf(err)
 	}
@@ -255,7 +255,7 @@ func (s *Server) openRead3(id, gen uint64, ok bool) (billy.File, attrs, status) 
 	if st != stOK {
 		return nil, attrs{}, st
 	}
-	f, _, info, err := s.open3(id, gen, p, os.O_RDONLY)
+	f, _, info, err := s.openHandle(id, gen, p, os.O_RDONLY)
 	if err != nil {
 		return nil, attrs{}, statusOf(err)
 	}
@@ -294,7 +294,7 @@ func (s *Server) write3(d *decoder, res *encoder) status {
 		return stFBig
 	}
 	// The filehandle names the object to write, not a path to follow.
-	p, info, err := s.describe3(id, gen, p)
+	p, info, err := s.describe(id, gen, p)
 	if err != nil {
 		return statusOf(err)
 	}
@@ -319,8 +319,8 @@ func (s *Server) write3(d *decoder, res *encoder) status {
 }
 
 // writeAt3 reuses the writer for id at p, or opens one where id is now
-// (open3), falling back to a descriptor kept before write permission was
-// removed when a fresh open is denied.
+// ([Server.openHandle]), falling back to a descriptor kept before write
+// permission was removed when a fresh open is denied.
 func (s *Server) writeAt3(id, gen uint64, p string, data []byte, off int64, stable bool) (int, error) {
 	key := keptKey{id: id, path: p}
 	var n int
@@ -334,7 +334,7 @@ func (s *Server) writeAt3(id, gen uint64, p string, data []byte, off int64, stab
 	if ok, err := s.v3.kept.With(key, write); ok {
 		return n, err
 	}
-	f, at, _, err := s.open3(id, gen, p, os.O_WRONLY)
+	f, at, _, err := s.openHandle(id, gen, p, os.O_WRONLY)
 	if err != nil {
 		if errors.Is(err, os.ErrPermission) {
 			if ok, kerr := s.v3.kept.With(keptKey{id: id}, write); ok {

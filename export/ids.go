@@ -1,7 +1,12 @@
 package export
 
 import (
+	"errors"
+	"io/fs"
 	"os"
+	"syscall"
+
+	"github.com/go-git/go-billy/v5"
 
 	"github.com/stencil-hq/ovnfs/checkout"
 	"github.com/stencil-hq/ovnfs/internal/ident"
@@ -183,6 +188,76 @@ func (n *Nodes) ChildID(dir string, info os.FileInfo) uint64 { return n.rt.child
 func (n *Nodes) Path(id uint64) (string, bool) {
 	p, _, ok := n.rt.locate(id)
 	return p, ok
+}
+
+// Describe returns where the entry with file id id is and its description,
+// without following a final symlink. The path [Nodes.Path] returns can stop
+// holding the entry before the caller uses it: a rename moves the entry or
+// puts another at that path, and the cached resolution can trail the rename
+// by a moment ([Router.relocate]). Describe checks the entry it finds there
+// and resolves id afresh when that is another entry, or none; ESTALE once no
+// visible entry has id. Frontends describe, change and open an id's entry
+// through it, so a request never reaches another file under the id.
+func (n *Nodes) Describe(id uint64) (string, os.FileInfo, error) {
+	p, _, ok := n.rt.locate(id)
+	if !ok {
+		return "", nil, syscall.ESTALE
+	}
+	info, err := n.lstatID(id, p)
+	if err == nil || !moved(err) {
+		return p, info, err
+	}
+	if p, _, ok = n.rt.relocate(id); !ok {
+		return "", nil, syscall.ESTALE
+	}
+	info, err = n.lstatID(id, p)
+	return p, info, err
+}
+
+// OpenID opens the file with file id id where [Nodes.Describe] finds it,
+// with flag, which does not create it, and returns that path and the open
+// file's description. ESTALE when a rename put another file there before
+// the open, which it checks through the open file; a truncating flag acts as
+// the file opens, so it relies on Describe's check moments before.
+func (n *Nodes) OpenID(id uint64, flag int) (billy.File, string, os.FileInfo, error) {
+	p, _, err := n.Describe(id)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	f, err := n.OpenFile(p, flag, 0)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	var info os.FileInfo
+	if s, ok := f.(interface{ Stat() (os.FileInfo, error) }); ok {
+		info, err = s.Stat()
+	} else {
+		err = errors.ErrUnsupported
+	}
+	if err == nil && n.IDOf(p, info) != id {
+		err = syscall.ESTALE
+	}
+	if err != nil {
+		f.Close()
+		return nil, "", nil, err
+	}
+	return f, p, info, nil
+}
+
+// lstatID describes the entry at p, which must have file id id: ESTALE when
+// p holds another.
+func (n *Nodes) lstatID(id uint64, p string) (os.FileInfo, error) {
+	info, err := n.Lstat(p)
+	if err == nil && n.IDOf(p, info) != id {
+		return nil, syscall.ESTALE
+	}
+	return info, err
+}
+
+// moved reports an error, from a call on the path an id resolved to, that a
+// rename since explains: the entry left the path or another took it.
+func moved(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.ESTALE)
 }
 
 // Statfs reports space on the upper volume, where all overlay writes land.

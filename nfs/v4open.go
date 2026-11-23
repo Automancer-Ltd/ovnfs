@@ -130,10 +130,11 @@ func (x *v4compound) open() status {
 		if s != stOK {
 			return s
 		}
-		pa, err := x.s.stat(cur.id, cur.path)
-		if err != nil {
-			return statusOf(err)
+		dinfo, s := x.follow(cur)
+		if s != stOK {
+			return s
 		}
+		pa := attrsOf(cur.id, dinfo)
 		if pa.typ != typeDir {
 			return stNotDir
 		}
@@ -153,6 +154,9 @@ func (x *v4compound) open() status {
 		}
 		cur, s := x.current()
 		if s != stOK {
+			return s
+		}
+		if _, s := x.follow(cur); s != stOK {
 			return s
 		}
 		p = cur.path
@@ -214,7 +218,7 @@ func (x *v4compound) open() status {
 		unlock := st.dirs.lock(parent.id, parent.id)
 		cinfo.before = x.s.changeAt4(parent.path)
 		var s status
-		kept, set, s = x.s.createFile4(p, exists, how, write, &sa)
+		kept, set, s = x.s.createFile4(p, id, exists, how, write, &sa)
 		cinfo.after = x.s.changeAt4(parent.path)
 		unlock()
 		if s != stOK {
@@ -259,18 +263,18 @@ func (x *v4compound) open() status {
 
 // createFile4 makes the regular file at p for an OPEN(create) with the
 // attributes sa and returns the attributes set. UNCHECKED4 of an existing
-// file applies none but a size of zero, which truncates it (RFC 7530
+// file, id, applies none but a size of zero, which truncates it (RFC 7530
 // section 16.16.5): open(O_CREAT) leaves an existing file's mode alone.
 //
 // A file created without write permission for its owner cannot be opened
 // for writing again, but its creator may write it through the open, so for
 // an open for writing the file stays open for WRITE (see keepWritable).
-func (s *Server) createFile4(p string, exists bool, how uint32, write bool, sa *v4sattr) (billy.File, v4bitmap, status) {
+func (s *Server) createFile4(p string, id uint64, exists bool, how uint32, write bool, sa *v4sattr) (billy.File, v4bitmap, status) {
 	if exists {
 		if !sa.mask.has(attr4Size) || sa.size != 0 {
 			return nil, v4bitmap{}, stOK
 		}
-		if err := s.truncate4(p, 0); err != nil {
+		if err := s.truncate4(id, p, 0); err != nil {
 			return nil, v4bitmap{}, statusOf(err)
 		}
 		return nil, bitmap4(attr4Size), stOK
@@ -470,7 +474,7 @@ func (x *v4compound) keepWritable(fh *v4fh, mode uint32) {
 	if mode&0o200 != 0 || !x.s.v4.wantsKept(fh.id) {
 		return
 	}
-	f, err := x.s.FS.OpenFile(fh.path, os.O_RDWR, 0)
+	f, _, err := x.s.openID(fh.id, fh.path, os.O_RDWR)
 	if err != nil {
 		return
 	}

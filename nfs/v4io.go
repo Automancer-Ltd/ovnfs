@@ -18,20 +18,15 @@ const (
 	stable4FileSync = 2
 )
 
-// regular4 checks that the file at p is a regular file for READ or WRITE,
-// returning its size.
-func (s *Server) regular4(p string) (int64, status) {
-	info, err := s.FS.Lstat(p)
-	if err != nil {
-		return 0, statusOf(err)
-	}
+// regular4 checks that info describes a regular file, for READ or WRITE.
+func regular4(info os.FileInfo) status {
 	switch {
 	case info.IsDir():
-		return 0, stIsDir
+		return stIsDir
 	case !info.Mode().IsRegular():
-		return 0, stInval
+		return stInval
 	}
-	return info.Size(), stOK
+	return stOK
 }
 
 // read answers READ, reading into the reply in place.
@@ -51,10 +46,14 @@ func (x *v4compound) read() status {
 		return s
 	}
 	x.note(client)
-	size, s := x.s.regular4(cur.path)
+	info, s := x.follow(cur)
 	if s != stOK {
 		return s
 	}
+	if s := regular4(info); s != stOK {
+		return s
+	}
+	size := info.Size()
 	// The data must fit the reply's budget, after eof, its length and its
 	// padding: a short read, which the client continues.
 	n := min(int(min(count, maxIO)), x.room()-12)
@@ -68,11 +67,12 @@ func (x *v4compound) read() status {
 	}
 	eofAt := x.e.len()
 	x.e.u32(0)
-	f, err := x.s.FS.Open(cur.path)
+	f, info, err := x.openFollowed(cur, os.O_RDONLY)
 	if err != nil {
 		return statusOf(err)
 	}
 	defer f.Close()
+	size = info.Size() // the descriptor's, like the bytes
 	got, err := x.e.opaqueFrom(n, func(b []byte) (int, error) { return f.ReadAt(b, int64(offset)) })
 	eof := errors.Is(err, io.EOF)
 	if err != nil && !eof {
@@ -113,7 +113,11 @@ func (x *v4compound) write() status {
 	if s := x.conflict(cur.id); s != stOK {
 		return s
 	}
-	if _, s := x.s.regular4(cur.path); s != stOK {
+	info, s := x.follow(cur)
+	if s != stOK {
+		return s
+	}
+	if s := regular4(info); s != stOK {
 		return s
 	}
 	if offset > math.MaxInt64-uint64(len(data)) {
@@ -126,7 +130,7 @@ func (x *v4compound) write() status {
 	var f billy.File
 	if held == nil {
 		var err error
-		f, err = x.s.FS.OpenFile(cur.path, os.O_WRONLY, 0)
+		f, _, err = x.openFollowed(cur, os.O_WRONLY)
 		if errors.Is(err, os.ErrPermission) && client != 0 {
 			held = st.kept(id, cur.id)
 		}
@@ -219,6 +223,10 @@ func (x *v4compound) setattrs() (v4bitmap, status) {
 	if s := x.conflict(cur.id); s != stOK {
 		return v4bitmap{}, s
 	}
+	info, s := x.follow(cur)
+	if s != stOK {
+		return v4bitmap{}, s
+	}
 	if sa.mask.has(attr4Mode) {
 		x.keepWritable(cur, sa.mode)
 	}
@@ -226,7 +234,8 @@ func (x *v4compound) setattrs() (v4bitmap, status) {
 	if kept != nil {
 		kf = kept.f
 	}
-	if s := x.s.apply4(cur.path, &sa, kf); s != stOK {
+	a := attrsOf(cur.id, info)
+	if s := x.s.applyTo4(&a, cur.path, &sa, kf); s != stOK {
 		return v4bitmap{}, s
 	}
 	x.changed(cur.id)

@@ -8,6 +8,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/go-git/go-billy/v5"
@@ -233,26 +234,22 @@ func (c *conn) inside(p string) bool {
 	return p == root || len(p) > len(root) && p[len(root)] == '/' && strings.HasPrefix(p, root)
 }
 
-// stat resolves id and describes its file without following a symlink. The
-// entry found must still carry id: a rename between resolving and stating
-// would otherwise describe whatever took the old name.
+// stat resolves id and describes its file without following a symlink, where
+// it is now ([export.Nodes.Describe]): a rename between resolving and stating
+// would otherwise describe whatever took the old name. Like path, it answers
+// an id that names nothing in the checkout as stale.
 func (c *conn) stat(id uint64) (string, os.FileInfo, error) {
-	for range 2 {
-		p, err := c.path(id)
-		if err != nil {
-			return "", nil, err
-		}
+	if id == RootID {
+		p := c.share.Checkout
 		info, err := c.nodes.Lstat(p)
-		switch {
-		case errors.Is(err, fs.ErrNotExist):
-			continue
-		case err != nil:
-			return "", nil, err
-		case id == RootID || c.nodes.IDOf(p, info) == id:
-			return p, info, nil
-		}
+		return p, info, err
 	}
-	return "", nil, ESTALE
+	p, info, err := c.nodes.Describe(id)
+	if errors.Is(err, syscall.ESTALE) || err == nil && !c.inside(p) {
+		c.forget(id)
+		return "", nil, ESTALE
+	}
+	return p, info, err
 }
 
 // dir resolves directory id for an op that creates in it.
@@ -456,19 +453,16 @@ func (c *conn) forget(id uint64) {
 	c.files.Drop(c.key(id, true))
 }
 
-// open opens regular file id, which c.path resolved to p, with flag,
-// checking through the open file that it is still id: the name may have
-// moved meanwhile, and the overlay would follow a symlink that took it. It
-// stats p first, since opening a FIFO would block. A share that may change
-// the tree opens past missing owner permission bits: the guest kernel
-// checked permissions when its process opened the file.
-func (c *conn) open(id uint64, p string, flag int) (billy.File, error) {
-	info, err := c.nodes.Lstat(p)
-	if err != nil || c.nodes.IDOf(p, info) != id {
-		// Moved or removed since it was resolved.
-		if p, info, err = c.stat(id); err != nil {
-			return nil, err
-		}
+// open opens regular file id with flag where stat finds it, checking through
+// the open file that it is still id: the name may have moved meanwhile, and
+// the overlay would follow a symlink that took it. It stats first, since
+// opening a FIFO would block. A share that may change the tree opens past
+// missing owner permission bits: the guest kernel checked permissions when
+// its process opened the file.
+func (c *conn) open(id uint64, flag int) (billy.File, error) {
+	p, info, err := c.stat(id)
+	if err != nil {
+		return nil, err
 	}
 	switch {
 	case info.IsDir():
@@ -532,8 +526,7 @@ func (c *conn) openForced(id uint64, p string, flag int, mode os.FileMode) (bill
 // follow renames and freezes (export routerFile). The id is resolved first
 // either way, so one that went stale is answered as such.
 func (c *conn) withFile(id uint64, write bool, flag int, fn func(billy.File) error) error {
-	p, err := c.path(id)
-	if err != nil {
+	if _, err := c.path(id); err != nil {
 		return err
 	}
 	if ok, err := c.files.With(c.key(id, true), fn); ok {
@@ -544,7 +537,7 @@ func (c *conn) withFile(id uint64, write bool, flag int, fn func(billy.File) err
 			return err
 		}
 	}
-	f, err := c.open(id, p, flag)
+	f, err := c.open(id, flag)
 	if err != nil {
 		return err
 	}
@@ -705,7 +698,11 @@ func (c *conn) setattr(id uint64, sa *SetattrReq) error {
 			return err
 		}
 	}
-	return c.putAttrAt(p)
+	if _, info, err = c.stat(id); err != nil {
+		return err
+	}
+	c.putAttr(id, info)
+	return nil
 }
 
 // create answers CREATE: a new regular file, kept open for the writes that

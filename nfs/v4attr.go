@@ -414,14 +414,8 @@ func getSattr4(d *decoder) (v4sattr, status) {
 	return sa, stOK
 }
 
-// apply4 sets the attributes sa lists on the file at p. kept, if not nil,
-// is the file kept open for writing (see keepWritable), which truncates
-// the file once its mode no longer lets it be opened for writing.
-//
-// The size goes first, while the mode still allows writing, and the owner
-// before the mode, since a chown clears setuid and setgid bits. A symlink's
-// mode is left alone: its bits mean nothing, and Chmod would follow it to
-// the target, or fail with ENOENT when it dangles.
+// apply4 sets the attributes sa lists on the entry at p, which a creating
+// operation just made; kept, if not nil, is the file it opened.
 func (s *Server) apply4(p string, sa *v4sattr, kept billy.File) status {
 	if sa.mask == (v4bitmap{}) {
 		return stOK
@@ -430,6 +424,20 @@ func (s *Server) apply4(p string, sa *v4sattr, kept billy.File) status {
 	if err != nil {
 		return statusOf(err)
 	}
+	return s.applyTo4(&a, p, sa, kept)
+}
+
+// applyTo4 sets the attributes sa lists on the file a describes, at p.
+// kept, if not nil, is the file kept open for writing (see keepWritable),
+// which truncates the file once its mode no longer lets it be opened for
+// writing.
+//
+// The size goes first, while the mode still allows writing, and the owner
+// before the mode, since a chown clears setuid and setgid bits. A symlink's
+// mode is left alone: its bits mean nothing, and Chmod would follow it to
+// the target, or fail with ENOENT when it dangles.
+func (s *Server) applyTo4(a *attrs, p string, sa *v4sattr, kept billy.File) status {
+	var err error
 	if sa.mask.has(attr4Size) {
 		switch {
 		case a.typ == typeDir:
@@ -442,7 +450,7 @@ func (s *Server) apply4(p string, sa *v4sattr, kept billy.File) status {
 		if kept != nil {
 			err = kept.Truncate(int64(sa.size))
 		} else {
-			err = s.truncate4(p, int64(sa.size))
+			err = s.truncate4(a.fileid, p, int64(sa.size))
 		}
 		if err != nil {
 			return statusOf(err)
@@ -484,9 +492,10 @@ func (s *Server) apply4(p string, sa *v4sattr, kept billy.File) status {
 	return stOK
 }
 
-// truncate4 sets the size of the file at p.
-func (s *Server) truncate4(p string, size int64) error {
-	f, err := s.FS.OpenFile(p, os.O_WRONLY, 0)
+// truncate4 sets the size of file id, at p: ESTALE when p holds another
+// file ([Server.openID]).
+func (s *Server) truncate4(id uint64, p string, size int64) error {
+	f, _, err := s.openID(id, p, os.O_WRONLY)
 	if err != nil {
 		return err
 	}
