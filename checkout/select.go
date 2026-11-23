@@ -101,12 +101,15 @@ func (r *Registry) pick(ctx context.Context, sel api.Select) ([]pickedCheckout, 
 		case dir != "" && !inside(dir, src) && !inside(src, dir):
 			continue
 		}
-		c := r.checkoutLocked(h)
+		c := r.describeLocked(h)
 		if sel.Idle == 0 || now.Sub(c.Touched) >= idle {
 			found = append(found, pickedCheckout{c, h, h.meta.Life})
 		}
 	}
 	r.mu.RUnlock()
+	for i := range found {
+		found[i].Dirty = r.dirty(found[i].h)
+	}
 	picked := found
 	if sel.NoDiff {
 		picked = found[:0]

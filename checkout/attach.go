@@ -229,8 +229,9 @@ func (r *Registry) AttachRemote(ctx context.Context, o peer.Offer) (api.Checkout
 		case m.Remote == nil || m.Remote.Node != o.Node || m.Remote.Source != o.Source:
 			h = nil
 		case m.Tree == o.Tree:
-			reply := r.checkoutLocked(h)
+			reply := r.describeLocked(h)
 			r.mu.RUnlock()
+			reply.Dirty = r.dirty(h)
 			return reply, nil
 		}
 	}

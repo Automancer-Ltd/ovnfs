@@ -724,7 +724,7 @@ func markGitdirs(gitdir, name string, view *base.Base) error {
 // checkout's was copied from: it moves to the same place in this one's. An
 // absorbed submodule of the capture that no layer touched gets the gitfile it had
 // when its checkout was opened, which was infrastructure and never frozen into a
-// layer (see upperEmpty). Writes go through fsys, which copies directories up
+// layer (see upperState.empty). Writes go through fsys, which copies directories up
 // with their metadata.
 func (r *Registry) installGitfiles(fsys *overlay.FS, name, dir string, view *base.Base, owners map[string]bool) (map[string]copiedDir, error) {
 	gitdir := r.gitdirPath(dir)
@@ -875,7 +875,7 @@ func readGitfile(fsys *overlay.FS, p string) (string, error) {
 
 // writeGitfileAt writes a gitfile pointing at gitdir to checkout path p through
 // fsys and keeps the mtime of p's directory, so a directory copied up only to
-// hold the gitfile still matches what lies beneath it (see upperEmpty).
+// hold the gitfile still matches what lies beneath it (see upperState.empty).
 func writeGitfileAt(fsys *overlay.FS, p, gitdir string) error {
 	content, err := git.Gitfile(gitdir)
 	if err != nil {
@@ -1075,28 +1075,56 @@ func (r *Registry) Fork(ctx context.Context, args api.ForkArgs) (api.ForkReply, 
 	return api.ForkReply{Snapshot: result, Checkout: childCheckout, Warnings: append([]string{}, warnings...)}, nil
 }
 
-// upperEmpty excludes only infrastructure: the work directory, the root's gitfile,
-// the checkout's jj workspace, and the gitfiles installGitfiles wrote into the
-// upper (absolute, into the checkout's own private git directory) together with
-// the directories it copied up to hold them (checkoutMeta.Copied), as long as
-// those keep the metadata they were copied with. Every real change requires a layer.
-func (r *Registry) upperEmpty(h *checkoutRecord) (bool, error) {
+// upperState is what empty inspects of a checkout: its overlay, its upper
+// directory and what of that is infrastructure. It stays the checkout's
+// while the caller holds the checkout's freeze lock: freezes and reattaches
+// replace all three only under it exclusively.
+type upperState struct {
+	fs  *overlay.FS
+	dir string
+	in  infra
+}
+
+// upperLocked reads h's upperState; the caller holds r.mu.
+func (r *Registry) upperLocked(h *checkoutRecord) upperState {
 	in := infra{copied: h.meta.Copied, workspace: h.meta.JJ != ""}
-	var workspace []string // memory files there are no change either
-	if in.workspace {
-		workspace = []string{jj.Dir}
-	}
-	if h.fs.Unflushed(workspace...) {
-		return false, nil
-	}
 	if h.meta.Git {
 		in.gitdir = r.gitdirPath(h.meta.dir())
 	}
-	empty, _, err := infraOnly(h.fs, h.upper, "", in)
+	return upperState{fs: h.fs, dir: h.upper, in: in}
+}
+
+// empty reports whether the upper holds nothing but infrastructure: the work
+// directory, the root's gitfile, the checkout's jj workspace, and the gitfiles
+// installGitfiles wrote into the upper (absolute, into the checkout's own
+// private git directory) together with the directories it copied up to hold
+// them (checkoutMeta.Copied), as long as those keep the metadata they were
+// copied with. Every real change requires a layer.
+//
+// It waits out the overlay's file calls, which can take minutes (a directory
+// rename copies a whole lower tree up). Under r.mu only a caller holding the
+// checkout's freeze lock exclusively, or registering the checkout in that same
+// critical section, may call it; others release r.mu first (see Registry.dirty).
+func (u upperState) empty() (bool, error) {
+	var workspace []string // memory files there are no change either
+	if u.in.workspace {
+		workspace = []string{jj.Dir}
+	}
+	if u.fs.Unflushed(workspace...) {
+		return false, nil
+	}
+	empty, _, err := infraOnly(u.fs, u.dir, "", u.in)
 	return empty, err
 }
 
-// infra is what of a checkout's upper is infrastructure (see upperEmpty).
+// dirty reports a change in the upper as api.Checkout.Dirty does: an upper that
+// cannot be read counts as unchanged.
+func (u upperState) dirty() bool {
+	empty, err := u.empty()
+	return err == nil && !empty
+}
+
+// infra is what of a checkout's upper is infrastructure (see upperState.empty).
 type infra struct {
 	gitdir    string               // the checkout's private git directory; "" for none
 	copied    map[string]copiedDir // checkoutMeta.Copied
@@ -1104,7 +1132,7 @@ type infra struct {
 }
 
 // infraOnly reports whether the upper directory dir, at checkout path rel, holds
-// nothing but infrastructure (see upperEmpty), and whether it holds a gitfile into
+// nothing but infrastructure (see upperState.empty), and whether it holds a gitfile into
 // the checkout's private git directory. A directory counts only when it was copied
 // up for gitfiles, holds one, and keeps the mode and mtime copied records for it;
 // otherwise it is a change (a chmod, a touch, or a removal that left it without a
@@ -1206,7 +1234,7 @@ func (r *Registry) freezeLocked(ctx context.Context, h *checkoutRecord, label st
 	if err := h.fs.Flush(); err != nil {
 		return nil, err
 	}
-	empty, err := r.upperEmpty(h)
+	empty, err := r.upperLocked(h).empty()
 	if err != nil {
 		return nil, err
 	}

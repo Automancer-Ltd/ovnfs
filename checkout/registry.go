@@ -116,7 +116,8 @@ func Open(c Config) (*Registry, error) {
 	if err != nil {
 		return nil, coded(err)
 	}
-	r := &Registry{config: c, store: st, checkouts: make(map[string]*checkoutRecord), snapshots: make(map[string]*snapRecord), lineage: make(map[string]*snapRecord), bases: make(map[string]*baseRecord), layers: make(map[string]*layerRecord), intents: make(map[string]diskIntent), reserved: make(map[string]bool), watched: make(map[string]bool), folders: make(map[string]*reuseFolder), roots: make(map[string]string), nextSnapshot: d.NextSnapshot, nextSlot: d.NextSlot, nextLife: d.NextLife, bySlot: make(map[uint16]*checkoutRecord), proto: d.Proto, port: d.Port, rootTime: time.Now().UTC(), gcWake: make(chan struct{}, 1), noticeWake: make(chan struct{}, 1), trashWake: make(chan chan struct{}, 1), stop: make(chan struct{})}
+	r := &Registry{config: c, store: st, checkouts: make(map[string]*checkoutRecord), snapshots: make(map[string]*snapRecord), lineage: make(map[string]*snapRecord), bases: make(map[string]*baseRecord), layers: make(map[string]*layerRecord), intents: make(map[string]diskIntent), reserved: make(map[string]bool), watched: make(map[string]bool), folders: make(map[string]*reuseFolder), roots: make(map[string]string), nextSnapshot: d.NextSnapshot, nextSlot: d.NextSlot, nextLife: d.NextLife, bySlot: make(map[uint16]*checkoutRecord), proto: d.Proto, port: d.Port, gcWake: make(chan struct{}, 1), noticeWake: make(chan struct{}, 1), trashWake: make(chan chan struct{}, 1), stop: make(chan struct{})}
+	r.rootTime.Store(time.Now().UnixNano())
 	r.commits.cond.L = &r.commits.mu
 	r.prepares = make(chan struct{}, prepareSlots)
 	r.resolving = make(map[string]chan struct{})
@@ -706,16 +707,14 @@ func (r *Registry) Names() []string {
 	return names
 }
 
-// RootTime is the virtual export-root directory modification time.
-func (r *Registry) RootTime() time.Time { r.mu.RLock(); defer r.mu.RUnlock(); return r.rootTime }
+// RootTime is the virtual export-root directory modification time. It takes no
+// lock: the file servers ask for it on every call to the root, which must not
+// queue behind a registry writer.
+func (r *Registry) RootTime() time.Time { return time.Unix(0, r.rootTime.Load()).UTC() }
 
 // moveRootLocked guarantees a strictly advancing directory modification time.
 func (r *Registry) moveRootLocked() {
-	now := time.Now().UTC()
-	if !now.After(r.rootTime) {
-		now = r.rootTime.Add(time.Nanosecond)
-	}
-	r.rootTime = now
+	r.rootTime.Store(max(time.Now().UnixNano(), r.rootTime.Load()+1))
 }
 
 // Ls lists the live checkouts args picks with their retained snapshots, or every
@@ -783,10 +782,36 @@ func (r *Registry) Largest() (name string, files int) {
 	return name, files
 }
 
-// checkoutLocked describes a checkout for replies.
+// checkoutLocked describes a checkout for replies. Its Dirty reads the upper, so
+// besides r.mu the caller holds h's freeze lock exclusively or registers h in
+// this critical section (see upperState.empty); other callers take
+// describeLocked and then dirty once r.mu is released.
 func (r *Registry) checkoutLocked(h *checkoutRecord) api.Checkout {
-	empty, err := r.upperEmpty(h)
-	return api.Checkout{Name: h.meta.Name, Path: filepath.Join(r.config.Mount, h.meta.Name), Source: h.source(), Base: h.meta.Base, Parent: deref(h.meta.Parent), Git: h.meta.Git, JJ: h.meta.JJ, Dirty: err == nil && !empty, Created: h.meta.Created, Touched: r.touched(h)}
+	c := r.describeLocked(h)
+	c.Dirty = r.upperLocked(h).dirty()
+	return c
+}
+
+// describeLocked describes a checkout for replies, all but Dirty (see dirty).
+// The caller holds r.mu.
+func (r *Registry) describeLocked(h *checkoutRecord) api.Checkout {
+	return api.Checkout{Name: h.meta.Name, Path: filepath.Join(r.config.Mount, h.meta.Name), Source: h.source(), Base: h.meta.Base, Parent: deref(h.meta.Parent), Git: h.meta.Git, JJ: h.meta.JJ, Created: h.meta.Created, Touched: r.touched(h)}
+}
+
+// dirty reports whether h's upper holds a change, for api.Checkout.Dirty. Like a
+// file call it holds h's freeze lock shared, and the registry lock only to read
+// h: a call keeping h's overlay busy holds up this caller, not every checkout
+// (see checkoutRecord.freeze).
+func (r *Registry) dirty(h *checkoutRecord) bool {
+	h.freeze.RLock()
+	defer h.freeze.RUnlock()
+	if h.retired.Load() {
+		return false
+	}
+	r.mu.RLock()
+	u := r.upperLocked(h)
+	r.mu.RUnlock()
+	return u.dirty()
 }
 
 // source is the folder a checkout was opened from; for one attached from another

@@ -62,7 +62,7 @@ type checkoutMeta struct {
 	MergeBases map[string]string `json:"merge_bases,omitempty"`
 	// Copied lists the directories of the upper that the checkout copied up to hold
 	// submodule gitfiles, with the metadata they had then; while they keep it, they
-	// are infrastructure, not changes (see Registry.upperEmpty).
+	// are infrastructure, not changes (see upperState.empty).
 	Copied map[string]copiedDir `json:"copied,omitempty"`
 	// Slot numbers the checkout in the export's file ids (export.Nodes), which
 	// clients keep as inode numbers, so it is persisted for ids that survive
@@ -187,7 +187,7 @@ type Registry struct {
 	bySlot       map[uint16]*checkoutRecord // registered checkouts by checkoutMeta.Slot
 	proto        string
 	port         int
-	rootTime     time.Time
+	rootTime     atomic.Int64 // unix nanoseconds of the export root's mtime (see RootTime); written under mu
 	closed       bool
 	operations   sync.WaitGroup
 	hashes       sync.WaitGroup
@@ -231,7 +231,9 @@ type checkoutRecord struct {
 	// change the checkout under them. It is taken before Registry.mu, never
 	// while holding it: a file call may be slow (a source folder on a network
 	// share), and waiting for it under the registry lock would stall every
-	// checkout instead of this one.
+	// checkout instead of this one. For the same reason nothing waits on the
+	// checkout's overlay under Registry.mu without holding freeze exclusively:
+	// file calls keep the overlay busy too (see upperState.empty).
 	freeze     sync.RWMutex
 	generation atomic.Uint64
 	retired    atomic.Bool
