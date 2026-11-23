@@ -262,18 +262,6 @@ func (m *model) copyUp(dir *mNode, name string) *mNode {
 	return n
 }
 
-// copyUpTree copies every name below directory dir up, as renaming a
-// directory does before it moves (overlay.go `copyUpTree`).
-func (m *model) copyUpTree(dir *mNode) {
-	for _, name := range sortedNames(dir) {
-		if dir.kids[name].kind == mDir {
-			m.copyUpTree(dir.kids[name])
-			continue
-		}
-		m.copyUp(dir, name)
-	}
-}
-
 // sortedNames lists a directory node's entries in name order.
 func sortedNames(dir *mNode) []string {
 	out := make([]string, 0, len(dir.kids))
@@ -499,12 +487,9 @@ func (m *model) rename(src, dst string) string {
 	if pcls == clUndef {
 		return pcls
 	}
-	// The source is copied up before the destination's parent is checked.
-	if n.kind == mDir {
-		m.copyUpTree(n)
-	} else {
-		n = m.copyUp(sdir, sname)
-	}
+	// The source is copied up, a directory without its tree (it redirects
+	// there instead), before the destination's parent is checked.
+	n = m.copyUp(sdir, sname)
 	if pcls != "" {
 		return pcls
 	}

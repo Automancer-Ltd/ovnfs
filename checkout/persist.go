@@ -19,11 +19,13 @@ import (
 // stateVersion is the registry manifest layout this build writes. Builds that
 // read only version 4 truncate store packs at frame kinds they do not know
 // (chunks, chunk manifests, tree deltas); version 5 makes them refuse the state
-// before they open the store.
-const stateVersion = 5
+// before they open the store. Builds that read only up to 5 would show a
+// renamed directory's redirect (overlay.Entry.Redirect) as an empty directory;
+// version 6 makes them refuse it.
+const stateVersion = 6
 
-// oldestStateVersion is the oldest layout this build reads; version 4 is a
-// subset of version 5, rewritten as 5 when the registry opens.
+// oldestStateVersion is the oldest layout this build reads; versions 4 and 5
+// are subsets of version 6, rewritten as 6 when the registry opens.
 const oldestStateVersion = 4
 
 // diskState is the versioned registry manifest; all referenced paths live below State.

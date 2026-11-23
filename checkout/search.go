@@ -105,10 +105,11 @@ type remoteSearch struct {
 
 // Locate reports p's blob when only the source machine holds it.
 func (g remoteSearch) Locate(p string) (grep.Blob, bool) {
-	if !g.fs.InBottom(p) {
+	q, ok := g.fs.InBottom(p)
+	if !ok {
 		return grep.Blob{}, false
 	}
-	w, ok := g.base.Uncached(p)
+	w, ok := g.base.Uncached(q)
 	return grep.Blob{ID: string(w.ID), Path: w.Path, Size: w.Size}, ok
 }
 

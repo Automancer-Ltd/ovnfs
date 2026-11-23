@@ -734,9 +734,14 @@ func (r *Registry) installGitfiles(fsys *overlay.FS, name, dir string, view *bas
 	}
 	var written []string
 	inherited := map[string]bool{}
-	for _, l := range fsys.Stack() {
+	stack := fsys.Stack()
+	for i, l := range stack {
 		for _, p := range l.GitEntries() {
 			if e, _ := l.Get(p); p != ".git" && e.Kind == overlay.KindFile {
+				// Directories the layers above moved show the gitfile elsewhere.
+				for j := i - 1; j >= 0; j-- {
+					p = stack[j].Unredirected(p)
+				}
 				inherited[p] = true
 			}
 		}

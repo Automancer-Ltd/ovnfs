@@ -50,7 +50,8 @@ func observe(f *FS, p string) string {
 		fmt.Fprintf(&b, "link: %s; ", target)
 	}
 	_, upper := f.UpperFile(p)
-	fmt.Fprintf(&b, "bottom: %v; upper: %v; ", f.InBottom(p), upper)
+	_, bottom := f.InBottom(p)
+	fmt.Fprintf(&b, "bottom: %v; upper: %v; ", bottom, upper)
 	if items, err := f.ReadDir(p); err == nil {
 		for _, item := range items {
 			fmt.Fprintf(&b, "%s %v %d, ", item.Name(), item.Mode(), item.Size())

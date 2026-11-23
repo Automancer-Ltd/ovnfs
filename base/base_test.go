@@ -316,6 +316,27 @@ func TestNestedRepositoryIsFrozenAsSource(t *testing.T) {
 	}
 }
 
+// TestBlobMovedOutOfItsRepository reads a submodule's tracked blob at a path
+// outside the submodule, where a directory rename in a checkout took it: the
+// repository holding the new path lacks the object, another one has it.
+func TestBlobMovedOutOfItsRepository(t *testing.T) {
+	repo, dir := repository(t)
+	_, submodule := repository(t)
+	writeTestFile(t, filepath.Join(submodule, "only.txt"), "submodule only\n")
+	runGit(t, submodule, "add", "only.txt")
+	runGit(t, submodule, "commit", "-qm", "only")
+	runGit(t, dir, "-c", "protocol.file.allow=always", "submodule", "add", "-q", submodule, "vendor")
+	runGit(t, dir, "commit", "-qm", "submodule")
+	b, _ := createTestBase(t, repo, nil)
+	leaf, ok := b.Leaf("vendor/only.txt")
+	if !ok {
+		t.Fatal("capture lacks vendor/only.txt")
+	}
+	if data, err := b.Blob("moved/only.txt", leaf.ID); err != nil || string(data) != "submodule only\n" {
+		t.Fatalf("moved blob = %q, %v", data, err)
+	}
+}
+
 // TestAncestorReplacementCannotSubstituteOldInodes rejects directory-rename bypasses.
 func TestAncestorReplacementCannotSubstituteOldInodes(t *testing.T) {
 	repo, dir := repository(t)

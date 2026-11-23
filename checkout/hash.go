@@ -209,6 +209,10 @@ type leafSet interface {
 	drop(p string) error
 	// dropUnder removes every leaf strictly below p.
 	dropUnder(p string) error
+	// capture records the leaves strictly below p now, returning a function
+	// that puts them at the same relative paths below another directory,
+	// which holds none, whatever changed meanwhile.
+	capture(p string) (func(dst string) error, error)
 }
 
 // fold applies layers to a parent tree's leaves: source-class files are hashed
@@ -229,10 +233,64 @@ func newFold(b *baseRecord, st *store.Store, view source.View, set leafSet) fold
 	return fold{base: b, store: st, view: view, set: set, class: map[string]rules.Class{"": rules.Source}, kept: layerBlobs{}}
 }
 
+// moved is what a directory a layer redirects shows from the levels below:
+// its origin's leaves, kept empty directories and class before the layer applies.
+type moved struct {
+	place func(dst string) error // puts the origin's leaves below dst
+	dirs  []string               // members of fold.dirs below the origin, relative to it
+	class rules.Class
+}
+
+// capture records what origin o holds before the current layer applies, for a
+// directory the layer redirects there.
+func (t *fold) capture(o string) (moved, error) {
+	place, err := t.set.capture(o)
+	if err != nil {
+		return moved{}, err
+	}
+	m := moved{place: place, class: t.heldClass(o)}
+	for q := range t.dirs.below(o) {
+		m.dirs = append(m.dirs, q[len(o)+1:])
+	}
+	return m, nil
+}
+
+// heldClass returns the class p had before the current layer: the first
+// non-source class of p or an ancestor that a layer or the capture decided,
+// else source.
+func (t *fold) heldClass(p string) rules.Class {
+	for q := p; q != "."; q = path.Dir(q) {
+		c, ok := t.class[q]
+		if !ok {
+			c, ok = t.base.view.Class(q)
+		}
+		if ok && c != rules.Source {
+			return c
+		}
+	}
+	return rules.Source
+}
+
 // apply folds one layer's entries, visited parents first, into the leaves.
+// A directory the layer redirects first shows what its origin held before the
+// layer: the origin's leaves and kept empty directories at the same relative
+// paths, and its class when that is not source (a moved cache directory stays
+// one: the fold never read its content). The layer's own entries below it
+// then apply as usual.
 func (t *fold) apply(l *overlay.Layer) error {
 	if t.store != nil && !l.Stored() && t.kept[l] == nil {
 		t.kept[l] = make(map[string]string)
+	}
+	var moves map[string]moved
+	for d, o := range l.Redirects() {
+		m, err := t.capture(o)
+		if err != nil {
+			return err
+		}
+		if moves == nil {
+			moves = make(map[string]moved)
+		}
+		moves[d] = m
 	}
 	// Resolve rename bases before whiteouts or opaque directories remove them. An
 	// origin the parent lacks (a temporary file renamed over its target) or that
@@ -271,7 +329,8 @@ func (t *fold) apply(l *overlay.Layer) error {
 		case overlay.KindWhiteout:
 			return t.remove(p)
 		case overlay.KindDir:
-			if e.Opaque {
+			m, redirected := moves[p]
+			if e.Opaque || redirected {
 				if err := t.removeUnder(p); err != nil {
 					return err
 				}
@@ -279,6 +338,9 @@ func (t *fold) apply(l *overlay.Layer) error {
 			class, err := t.classify(p, e.Info)
 			if err != nil {
 				return err
+			}
+			if redirected && class == rules.Source {
+				class = m.class
 			}
 			t.class[p] = class
 			f, ok, err := t.set.leaf(p)
@@ -294,6 +356,12 @@ func (t *fold) apply(l *overlay.Layer) error {
 				return t.remove(p)
 			}
 			t.dirs.add(p)
+			if redirected {
+				for _, rel := range m.dirs {
+					t.dirs.add(p + "/" + rel)
+				}
+				return m.place(p)
+			}
 		case overlay.KindFile, overlay.KindSymlink:
 			// A socket or FIFO has no content: like a source folder's, it
 			// stays out of the tree, hiding whatever p held before.
@@ -440,9 +508,24 @@ func (t *fold) removeUnder(p string) error {
 type tree struct {
 	fold
 	files  map[string]store.File
-	sorted []string                  // parent paths, for prefix removal without full scans
-	added  pathSet                   // paths set by layers
-	layers map[string]*overlay.Layer // path → layer whose file supplied its content
+	sorted []string          // parent paths, for prefix removal without full scans
+	added  pathSet           // paths set by layers
+	from   map[string]supply // path → where its content is read, unless the parent tree's leaf at path
+}
+
+// supply names where a leaf's content is read: the entry at path of layer, or
+// with no layer the parent tree's leaf at path (a directory moved it).
+type supply struct {
+	layer *overlay.Layer
+	path  string
+}
+
+// supplier returns where the leaf at p is read.
+func (t *tree) supplier(p string) supply {
+	if s, ok := t.from[p]; ok {
+		return s
+	}
+	return supply{path: p}
 }
 
 // newTree starts from a flattened parent tree.
@@ -451,7 +534,7 @@ func newTree(b *baseRecord, st *store.Store, parent store.OID, view source.View)
 	if err != nil {
 		return nil, err
 	}
-	t := &tree{files: files, sorted: source.SortedPaths(files), layers: map[string]*overlay.Layer{}}
+	t := &tree{files: files, sorted: source.SortedPaths(files), from: map[string]supply{}}
 	t.fold = newFold(b, st, view, t)
 	return t, nil
 }
@@ -464,7 +547,7 @@ func (t *tree) leaf(p string) (store.File, bool, error) {
 
 // put lists the leaf at p.
 func (t *tree) put(p string, f store.File, l *overlay.Layer) error {
-	t.files[p], t.layers[p] = f, l
+	t.files[p], t.from[p] = f, supply{l, p}
 	t.added.add(p)
 	return nil
 }
@@ -473,7 +556,7 @@ func (t *tree) put(p string, f store.File, l *overlay.Layer) error {
 func (t *tree) drop(p string) error {
 	delete(t.files, p)
 	t.added.remove(p)
-	delete(t.layers, p)
+	delete(t.from, p)
 	return nil
 }
 
@@ -485,9 +568,34 @@ func (t *tree) dropUnder(p string) error {
 	}
 	t.added.removeUnder(p, func(q string) {
 		delete(t.files, q)
-		delete(t.layers, q)
+		delete(t.from, q)
 	})
 	return nil
+}
+
+// capture copies the leaves listed strictly below p, with where each is read.
+func (t *tree) capture(p string) (func(dst string) error, error) {
+	type held struct {
+		f store.File
+		s supply
+	}
+	below := map[string]held{}
+	prefix := p + "/"
+	for i := sort.SearchStrings(t.sorted, prefix); i < len(t.sorted) && strings.HasPrefix(t.sorted[i], prefix); i++ {
+		if f, ok := t.files[t.sorted[i]]; ok {
+			below[t.sorted[i][len(p):]] = held{f, t.supplier(t.sorted[i])}
+		}
+	}
+	for q := range t.added.below(p) {
+		below[q[len(p):]] = held{t.files[q], t.supplier(q)}
+	}
+	return func(dst string) error {
+		for rel, h := range below {
+			t.files[dst+rel], t.from[dst+rel] = h.f, h.s
+			t.added.add(dst + rel)
+		}
+		return nil
+	}, nil
 }
 
 // finish turns created directories left without leaves into empty-directory
@@ -649,6 +757,47 @@ func (t *snapTree) drop(p string) error {
 	}
 	touch(dirs)
 	return nil
+}
+
+// capture keeps a copy of the directory at p that later changes do not reach;
+// it reads no stored tree the fold has not read.
+func (t *snapTree) capture(p string) (func(dst string) error, error) {
+	_, k, err := t.find(p, false)
+	if err != nil || k == nil || k.dir == nil {
+		return func(string) error { return nil }, err
+	}
+	below := k.dir.frozen()
+	below.emptyLeaf = false
+	return func(dst string) error {
+		dirs, k, err := t.find(dst, true)
+		if err != nil {
+			return err
+		}
+		if k != nil {
+			// dst stays an empty-directory leaf if it was one.
+			below.emptyLeaf = k.dir != nil && k.dir.emptyLeaf || k.dir == nil && k.leaf.Mode == store.ModeDir
+		}
+		dirs[len(dirs)-1].kids[path.Base(dst)] = &snapKid{dir: below}
+		touch(dirs)
+		return nil
+	}, nil
+}
+
+// frozen copies d: unchanged directories are shared by their stored tree,
+// changed ones copied, so changes to d or below do not reach the copy.
+func (d *snapDir) frozen() *snapDir {
+	if !d.changed {
+		return &snapDir{id: d.id}
+	}
+	c := &snapDir{id: d.id, kids: make(map[string]*snapKid, len(d.kids)), changed: true, emptyLeaf: d.emptyLeaf}
+	for name, k := range d.kids {
+		if k.dir == nil {
+			c.kids[name] = &snapKid{leaf: k.leaf}
+		} else {
+			c.kids[name] = &snapKid{dir: k.dir.frozen()}
+		}
+	}
+	return c
 }
 
 // dropUnder empties the directory at p without reading it.

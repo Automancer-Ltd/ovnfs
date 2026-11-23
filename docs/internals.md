@@ -88,15 +88,17 @@ falling back to reading through the mount when it refuses.
 
 ## Persistence
 
-State is `state.json` (version 5), atomically replaced with one durable write
+State is `state.json` (version 6), atomically replaced with one durable write
 per operation (`snap`, `fork` and `new --from` each sync once); multi-step
 operations first write an intent that restart rolls forward or back. A
 snapshot's tree id is written without a sync: a restart that lost it hashes the
 snapshot again. Layer stacks are written only where they cannot be rebuilt from
 a snapshot's parent. Builds that read only version 4 would cut store packs at
 frame kinds they do not know (chunks, chunk manifests, tree deltas), so version
-5 makes them refuse the state before they open the store; this build reads
-version 4 and rewrites it as 5 when it opens. State of any other version is
+5 makes them refuse the state before they open the store. Builds that read
+only up to version 5 would show a renamed directory's redirect (below) as an
+empty directory, so version 6 makes them refuse it; this build reads versions
+4 and 5 and rewrites them as 6 when it opens. State of any other version is
 refused. File calls never write state: a checkout's last write through its
 folder (`ls` TOUCHED) is saved with the next operation or the planned stop, so
 a crash forgets the writes since.
@@ -152,6 +154,15 @@ rewrites `state.json` with everything embedded in it. Small manifest files left
 by a crash or an older build move into `state.json` on reopen.
 Copy-up and Git hashing still process whole changed files; chunking reduces
 retained history, not the work of computing a Git SHA-1.
+
+Renaming a directory moves none of its files. One whose tree the base or a
+frozen layer holds in part takes a `.wh..wh.redirect` marker naming where
+they hold it, its old name a whiteout, and lookups below it continue there
+through every lower level, as overlayfs's `redirect_dir` does; so `mv target
+target.old` over a large build directory costs the upper's part of the tree,
+not a copy of it. Redirects move with their directories, freeze into layers
+(a stored layer keeps them in its manifest), and snapshot trees, hashes and
+diffs fold them like any other entry.
 
 Unreferenced layers, bases and store objects are collected in the background.
 A layer or cache snapshot that goes is not deleted there, nor is the upper of

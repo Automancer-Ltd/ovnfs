@@ -237,8 +237,9 @@ func randomLayer(t *testing.T, rng *rand.Rand, dir string) {
 }
 
 // specLayer fills dir from path → spec: "dir", "opaque" (an opaque
-// directory), "wh" (a whiteout), "link:<target>", "exec:<content>" or
-// "file:<content>"; parents are created as plain directories.
+// directory), "redirect:<origin>" (a directory redirected to origin), "wh" (a
+// whiteout), "link:<target>", "exec:<content>" or "file:<content>"; parents
+// are created as plain directories.
 func specLayer(t *testing.T, dir string, spec map[string]string) {
 	t.Helper()
 	for _, p := range slices.Sorted(maps.Keys(spec)) {
@@ -254,6 +255,10 @@ func specLayer(t *testing.T, dir string, spec map[string]string) {
 		case "opaque":
 			if err = os.MkdirAll(host, 0o755); err == nil {
 				err = os.WriteFile(filepath.Join(host, ".wh..wh..opq"), nil, 0o644)
+			}
+		case "redirect":
+			if err = os.MkdirAll(host, 0o755); err == nil {
+				err = os.WriteFile(filepath.Join(host, ".wh..wh.redirect"), []byte(arg), 0o644)
 			}
 		case "wh":
 			err = os.WriteFile(filepath.Join(filepath.Dir(host), ".wh."+path.Base(p)), nil, 0o644)

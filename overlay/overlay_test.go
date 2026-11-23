@@ -373,7 +373,7 @@ func TestRenameLowerFile(t *testing.T) {
 	assertNames(t, f, "", "a")
 }
 
-// TestRenameMergedDirectoryMovesWholeTree copies a complete merged subtree.
+// TestRenameMergedDirectoryMovesWholeTree shows a complete merged subtree at the new name.
 func TestRenameMergedDirectoryMovesWholeTree(t *testing.T) {
 	f := setup(t, map[string]string{"d/low": "l", "d/sub/deep": "x", "d/del": "", "e/": ""})
 	write(t, f, "d/sub/up", "u", os.O_WRONLY|os.O_CREATE)
@@ -394,6 +394,65 @@ func TestRenameMergedDirectoryMovesWholeTree(t *testing.T) {
 	// The name is free again and must not resurrect lower's d.
 	must(t, f.MkdirAll("d", 0o755))
 	assertNames(t, f, "d")
+}
+
+// TestRenameLowerDirectoryRedirects renames a directory the bottom holds, one
+// of its files changed: no other file is copied up, the tree shows at the new
+// name and not the old, a file's identity follows it, and so it stays with
+// the index cold, the upper reopened and frozen into a layer.
+func TestRenameLowerDirectoryRedirects(t *testing.T) {
+	f := setup(t, map[string]string{"target/a/x": "x", "target/b": "b", "target/c": "c"})
+	write(t, f, "target/c", "changed", os.O_WRONLY|os.O_TRUNC)
+	info, err := f.Lstat("target/a/x")
+	must(t, err)
+	id, _ := ident.Of(info)
+	must(t, f.Rename("target", "moved"))
+	for _, p := range []string{"moved/a", "moved/b"} {
+		if _, err := os.Lstat(filepath.Join(f.Upper(), p)); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("rename copied %s up: %v", p, err)
+		}
+	}
+	check := func(stage string, g *FS) {
+		t.Helper()
+		assertGone(t, g, "target")
+		assertNames(t, g, "moved", "a", "b", "c")
+		for p, want := range map[string]string{"moved/a/x": "x", "moved/b": "b", "moved/c": "changed"} {
+			if got := read(t, g, p); got != want {
+				t.Fatalf("%s: %s = %q, want %q", stage, p, got, want)
+			}
+		}
+		if p, ok := g.Locate(id); !ok || p != "moved/a/x" {
+			t.Fatalf("%s: Locate = %q %v, want moved/a/x", stage, p, ok)
+		}
+	}
+	check("live", f)
+	f.Cool(time.Now().Add(time.Hour))
+	check("cold", f)
+	reopened, err := New(f.Upper(), nil, f.bottom, nil)
+	must(t, err)
+	check("reopened", reopened)
+	frozen := freezeForTest(t, reopened)
+	assertFrozenIndexMatchesDisk(t, frozen)
+	over, err := New(t.TempDir(), []*Layer{frozen}, f.bottom, nil)
+	must(t, err)
+	check("frozen", over)
+	// Moved back over the layer, which whites target out, it redirects to moved.
+	must(t, over.Rename("moved", "target"))
+	assertGone(t, over, "moved")
+	if got := read(t, over, "target/a/x"); got != "x" {
+		t.Fatalf("moved back: target/a/x = %q", got)
+	}
+	// Moved back within one upper, it shows from its own name again.
+	g := setup(t, map[string]string{"t/x": "x"})
+	must(t, g.Rename("t", "m"))
+	must(t, g.Rename("m", "t"))
+	assertGone(t, g, "m")
+	if got := read(t, g, "t/x"); got != "x" {
+		t.Fatalf("moved back in one upper: t/x = %q", got)
+	}
+	if _, err := os.Lstat(filepath.Join(g.Upper(), "t", redirectName)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("moved back in one upper: redirect marker kept: %v", err)
+	}
 }
 
 // TestRenameOntoNonEmptyDirFails enforces directory replacement constraints.

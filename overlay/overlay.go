@@ -29,8 +29,10 @@ const (
 	whPrefix   = ".wh."
 	metaPrefix = ".wh..wh."
 	opaqueName = metaPrefix + ".opq"
-	workName   = metaPrefix + "work"
-	writeFlags = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREATE | os.O_TRUNC
+	// redirectName holds a directory's [Entry.Redirect] origin as its content.
+	redirectName = metaPrefix + "redirect"
+	workName     = metaPrefix + "work"
+	writeFlags   = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREATE | os.O_TRUNC
 )
 
 // FS is a concurrent-safe writable upper over immutable layers and a bottom.
@@ -345,10 +347,13 @@ func (f *FS) Empty() (bool, error) {
 	return true, nil
 }
 
-// source identifies the upper, a frozen layer, or the bottom for one lookup.
+// source identifies the upper, a frozen layer, or the bottom for one lookup,
+// and the path that level holds the entry at: the overlay path, translated
+// through the redirects of the levels above (see [Entry.Redirect]).
 type source struct {
 	layer *Layer
 	upper bool
+	path  string
 }
 
 // up maps an overlay path into its writable upper.
@@ -360,56 +365,77 @@ func (f *FS) lookup(p string) (source, os.FileInfo, error) {
 		return source{}, nil, notExist("lstat", p)
 	}
 	if p == "" && f.index == nil && f.upper != "" && f.rootInfo != nil {
-		return source{upper: true}, f.rootInfo, nil
+		return source{upper: true, path: p}, f.rootInfo, nil
 	}
+	q := p
 	if f.index != nil {
 		if e, ok := f.index.entries[p]; ok {
 			if e.Kind == KindWhiteout {
 				return source{}, nil, notExist("lstat", p)
 			}
 			if m := f.files[p]; m != nil {
-				return source{layer: f.index, upper: true}, m.info(path.Base(p)), nil
+				return source{layer: f.index, upper: true, path: p}, m.info(path.Base(p)), nil
 			}
 			info, err := f.upperInfo(p, e)
-			return source{layer: f.index, upper: true}, info, err
+			return source{layer: f.index, upper: true, path: p}, info, err
 		}
 		if f.index.barrier(p) {
 			return source{}, nil, notExist("lstat", p)
 		}
+		q = f.index.redirected(p)
 	}
+	return f.lookupBelow(p, q)
+}
+
+// lookupBelow looks up overlay path p, which the upper does not hold, in the
+// frozen layers and the bottom, the topmost of which holds it at q.
+func (f *FS) lookupBelow(p, q string) (source, os.FileInfo, error) {
 	for _, l := range f.layers {
 		v := l.view()
-		if e, ok := v.entries[p]; ok {
+		if e, ok := v.entries[q]; ok {
 			if e.Kind == KindWhiteout {
 				return source{}, nil, notExist("lstat", p)
 			}
-			return source{layer: l}, e.Info, nil
+			return source{layer: l, path: q}, e.Info, nil
 		}
-		if v.barrier(p) {
+		if v.barrier(q) {
 			return source{}, nil, notExist("lstat", p)
 		}
+		q = v.redirected(q)
 	}
 	if f.bottom == nil {
 		return source{}, nil, notExist("lstat", p)
 	}
-	info, err := f.bottom.Lstat(p)
+	info, err := f.bottom.Lstat(q)
 	if missing(err) {
 		return source{}, nil, notExist("lstat", p)
 	}
-	return source{}, info, err
+	return source{path: q}, info, err
+}
+
+// lowerPath is upper path p as the levels below the upper would hold it if
+// the upper had no entry at p: translated through its ancestors' redirects.
+func (f *FS) lowerPath(p string) string {
+	if p == "" || f.index == nil {
+		return p
+	}
+	return path.Join(f.index.redirected(parent(p)), path.Base(p))
 }
 
 // lowerHas detects a name in any immutable source, even if currently hidden.
 func (f *FS) lowerHas(p string) (bool, error) {
+	q := f.lowerPath(p)
 	for _, l := range f.layers {
-		if e, ok := l.view().entries[p]; ok && e.Kind != KindWhiteout {
+		v := l.view()
+		if e, ok := v.entries[q]; ok && e.Kind != KindWhiteout {
 			return true, nil
 		}
+		q = v.redirected(q)
 	}
 	if f.bottom == nil {
 		return false, nil
 	}
-	_, err := f.bottom.Lstat(p)
+	_, err := f.bottom.Lstat(q)
 	if missing(err) {
 		return false, nil
 	}
@@ -423,20 +449,21 @@ func (f *FS) readlink(s source, p string) (string, error) {
 		return filepath.ToSlash(target), err
 	}
 	if s.layer != nil {
-		return s.layer.Readlink(p)
+		return s.layer.Readlink(s.path)
 	}
-	return f.bottom.Readlink(p)
+	return f.bottom.Readlink(s.path)
 }
 
 // InBottom reports whether name, without following a final symlink, is
-// served by the bottom: neither the upper nor a frozen layer provides or
-// hides it.
-func (f *FS) InBottom(name string) bool {
+// served by the bottom, neither the upper nor a frozen layer providing or
+// hiding it, and the path the bottom holds it at: name's, unless a renamed
+// directory above it redirects there (see [Entry.Redirect]).
+func (f *FS) InBottom(name string) (string, bool) {
 	f.await(name)
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	s, _, err := f.lookupRead(Clean(name))
-	return err == nil && !s.upper && s.layer == nil
+	return s.path, err == nil && !s.upper && s.layer == nil
 }
 
 // Lstat describes name without following its final symlink.
@@ -507,8 +534,8 @@ func (f *FS) ReadDir(name string) ([]os.FileInfo, error) {
 
 // readDir applies ancestor barriers, whiteouts, opaque directories and shadows.
 func (f *FS) readDir(p string) ([]os.FileInfo, error) {
-	if !reserved(p) && f.bottomOnly(p) {
-		items, err := f.bottom.ReadDir(p)
+	if q, ok := f.bottomOnly(p); ok && !reserved(p) {
+		items, err := f.bottom.ReadDir(q)
 		if err != nil {
 			return nil, err
 		}
@@ -523,13 +550,16 @@ func (f *FS) readDir(p string) ([]os.FileInfo, error) {
 	}
 	seen := make(map[string]bool)
 	out := make([]os.FileInfo, 0)
+	// q is p as the level merged next holds it (see [Entry.Redirect]).
+	q := p
 	merge := func(l *Layer, upper bool) (bool, error) {
 		l = l.view()
-		e, present := l.entries[p]
+		defer func() { q = l.redirected(q) }()
+		e, present := l.entries[q]
 		if present && e.Kind != KindDir {
 			return true, nil
 		}
-		for n, c := range l.children[p] {
+		for n, c := range l.children[q] {
 			if seen[n] {
 				continue
 			}
@@ -552,7 +582,8 @@ func (f *FS) readDir(p string) ([]os.FileInfo, error) {
 			}
 			out = append(out, ci)
 		}
-		return (present && e.Opaque) || l.barrier(p), nil
+		// Its own redirect has the levels below list q elsewhere, whatever is above.
+		return (present && e.Opaque) || (e.Redirect == "" && l.barrier(q)), nil
 	}
 	stop := false
 	if f.index != nil {
@@ -571,7 +602,7 @@ func (f *FS) readDir(p string) ([]os.FileInfo, error) {
 		}
 	}
 	if !stop && f.bottom != nil {
-		items, err := f.bottom.ReadDir(p)
+		items, err := f.bottom.ReadDir(q)
 		if err != nil && !missing(err) {
 			return nil, err
 		}
@@ -587,22 +618,31 @@ func (f *FS) readDir(p string) ([]os.FileInfo, error) {
 }
 
 // bottomOnly reports whether no upper or layer level has an entry, child or
-// barrier at directory p, so the bottom listing alone is the result.
-func (f *FS) bottomOnly(p string) bool {
+// barrier at directory p, so the bottom listing alone is the result, and the
+// path the bottom holds p at (see [Entry.Redirect]).
+func (f *FS) bottomOnly(p string) (string, bool) {
 	if f.bottom == nil {
-		return false
+		return "", false
+	}
+	q := p
+	if f.index != nil {
+		if !f.index.untouched(q) {
+			return "", false
+		}
+		q = f.index.redirected(q)
 	}
 	for _, l := range f.layers {
-		if !l.untouched(p) {
-			return false
+		v := l.view()
+		if !v.untouched(q) {
+			return "", false
 		}
+		q = v.redirected(q)
 	}
-	return f.index == nil || f.index.untouched(p)
+	return q, true
 }
 
-// untouched reports whether l has no entry, child or barrier for directory p.
+// untouched reports whether view l has no entry, child or barrier for directory p.
 func (l *Layer) untouched(p string) bool {
-	l = l.view()
 	_, present := l.entries[p]
 	return !present && len(l.children[p]) == 0 && !l.barrier(p)
 }
@@ -640,10 +680,10 @@ func (f *FS) openLower(name string, flag int) (h billy.File, ok bool, err error)
 		return nil, false, nil
 	}
 	if s.layer != nil {
-		h, err := s.layer.open(p, p, flag)
+		h, err := s.layer.open(s.path, p, flag)
 		return h, true, err
 	}
-	c, err := bottom.Open(p)
+	c, err := bottom.Open(s.path)
 	if err != nil {
 		return nil, true, err
 	}
@@ -711,10 +751,10 @@ retry:
 		} else {
 			bottom, epoch := f.bottom, f.bottomEpoch
 			f.mu.Unlock()
-			target, linkErr = bottom.Readlink(p)
+			target, linkErr = bottom.Readlink(s.path)
 			f.mu.Lock()
 			current, currentInfo, currentErr := f.lookup(p)
-			if f.bottomEpoch != epoch || currentErr != nil || current.layer != nil || currentInfo.Mode()&os.ModeSymlink == 0 {
+			if f.bottomEpoch != epoch || currentErr != nil || current != s || currentInfo.Mode()&os.ModeSymlink == 0 {
 				goto retry
 			}
 		}
@@ -765,14 +805,14 @@ retry:
 			return h, nil
 		}
 		if s.layer != nil {
-			return s.layer.open(p, original, flag)
+			return s.layer.open(s.path, original, flag)
 		}
 		if !info.Mode().IsRegular() {
 			return nil, &fs.PathError{Op: "open", Path: name, Err: syscall.EISDIR}
 		}
 		bottom := f.bottom
 		f.mu.Unlock()
-		fh, err := bottom.Open(p)
+		fh, err := bottom.Open(s.path)
 		f.mu.Lock()
 		if err != nil {
 			return nil, err
@@ -842,7 +882,7 @@ retry:
 					return nil, err
 				}
 			} else if s.layer == nil && info.Mode().IsRegular() {
-				changed, err := f.copyUpBottomForOpen(p, info)
+				changed, err := f.copyUpBottomForOpen(p, s.path, info)
 				if err != nil {
 					return nil, err
 				}
@@ -1311,7 +1351,11 @@ retry:
 	return f.touchDir(parent(dst), true)
 }
 
-// Rename materializes a merged source tree before moving it entirely in upper.
+// Rename moves a name in the upper. A file is copied up first; a directory
+// moves without its tree, which the levels below keep: one showing part of
+// theirs takes a redirect to where they hold it (see [Entry.Redirect]), and
+// redirects below it move along. Either way a name the levels below hold is
+// whited out, and the cost is the upper's part of the tree.
 func (f *FS) Rename(from, to string) error {
 	defer f.names.Add(1) // after the move, see [FS.Names]
 	f.await(from)
@@ -1377,6 +1421,10 @@ retry:
 		}
 		goto retry
 	}
+	origin := ""
+	if sinfo.IsDir() {
+		origin = f.origin(src)
+	}
 	inPlace := !lower && f.index.entries[parent(dst)].Kind == KindDir
 	if inPlace && f.hostFile(src) && (derr != nil || f.hostFile(dst) && dstAlias == "") && f.queueable() {
 		return f.queueRename(src, dst, dinfo)
@@ -1392,16 +1440,33 @@ retry:
 	if inPlace && f.hostFile(src) && f.lazyDirs() && (derr != nil || f.hostFile(dst) && dstAlias == "") {
 		return f.renameOutside(src, dst, dinfo)
 	}
-	if sinfo.IsDir() {
-		err = f.copyUpTree(src)
-	} else {
+	if origin != "" {
+		// What a memory file below src shadows of the levels below would show
+		// under the new name after a crash: such files go to disk first.
+		linked, err := f.spillBelow(src)
+		if err != nil {
+			return err
+		}
+		if linked {
+			goto retry // after the queued links of their other names
+		}
+	}
+	if !sinfo.IsDir() {
 		err = f.copyUp(src)
+	} else {
+		err = f.ensureDir(src)
 	}
 	if err != nil {
 		return err
 	}
 	if err := f.ensureDir(parent(dst)); err != nil {
 		return err
+	}
+	if origin != "" {
+		// The marker moves with the directory: a crash leaves it at either name.
+		if err := f.setRedirect(src, origin); err != nil {
+			return err
+		}
 	}
 	if derr == nil && dinfo.IsDir() && ds.upper {
 		if err := f.ids.release(dinfo); err != nil {
@@ -1451,9 +1516,12 @@ retry:
 			return err
 		}
 	}
-	if sinfo.IsDir() {
+	switch {
+	case origin != "":
+		err = f.placeRedirect(dst, dstMarked)
+	case sinfo.IsDir():
 		err = f.placeDir(dst, true, dstMarked)
-	} else {
+	default:
 		if f.files[dst] == nil {
 			err = f.clearWhiteout(dst, dstMarked)
 		}
@@ -1651,6 +1719,95 @@ func (f *FS) placeDir(p string, complete, marked bool) error {
 	return f.refresh(p)
 }
 
+// origin returns the redirect a directory renamed from src moves with: where
+// the levels below hold the tree it shows of theirs, or "" when it shows
+// none (an opaque directory or one below it, or one only the upper holds,
+// whose redirected subdirectories show theirs wherever they move).
+func (f *FS) origin(src string) string {
+	e := f.index.entries[src]
+	if e.Redirect != "" {
+		return e.Redirect // whatever is above, see [Layer.barrier]
+	}
+	if e.Opaque || f.index.barrier(src) {
+		return ""
+	}
+	q := f.lowerPath(src)
+	if _, info, err := f.lookupBelow(src, q); err == nil && info.IsDir() {
+		return q
+	}
+	return ""
+}
+
+// setRedirect points upper directory p at origin (see [Entry.Redirect]), or
+// drops its redirect for "". The marker is staged and renamed into place, so
+// a crash leaves the old or the new one whole.
+func (f *FS) setRedirect(p, origin string) error {
+	e := f.index.entries[p]
+	if e.Redirect == origin {
+		return nil
+	}
+	return f.preserveDirTime(p, func() error {
+		marker := filepath.Join(f.up(p), redirectName)
+		if origin == "" {
+			if err := removeMarker(marker); err != nil {
+				return err
+			}
+		} else {
+			tmp := f.stagingName()
+			err := os.WriteFile(tmp, []byte(origin), 0o644)
+			if err == nil {
+				err = hostfile.Rename(tmp, marker)
+			}
+			if err != nil {
+				return errors.Join(err, removeMarker(tmp))
+			}
+		}
+		e.Redirect = origin
+		f.index.set(p, e)
+		return nil
+	})
+}
+
+// spillBelow moves every memory file named at or below directory p to disk
+// under that name, reporting whether one had other names, which follow as
+// queued links. The caller waited for the host changes on p.
+func (f *FS) spillBelow(p string) (bool, error) {
+	var below []string
+	for q := range f.files {
+		if q == p || strings.HasPrefix(q, p+"/") {
+			below = append(below, q)
+		}
+	}
+	linked := false
+	for _, q := range below {
+		m := f.files[q]
+		if m == nil {
+			continue // spilled under another of its names
+		}
+		linked = linked || len(m.others) != 0
+		if err := f.spillAs(m, q); err != nil {
+			return linked, err
+		}
+	}
+	return linked, nil
+}
+
+// placeRedirect settles directory p, renamed with its redirect, at its new
+// name; marked is [FS.mayHoldMarker] of p before p took its new entry. One
+// renamed back to where the levels below hold its tree needs no redirect,
+// unless an opaque directory above would hide that tree then.
+func (f *FS) placeRedirect(p string, marked bool) error {
+	if f.index.entries[p].Redirect == f.lowerPath(p) && !f.index.barrier(p) {
+		if err := f.setRedirect(p, ""); err != nil {
+			return err
+		}
+	}
+	if err := f.clearWhiteout(p, marked); err != nil {
+		return err
+	}
+	return f.refresh(p)
+}
+
 // whiteout places a marker before removing an upper entry.
 func (f *FS) whiteout(p string) error {
 	if err := f.ensureDir(parent(p)); err != nil {
@@ -1756,10 +1913,10 @@ func (f *FS) ensureDir(p string) error {
 	return f.refresh(p)
 }
 
-// copyUpBottomForOpen stages an immutable bottom file without holding mu.
-// On reacquiring mu it either publishes that same file or tells OpenFile to
-// resolve the name again if another operation changed its source.
-func (f *FS) copyUpBottomForOpen(p string, info os.FileInfo) (bool, error) {
+// copyUpBottomForOpen stages immutable bottom file q, shown at p, without
+// holding mu. On reacquiring mu it either publishes that same file or tells
+// OpenFile to resolve the name again if another operation changed its source.
+func (f *FS) copyUpBottomForOpen(p, q string, info os.FileInfo) (bool, error) {
 	bottom, epoch, ids := f.bottom, f.bottomEpoch, f.ids
 	id := f.inherit(source{}, p, info)
 	inMemory := f.mem != nil && info.Size() <= f.mem.fileMax
@@ -1773,13 +1930,13 @@ func (f *FS) copyUpBottomForOpen(p string, info os.FileInfo) (bool, error) {
 		var err error
 		if inMemory {
 			var c Content
-			c, err = bottom.Open(p)
+			c, err = bottom.Open(q)
 			if err == nil {
 				data, err = readBounded(c, info.Size(), f.mem.fileMax)
 				err = errors.Join(err, c.Close())
 			}
 		} else {
-			err = bottom.CopyTo(p, tmp)
+			err = bottom.CopyTo(q, tmp)
 			if err == nil {
 				err = ids.persist(tmp, id)
 			}
@@ -1789,7 +1946,7 @@ func (f *FS) copyUpBottomForOpen(p string, info os.FileInfo) (bool, error) {
 		}
 		f.mu.Lock()
 		current, currentInfo, lookupErr := f.lookup(p)
-		if f.bottomEpoch != epoch || lookupErr != nil || current.layer != nil || !currentInfo.Mode().IsRegular() {
+		if f.bottomEpoch != epoch || lookupErr != nil || current != (source{path: q}) || !currentInfo.Mode().IsRegular() {
 			if tmp != "" {
 				ids.discard(tmp)
 			}
@@ -1846,9 +2003,9 @@ func (f *FS) copyUp(p string) error {
 	tmp := filepath.Join(f.work, strconv.FormatUint(f.tmpSeq, 36))
 	defer f.ids.discard(tmp)
 	if s.layer != nil {
-		err = s.layer.copyTo(p, tmp, info)
+		err = s.layer.copyTo(s.path, tmp, info)
 	} else {
-		err = f.bottom.CopyTo(p, tmp)
+		err = f.bottom.CopyTo(s.path, tmp)
 	}
 	if err == nil {
 		err = f.ids.persist(tmp, f.inherit(s, p, info))
@@ -1863,29 +2020,6 @@ func (f *FS) copyUp(p string) error {
 		return err
 	}
 	return f.refresh(p)
-}
-
-// copyUpTree recursively copies the merged view rather than any one layer.
-func (f *FS) copyUpTree(p string) error {
-	if err := f.ensureDir(p); err != nil {
-		return err
-	}
-	items, err := f.readDir(p)
-	if err != nil {
-		return err
-	}
-	for _, info := range items {
-		q := path.Join(p, info.Name())
-		if info.IsDir() {
-			err = f.copyUpTree(q)
-		} else {
-			err = f.copyUp(q)
-		}
-		if err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // upperInfo returns an indexed upper entry's metadata. Every change made

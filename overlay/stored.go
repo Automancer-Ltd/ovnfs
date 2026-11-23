@@ -55,19 +55,20 @@ type manifest struct {
 
 // manifestEntry restores one indexed path; whiteouts carry only Path and Kind.
 type manifestEntry struct {
-	Path   string `json:"p"`
-	Name   string `json:"n,omitempty"` // the root's name; others are named by their last component
-	Kind   Kind   `json:"k"`
-	Opaque bool   `json:"o,omitempty"`
-	Mode   uint32 `json:"m,omitempty"` // os.FileMode, type bits included
-	Size   int64  `json:"s,omitempty"`
-	Sec    int64  `json:"t,omitempty"` // modification time
-	Nsec   int64  `json:"u,omitempty"`
-	Sys    []byte `json:"x,omitempty"` // native stat record, see encodeSys
-	ID     uint64 `json:"i,omitempty"` // the entry's ident.ID, shared by hard links; version 2
-	Link   int    `json:"l,omitempty"` // 1 + index of the first entry naming the same host file; version 1
-	Blob   string `json:"b,omitempty"` // stored content; absent: the raw file stays in the directory
-	Origin string `json:"q,omitempty"` // rename's source path in the parent layer view
+	Path     string `json:"p"`
+	Name     string `json:"n,omitempty"` // the root's name; others are named by their last component
+	Kind     Kind   `json:"k"`
+	Opaque   bool   `json:"o,omitempty"`
+	Mode     uint32 `json:"m,omitempty"` // os.FileMode, type bits included
+	Size     int64  `json:"s,omitempty"`
+	Sec      int64  `json:"t,omitempty"` // modification time
+	Nsec     int64  `json:"u,omitempty"`
+	Sys      []byte `json:"x,omitempty"` // native stat record, see encodeSys
+	ID       uint64 `json:"i,omitempty"` // the entry's ident.ID, shared by hard links; version 2
+	Link     int    `json:"l,omitempty"` // 1 + index of the first entry naming the same host file; version 1
+	Blob     string `json:"b,omitempty"` // stored content; absent: the raw file stays in the directory
+	Origin   string `json:"q,omitempty"` // rename's source path in the parent layer view
+	Redirect string `json:"d,omitempty"` // a directory's Entry.Redirect
 }
 
 // storedInfo is metadata a manifest restores: exactly what the host reported
@@ -285,7 +286,7 @@ func (l *Layer) Store(ids map[string]string, tree string, blobs Blobs) error {
 func (l *Layer) manifest(ids map[string]string, tree string) (manifest, error) {
 	m := manifest{Version: manifestVersion, Tree: tree, Synthetic: l.synthetic}
 	err := l.Walk(func(p string, e Entry) error {
-		me := manifestEntry{Path: p, Kind: e.Kind, Opaque: e.Opaque, Blob: ids[p], Origin: e.Origin}
+		me := manifestEntry{Path: p, Kind: e.Kind, Opaque: e.Opaque, Blob: ids[p], Origin: e.Origin, Redirect: e.Redirect}
 		if e.Kind != KindWhiteout {
 			id, ok := ident.Of(e.Info)
 			if !ok {
@@ -700,6 +701,12 @@ func (l *Layer) load(i int, me manifestEntry) error {
 		l.ids[p] = me.Blob
 	}
 	e.Opaque = me.Opaque
+	if me.Redirect != "" {
+		if e.Kind != KindDir || Clean(me.Redirect) != me.Redirect || reserved(me.Redirect) {
+			return fmt.Errorf("%q has redirect %q", p, me.Redirect)
+		}
+		e.Redirect = me.Redirect
+	}
 	if validOrigin(e.Kind, me.Origin) {
 		e.Origin = me.Origin
 	}
@@ -732,6 +739,9 @@ func (l *Layer) prune() bool {
 			}
 			if e.Opaque {
 				_ = os.Remove(filepath.Join(host, opaqueName))
+			}
+			if e.Redirect != "" {
+				_ = os.Remove(filepath.Join(host, redirectName))
 			}
 			if p != "" {
 				dirs = append(dirs, p)

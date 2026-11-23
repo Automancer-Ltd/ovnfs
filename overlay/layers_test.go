@@ -130,7 +130,30 @@ func TestRenameEveryLevel(t *testing.T) {
 	}
 }
 
-// TestThreeLayerDirectoryRename materializes every visible level but no hidden names.
+// TestUnredirected checks where a layer shows paths of the levels below it:
+// the redirect whose origin holds the path most closely wins, and only whole
+// components match.
+func TestUnredirected(t *testing.T) {
+	l := &Layer{entries: map[string]Entry{}, children: map[string]map[string]Entry{}}
+	for d, o := range map[string]string{"n": "a", "n/s": "a/b/c", "m": "x/y"} {
+		l.set(d, Entry{Kind: KindDir, Redirect: o})
+	}
+	for p, want := range map[string]string{
+		"a":          "n",
+		"a/f/.git":   "n/f/.git",
+		"a/b/c/.git": "n/s/.git",
+		"a/b/.git":   "n/b/.git",
+		"x/y/z/.git": "m/z/.git",
+		"x/.git":     "x/.git",
+		"ab/.git":    "ab/.git",
+	} {
+		if got := l.Unredirected(p); got != want {
+			t.Errorf("Unredirected(%q) = %q, want %q", p, got, want)
+		}
+	}
+}
+
+// TestThreeLayerDirectoryRename shows every visible level at the new name but no hidden names.
 func TestThreeLayerDirectoryRename(t *testing.T) {
 	f := stackFixture(t)
 	write(t, f, "d/up", "upper", os.O_CREATE|os.O_WRONLY)
@@ -141,7 +164,7 @@ func TestThreeLayerDirectoryRename(t *testing.T) {
 	assertGone(t, f, "moved/gone")
 	for _, p := range []string{"base", "low", "mid", "top"} {
 		if got := read(t, f, "moved/sub/"+p); got != "nested "+map[string]string{"base": "bottom", "low": "low", "mid": "mid", "top": "top"}[p] {
-			t.Fatalf("copied %s = %q", p, got)
+			t.Fatalf("moved %s = %q", p, got)
 		}
 	}
 	must(t, f.MkdirAll("d", 0o755))

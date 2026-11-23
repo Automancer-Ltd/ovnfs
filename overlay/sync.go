@@ -69,12 +69,12 @@ func (f *FS) SyncFile(name string, id ident.ID, opened billy.File) error {
 		return syncHostFile(f.upper, p, fd)
 	}
 	if src.layer != nil {
-		return src.layer.Content(p, func(_, blob string) error {
+		return src.layer.Content(src.path, func(_, blob string) error {
 			if blob != "" {
 				// A completed snapshot may still live in an unsynced pack.
 				return src.layer.blobs.SyncBlob(blob)
 			}
-			return syncHostFile(src.layer.dir, p, nil)
+			return syncHostFile(src.layer.dir, src.path, nil)
 		})
 	}
 	return nil // The bottom received no writes.

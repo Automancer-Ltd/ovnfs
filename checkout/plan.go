@@ -145,15 +145,16 @@ func (r *Registry) Plan(ctx context.Context, args api.PlanArgs) (api.PlanReply, 
 		view := h.base.view
 		// Sized as an attach offers them: a path still holding the base's
 		// leaf as the base does (an LFS leaf as its pointer), others as the
-		// layer or the stored blob holding them.
+		// layer entry (wherever a directory move left it) or the stored blob
+		// holding them.
 		info := func(p string) source.Info {
 			f := now.files[p]
 			if leaf, ok := view.Leaf(p); ok && f == leaf {
 				info, _, _ := offeredInfo(view, p)
 				return info
 			}
-			if l, ok := now.layers[p]; ok {
-				if e, ok := l.Get(p); ok && e.Info != nil {
+			if from := now.supplier(p); from.layer != nil {
+				if e, ok := from.layer.Get(from.path); ok && e.Info != nil {
 					return source.Info{Mtime: e.Info.ModTime(), Size: e.Info.Size()}
 				}
 			}

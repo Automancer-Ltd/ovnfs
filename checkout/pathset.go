@@ -79,6 +79,15 @@ func (s *pathSet) removeUnder(p string, fn func(string)) {
 	n.kids = nil
 }
 
+// below yields every member strictly below p, in no particular order.
+func (s *pathSet) below(p string) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		if n := s.node(p, false); n != nil {
+			walkPaths(n, p, yield)
+		}
+	}
+}
+
 // all yields every member, in no particular order.
 func (s *pathSet) all() iter.Seq[string] {
 	return func(yield func(string) bool) {

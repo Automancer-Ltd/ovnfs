@@ -67,12 +67,13 @@ type storedFixture struct {
 }
 
 // newStoredFixture builds the raw layer: files, an executable, a symlink, a
-// hard link, nested and read-only directories, an opaque directory and a
-// whiteout over the bottom.
+// hard link, nested and read-only directories, an opaque directory, a
+// whiteout over the bottom and a directory renamed from the bottom, which
+// redirects there.
 func newStoredFixture(t *testing.T) *storedFixture {
 	t.Helper()
-	sf := &storedFixture{dir: filepath.Join(t.TempDir(), "layer"), bottom: dirBottom{tree(t, map[string]string{"gone": "bottom", "opq/hidden": "bottom", "src/base": "bottom"})}, blobs: memBlobs{}, ids: map[string]string{}}
-	files := map[string]string{"src/a.txt": "alpha", "src/run.sh": "#!/bin/sh\n", "keep.log": "raw", "deep/er/x": "deep", "raw/dir/y": "raw too", "opq/z": "zed", "ro/f": "read-only parent"}
+	sf := &storedFixture{dir: filepath.Join(t.TempDir(), "layer"), bottom: dirBottom{tree(t, map[string]string{"gone": "bottom", "opq/hidden": "bottom", "src/base": "bottom", "moved/kept": "bottom"})}, blobs: memBlobs{}, ids: map[string]string{}}
+	files := map[string]string{"src/a.txt": "alpha", "src/run.sh": "#!/bin/sh\n", "keep.log": "raw", "deep/er/x": "deep", "raw/dir/y": "raw too", "opq/z": "zed", "ro/f": "read-only parent", "renamed/new": "added"}
 	for p, data := range files {
 		host := filepath.Join(sf.dir, filepath.FromSlash(p))
 		must(t, os.MkdirAll(filepath.Dir(host), 0o755))
@@ -89,6 +90,8 @@ func newStoredFixture(t *testing.T) *storedFixture {
 	sf.ids["src/hard"] = "blob-src/a.txt"
 	must(t, os.WriteFile(filepath.Join(sf.dir, ".wh.gone"), nil, 0o644))
 	must(t, os.WriteFile(filepath.Join(sf.dir, "opq", opaqueName), nil, 0o644))
+	must(t, os.WriteFile(filepath.Join(sf.dir, "renamed", redirectName), []byte("moved"), 0o644))
+	must(t, os.WriteFile(filepath.Join(sf.dir, ".wh.moved"), nil, 0o644))
 	must(t, os.Chmod(filepath.Join(sf.dir, "ro"), 0o555))
 	t.Cleanup(func() { os.Chmod(filepath.Join(sf.dir, "ro"), 0o755) })
 	var err error
@@ -116,7 +119,7 @@ func viewOf(t *testing.T, f *FS) map[string]pathView {
 		info, err := f.Lstat(p)
 		must(t, err)
 		v := pathView{Name: info.Name(), Mode: info.Mode().String(), Size: info.Size(), MTime: info.ModTime().UnixNano(), Sys: info.Sys(), Listed: true}
-		if f.InBottom(p) {
+		if _, ok := f.InBottom(p); ok {
 			v.Sys = stableSystemInfo(info) // the bottom is stat live, and reading it moves its access time
 		}
 		if listed != nil {
@@ -193,6 +196,9 @@ func TestStoredLayerServesTheSameView(t *testing.T) {
 	}
 	if _, ok := want["opq/hidden"]; ok {
 		t.Fatal("opaque directory did not hide the bottom")
+	}
+	if _, ok := want["moved"]; ok || want["renamed/kept"].Content != "bottom" || want["renamed/new"].Content != "added" {
+		t.Fatalf("redirect shows moved %v, renamed/kept %+v, renamed/new %+v", ok, want["renamed/kept"], want["renamed/new"])
 	}
 	open, err := raw.Open("src/a.txt")
 	must(t, err)

@@ -491,10 +491,10 @@ func (f *FS) copyUpMem(s source, p string, info os.FileInfo) (bool, error) {
 	var data []byte
 	var err error
 	if s.layer != nil {
-		data, err = s.layer.ReadFile(p)
+		data, err = s.layer.ReadFile(s.path)
 	} else {
 		var c Content
-		if c, err = f.bottom.Open(p); err == nil {
+		if c, err = f.bottom.Open(s.path); err == nil {
 			data, err = readBounded(c, info.Size(), f.mem.fileMax)
 			err = errors.Join(err, c.Close())
 		}

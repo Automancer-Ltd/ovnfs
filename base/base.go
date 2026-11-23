@@ -333,7 +333,9 @@ func (b *Base) Domains() *source.Domains { return b.domains }
 func (b *Base) Store() *store.Store { return b.config.Store }
 
 // Blob reads a captured blob: from the store, else from the git objects of the
-// repository holding p, else (remote bases) from the source machine.
+// repository holding p, else (remote bases) from the source machine. A leaf a
+// directory rename moved to p (overlay.Entry.Redirect) keeps the blob of its
+// old path, so the capture's other repositories are asked when p's lacks it.
 func (b *Base) Blob(p string, id store.OID) ([]byte, error) {
 	if b.config.Store.Has(id) {
 		return b.config.Store.ReadBlob(id)
@@ -354,11 +356,29 @@ func (b *Base) Blob(p string, id store.OID) ([]byte, error) {
 		top = filepath.Join(b.meta.Dir, filepath.FromSlash(origin))
 	} else if repo != nil {
 		top = repo.Top
-	} else {
-		return nil, fmt.Errorf("content of %s (%s) is no longer available", p, id)
 	}
 	b.objectsMu.Lock()
 	defer b.objectsMu.Unlock()
+	err := fmt.Errorf("content of %s (%s) is no longer available", p, id)
+	if top != "" {
+		var data []byte
+		if data, err = b.repoBlob(top, repo, id); err == nil || overridden {
+			return data, err
+		}
+	}
+	for _, r := range b.index.repos {
+		if other := filepath.Join(b.meta.Dir, filepath.FromSlash(r.Path)); other != top {
+			if data, otherErr := b.repoBlob(other, nil, id); otherErr == nil {
+				return data, nil
+			}
+		}
+	}
+	return nil, err
+}
+
+// repoBlob reads blob id from the git objects of the work tree at top, whose
+// repository is repo when that is open already. The caller holds objectsMu.
+func (b *Base) repoBlob(top string, repo *git.Repo, id store.OID) ([]byte, error) {
 	objects := b.objects[top]
 	if objects == nil {
 		var err error

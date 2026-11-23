@@ -537,8 +537,12 @@ var (
 	modelCreateModes = []os.FileMode{0o644, 0o600, 0o444, 0o666, 0o755}
 )
 
-// checkHandleID checks a new handle's identity against its model node.
+// checkHandleID checks a new handle's identity against its model node; with
+// none (the model expects the open to fail), the caller's expect reports it.
 func (r *runner) checkHandleID(desc string, h billy.File, n *mNode) error {
+	if n == nil {
+		return nil
+	}
 	if hi, ok := h.(ident.Identifier); ok {
 		if err := r.ids.observe(n.id, hi.Identity()); err != nil {
 			return fmt.Errorf("%s: handle: %w", desc, err)

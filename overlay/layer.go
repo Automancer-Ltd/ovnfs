@@ -57,6 +57,11 @@ type Entry struct {
 	Opaque bool
 	Info   os.FileInfo
 	Origin string // path before this upper's renames; a delta-base hint, not file identity
+	// Redirect, on a directory a rename moved from a tree the levels below
+	// hold, is the path those levels know that tree by: they show it below
+	// the directory, under whatever the layer holds there itself, while its
+	// old name is whited out. See [FS.Rename] and [Layer.redirected].
+	Redirect string
 }
 
 // Layer is a frozen directory indexed once and safe for concurrent readers.
@@ -67,6 +72,8 @@ type Layer struct {
 	entries  map[string]Entry
 	children map[string]map[string]Entry
 	gits     map[string]bool // paths of entries named .git, see [Layer.GitEntries]
+	// redirects maps each directory with an [Entry.Redirect] to that origin.
+	redirects map[string]string
 	// fold, set on a mutable upper whose volume takes different names for
 	// one entry, gives the form of a name under which the volume finds it;
 	// folded maps each entry's [foldedPath] to its path, see [FS.claimName].
@@ -173,6 +180,14 @@ func walkLayer(dir string, live, recursive bool, listing string, ids *idStore) (
 			e := l.entries[parent(p)]
 			e.Opaque = true
 			l.set(parent(p), e)
+		case n == redirectName:
+			origin, err := readRedirect(real)
+			if err != nil {
+				return err
+			}
+			e := l.entries[parent(p)]
+			e.Redirect = origin
+			l.set(parent(p), e)
 		case strings.HasPrefix(n, metaPrefix):
 		case strings.HasPrefix(n, whPrefix):
 			q := path.Join(parent(p), strings.TrimPrefix(n, whPrefix))
@@ -215,6 +230,11 @@ func (l *Layer) Get(p string) (Entry, bool) { e, ok := l.view().entries[Clean(p)
 
 // Children returns an independent map of direct entries, including whiteouts.
 func (l *Layer) Children(p string) map[string]Entry { return maps.Clone(l.view().children[Clean(p)]) }
+
+// Redirects returns an independent map of the layer's redirected directories
+// to their origins (see [Entry.Redirect]), for callers resolving paths across
+// layers without walking them.
+func (l *Layer) Redirects() map[string]string { return maps.Clone(l.view().redirects) }
 
 // GitEntries lists the paths of the layer's entries named .git, in no order. The
 // index keeps them as it changes, so the git adapter finds a checkout's gitfiles
@@ -319,6 +339,14 @@ func (l *Layer) set(p string, e Entry) {
 			delete(l.folded, k)
 		}
 	}
+	if e.Redirect != "" {
+		if l.redirects == nil {
+			l.redirects = make(map[string]string)
+		}
+		l.redirects[p] = e.Redirect
+	} else {
+		delete(l.redirects, p)
+	}
 	if path.Base(p) == ".git" {
 		if l.gits == nil {
 			l.gits = make(map[string]bool)
@@ -354,6 +382,7 @@ func (l *Layer) drop(p string) {
 	delete(l.children, p)
 	delete(l.entries, p)
 	delete(l.gits, p)
+	delete(l.redirects, p)
 	if l.fold != nil && p != "" {
 		if k := foldedPath(parent(p), l.fold(path.Base(p))); l.folded[k] == p {
 			delete(l.folded, k)
@@ -364,17 +393,70 @@ func (l *Layer) drop(p string) {
 	}
 }
 
-// barrier reports whether this layer prevents lookup in all deeper layers.
+// barrier reports whether this layer prevents lookup in all deeper layers:
+// an ancestor of p is opaque or no directory. Above the nearest redirected
+// ancestor none counts, as the deeper layers hold p elsewhere.
 func (l *Layer) barrier(p string) bool {
 	l = l.view()
 	for q := parent(p); ; q = parent(q) {
-		if e, ok := l.entries[q]; ok && (e.Kind != KindDir || e.Opaque) {
-			return true
+		if e, ok := l.entries[q]; ok {
+			if e.Kind != KindDir || e.Opaque {
+				return true
+			}
+			if e.Redirect != "" {
+				return false
+			}
 		}
 		if q == "" {
 			return false
 		}
 	}
+}
+
+// redirected translates path p of l's view into the view of the levels below
+// l: below the nearest of p and its ancestors with an [Entry.Redirect], they
+// hold p at that origin. l is a view.
+func (l *Layer) redirected(p string) string {
+	if len(l.redirects) == 0 {
+		return p
+	}
+	for d := p; d != ""; d = parent(d) {
+		if origin, ok := l.redirects[d]; ok {
+			return origin + p[len(d):]
+		}
+	}
+	return p
+}
+
+// Unredirected translates path p of the levels below l into l's view, the
+// inverse of [Layer.redirected]: the redirect whose origin holds p most
+// closely names where l shows it. [FS.Locate] and the checkout's gitfile
+// discovery use it to find where an entry of a deeper layer shows.
+func (l *Layer) Unredirected(p string) string {
+	l = l.view()
+	at, origin := "", ""
+	for d, o := range l.redirects {
+		if (p == o || strings.HasPrefix(p, o+"/")) && (len(o) > len(origin) || len(o) == len(origin) && d < at) {
+			at, origin = d, o
+		}
+	}
+	if at == "" {
+		return p
+	}
+	return at + p[len(origin):]
+}
+
+// readRedirect reads the origin a directory's redirect marker at host path real names.
+func readRedirect(real string) (string, error) {
+	data, err := os.ReadFile(real)
+	if err != nil {
+		return "", err
+	}
+	origin := string(data)
+	if origin == "" || Clean(origin) != origin || reserved(origin) {
+		return "", fmt.Errorf("overlay: redirect marker %s names %q", real, origin)
+	}
+	return origin, nil
 }
 
 // view returns the layer holding the index: l itself, or the index a restored

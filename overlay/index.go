@@ -27,6 +27,9 @@ func (f *FS) lookupRead(p string) (source, os.FileInfo, error) {
 		return source{}, nil, err
 	}
 	blocked := d.opaque
+	// at is the nearest upper directory passed that redirects (see
+	// [Entry.Redirect]) and origin its origin, for the levels below.
+	at, origin := "", ""
 	// Each round looks up the component p[start:stop] in the upper
 	// directory p[:start-1] (the root when start is 0), which d describes.
 	start := 0
@@ -47,7 +50,10 @@ func (f *FS) lookupRead(p string) (source, os.FileInfo, error) {
 			} else if gone || blocked {
 				return source{}, nil, notExist("lstat", p)
 			}
-			return f.lookup(p)
+			if at == "" {
+				return f.lookupBelow(p, p)
+			}
+			return f.lookupBelow(p, origin+p[len(at):])
 		}
 		if stop == len(p) {
 			real := f.up(p)
@@ -56,7 +62,7 @@ func (f *FS) lookupRead(p string) (source, os.FileInfo, error) {
 				return source{}, nil, err
 			}
 			info, err = describe(real, info, f.ids)
-			return source{upper: true}, info, err
+			return source{upper: true, path: p}, info, err
 		}
 		if !isDir {
 			return source{}, nil, notExist("lstat", p)
@@ -65,6 +71,11 @@ func (f *FS) lookupRead(p string) (source, os.FileInfo, error) {
 			return source{}, nil, err
 		}
 		blocked = blocked || d.opaque
+		if d.redirect != "" {
+			// The levels below hold what is beneath child elsewhere, past
+			// any opaque directory above it.
+			at, origin, blocked = child, d.redirect, false
+		}
 		start = stop + 1
 	}
 }
@@ -90,7 +101,8 @@ type coldDirs struct {
 
 // coldDir is one upper directory as a cold lookup listed it.
 type coldDir struct {
-	opaque bool
+	opaque   bool
+	redirect string // the directory's [Entry.Redirect]
 	// entries maps each name to whether it is a directory; nil when the
 	// directory was too large to keep, and the host is asked instead.
 	entries map[string]bool
@@ -136,6 +148,15 @@ func (c *coldDirs) dir(upper, q string) (*coldDir, error) {
 		if _, err := os.Lstat(filepath.Join(real, opaqueName)); err == nil {
 			d.opaque = true
 		} else if !missing(err) {
+			return nil, err
+		}
+	}
+	if _, listed := d.entries[redirectName]; listed || d.entries == nil {
+		origin, err := readRedirect(filepath.Join(real, redirectName))
+		switch {
+		case err == nil:
+			d.redirect = origin
+		case !missing(err) || listed:
 			return nil, err
 		}
 	}

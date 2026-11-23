@@ -181,10 +181,14 @@ func (f *FS) restat(p string) error {
 	return nil
 }
 
-// setInfo indexes upper name p's metadata, keeping its opacity.
+// setInfo indexes upper name p's metadata, keeping its opacity and redirect.
 func (f *FS) setInfo(p string, info os.FileInfo) {
 	e := entry(info)
-	e.Opaque = f.index.entries[p].Opaque
+	old := f.index.entries[p]
+	e.Opaque = old.Opaque
+	if e.Kind == KindDir {
+		e.Redirect = old.Redirect
+	}
 	f.index.set(p, e)
 }
 

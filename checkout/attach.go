@@ -310,7 +310,9 @@ func (r *Registry) AttachRemote(ctx context.Context, o peer.Offer) (api.Checkout
 	return reply.Checkout, nil
 }
 
-// cacheOnlyLocked checks every retained overlay, including snapshots' cache layers.
+// cacheOnlyLocked checks every retained overlay, including snapshots' cache
+// layers. A directory a layer redirects is a change unless it, or the origin
+// it moved from, is not source.
 func (r *Registry) cacheOnlyLocked(h *checkoutRecord) (bool, error) {
 	layers := h.fs.Stack()
 	if err := h.fs.Flush(); err != nil {
@@ -328,6 +330,7 @@ func (r *Registry) cacheOnlyLocked(h *checkoutRecord) (bool, error) {
 	clean := true
 	for _, layer := range layers {
 		t.class = map[string]rules.Class{"": rules.Source}
+		redirects := layer.Redirects()
 		err := layer.Walk(func(p string, e overlay.Entry) error {
 			if p == "" {
 				if e.Opaque {
@@ -342,6 +345,14 @@ func (r *Registry) cacheOnlyLocked(h *checkoutRecord) (bool, error) {
 					return err
 				}
 			}
+			if origin, ok := redirects[p]; ok && class == rules.Source {
+				if class = t.heldClass(origin); class == rules.Source {
+					var err error
+					if class, err = t.classify(origin, nil); err != nil {
+						return err
+					}
+				}
+			}
 			if e.Kind == overlay.KindDir {
 				t.class[p] = class
 			}
@@ -349,7 +360,7 @@ func (r *Registry) cacheOnlyLocked(h *checkoutRecord) (bool, error) {
 				return nil
 			}
 			// Source directories are only scaffolding for nested cache roots.
-			if class == rules.Source && e.Kind == overlay.KindDir && !e.Opaque && len(layer.Children(p)) != 0 {
+			if class == rules.Source && e.Kind == overlay.KindDir && !e.Opaque && e.Redirect == "" && len(layer.Children(p)) != 0 {
 				return nil
 			}
 			clean = false

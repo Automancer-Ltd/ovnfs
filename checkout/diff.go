@@ -145,11 +145,11 @@ func (r *Registry) Diff(ctx context.Context, args api.DiffArgs) (api.DiffReply, 
 		var patch strings.Builder
 		kept := reply.Changes[:0:0]
 		for _, c := range reply.Changes {
-			old, err := r.content(h, c.Path, from[c.Path], nil)
+			old, err := r.content(h, from[c.Path], supply{path: c.Path})
 			if err != nil {
 				return api.DiffReply{}, coded(err)
 			}
-			cur, err := r.content(h, c.Path, now.files[c.Path], now.layers[c.Path])
+			cur, err := r.content(h, now.files[c.Path], now.supplier(c.Path))
 			if err != nil {
 				return api.DiffReply{}, coded(err)
 			}
@@ -245,20 +245,20 @@ func union(a, b map[string]store.File) map[string]store.File {
 	return out
 }
 
-// content reads a leaf's bytes: from the layer that supplied it, else the store
-// or the source's git objects.
-func (r *Registry) content(h *checkoutRecord, p string, f store.File, layer *overlay.Layer) ([]byte, error) {
+// content reads a leaf's bytes where from names: from the layer that supplied
+// it, else the store or the source's git objects.
+func (r *Registry) content(h *checkoutRecord, f store.File, from supply) ([]byte, error) {
 	if f.ID == "" || f.Mode == store.ModeDir {
 		return nil, nil
 	}
-	if layer != nil {
+	if from.layer != nil {
 		if f.Mode == store.ModeSymlink {
-			target, err := layer.Readlink(p)
+			target, err := from.layer.Readlink(from.path)
 			return []byte(target), err
 		}
-		return layer.ReadFile(p)
+		return from.layer.ReadFile(from.path)
 	}
-	return h.base.view.Blob(p, f.ID)
+	return h.base.view.Blob(from.path, f.ID)
 }
 
 // binaryContent reports whether either side of a change is binary, as git
