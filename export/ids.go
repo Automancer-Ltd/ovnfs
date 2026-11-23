@@ -158,6 +158,58 @@ func (r *Router) find(fid uint64, cached bool) (p string, life uint32, ok bool) 
 	return p, life, true
 }
 
+// vanished returns the pre-fence metadata of file id fid and its checkout's
+// life when fid names a cache-root entry the host changed or removed after the
+// checkout opened and the checkout itself has not shadowed or removed it.
+func (r *Router) vanished(fid uint64) (p string, info os.FileInfo, life uint32, ok bool) {
+	slot, id := splitFileID(fid)
+	if slot == 0 || id.Space() != ident.State {
+		return "", nil, 0, false
+	}
+	var s checkout.Session
+	name, life, err := r.reg.EnterSlot(slot, &s)
+	if err != nil {
+		return "", nil, 0, false
+	}
+	defer s.Done()
+	rel, info, ok := s.FS.Vanished(id)
+	if !ok {
+		return "", nil, 0, false
+	}
+	if rel == "" {
+		return name, info, life, true
+	}
+	return name + "/" + rel, info, life, true
+}
+
+// truncateVanished materializes a vanished fenced regular file fid as an empty
+// upper file in its checkout when its checkout life matches wantLife, keeping
+// fid's identity so a client's truncating write succeeds.
+func (r *Router) truncateVanished(fid uint64, wantLife uint32) (string, os.FileInfo, error) {
+	slot, id := splitFileID(fid)
+	if slot == 0 || id.Space() != ident.State {
+		return "", nil, syscall.ESTALE
+	}
+	var s checkout.Session
+	name, life, err := r.reg.EnterSlot(slot, &s)
+	if err != nil || life != wantLife {
+		if err == nil {
+			s.Done()
+		}
+		return "", nil, syscall.ESTALE
+	}
+	defer s.Done()
+	rel, info, err := s.FS.TruncateVanished(id)
+	if err != nil {
+		return "", nil, err
+	}
+	s.Touch()
+	if rel == "" {
+		return name, info, nil
+	}
+	return name + "/" + rel, info, nil
+}
+
 // Nodes is the export for frontends that address files by file id (FUSE
 // and WinFsp inode numbers, remote-fs). Its filesystem and metadata
 // calls recall other protocols' cached copies, as every export view does.

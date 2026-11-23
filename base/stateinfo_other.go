@@ -2,7 +2,11 @@
 
 package base
 
-import "os"
+import (
+	"os"
+
+	"github.com/stencil-hq/ovnfs/internal/ident"
+)
 
 // newLocator needs no volume-specific setup for native inode numbers.
 func newLocator(_ string) locator { return locator{} }
@@ -16,5 +20,14 @@ func (l *locator) lookupInfo(info os.FileInfo, _, p string) os.FileInfo {
 
 func (l *locator) listedInfo(info os.FileInfo, _, dir string) os.FileInfo {
 	l.listed(info, dir)
+	return info
+}
+
+// rememberFenced records a pre-fence cache-root file's metadata when its State
+// identity is immediately available without an extra syscall.
+func (c *Caches) rememberFenced(p string, info os.FileInfo) os.FileInfo {
+	if id, ok := ident.Of(info); ok {
+		c.seen.put(id, p, info)
+	}
 	return info
 }

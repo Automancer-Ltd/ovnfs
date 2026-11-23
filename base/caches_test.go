@@ -572,6 +572,121 @@ func BenchmarkCacheRootReadDir(b *testing.B) {
 	})
 }
 
+// TestFencedVanishedRemembersPreFenceMetadata verifies that a cache-root file
+// changed or removed on the host after being observed leaves Lstat/ReadDir
+// while retaining its pre-fence metadata in Vanished (never leaking the host's
+// newer mtime or size), and stops reporting as vanished once hidden/removed in
+// the overlay or still visible.
+func TestFencedVanishedRemembersPreFenceMetadata(t *testing.T) {
+	repo, dir := repository(t)
+	hostA := filepath.Join(dir, "target", "deps", "a.rlib")
+	hostB := filepath.Join(dir, "target", "deps", "b.rlib")
+	writeTestFile(t, hostA, "old-a")
+	writeTestFile(t, hostB, "old-b-longer")
+	oldTime := time.Now().Add(-time.Hour).Truncate(time.Second)
+	for _, p := range []string{hostA, hostB} {
+		if err := os.Chtimes(p, oldTime, oldTime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b, _ := createTestBase(t, repo, nil)
+	c := b.TakeCaches("c1")
+	c.Wait()
+	view := b.Bottom(c)
+	f, err := overlay.New(t.TempDir(), nil, view, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	infoA, err := f.Lstat("target/deps/a.rlib")
+	if err != nil {
+		t.Fatal(err)
+	}
+	idA, ok := ident.Of(infoA)
+	if !ok {
+		t.Fatal("a.rlib has no identity")
+	}
+	// b.rlib observed via ReadDir only (as NFS READDIRPLUS does).
+	items, err := f.ReadDir("target/deps")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var idB ident.ID
+	for _, item := range items {
+		if item.Name() == "b.rlib" {
+			idB, ok = ident.Of(item)
+		}
+	}
+	if !ok || idB == 0 {
+		t.Fatal("b.rlib has no listed identity")
+	}
+
+	// While still shown by the fence, neither is vanished.
+	if p, _, ok := f.Vanished(idA); ok {
+		t.Fatalf("live a.rlib reported vanished at %q", p)
+	}
+
+	// Host rewrites a.rlib in place with newer mtime and different size, and removes b.rlib.
+	writeTestFile(t, hostA, "NEW-HOST-A-MUCH-LONGER")
+	if err := os.Remove(hostB); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Lstat("target/deps/a.rlib"); !os.IsNotExist(err) {
+		t.Fatalf("rewritten a.rlib still visible to Lstat: %v", err)
+	}
+
+	// Vanished returns the pre-fence metadata, never the host's newer size/mtime.
+	pA, vA, ok := f.Vanished(idA)
+	if !ok || pA != "target/deps/a.rlib" {
+		t.Fatalf("Vanished(a) = %q, %v; want target/deps/a.rlib, true", pA, ok)
+	}
+	if vA.Size() != int64(len("old-a")) || !vA.ModTime().Equal(oldTime) {
+		t.Fatalf("Vanished(a) metadata = size %d mtime %v; want %d, %v", vA.Size(), vA.ModTime(), len("old-a"), oldTime)
+	}
+	pB, vB, ok := f.Vanished(idB)
+	if !ok || pB != "target/deps/b.rlib" || vB.Size() != int64(len("old-b-longer")) {
+		t.Fatalf("Vanished(b) = %q, %v, %v; want target/deps/b.rlib size %d", pB, vB, ok, len("old-b-longer"))
+	}
+
+	// TruncateVanished materializes an empty upper file under idA without touching the host.
+	mp, minfo, err := f.TruncateVanished(idA)
+	if err != nil {
+		t.Fatalf("TruncateVanished(a): %v", err)
+	}
+	if mp != "target/deps/a.rlib" || minfo.Size() != 0 {
+		t.Fatalf("TruncateVanished(a) = %q size %d", mp, minfo.Size())
+	}
+	if got, _ := ident.Of(minfo); got != idA {
+		t.Fatalf("TruncateVanished(a) changed identity %v -> %v", idA, got)
+	}
+	if p, ok := f.Locate(idA); !ok || p != "target/deps/a.rlib" {
+		t.Fatalf("Locate after TruncateVanished = %q, %v", p, ok)
+	}
+	if _, _, ok := f.Vanished(idA); ok {
+		t.Fatal("materialized file still reported vanished")
+	}
+	// Removing it in the checkout makes it stay gone (whiteout/upper removal must not resurrect via Vanished).
+	if err := f.Remove("target/deps/a.rlib"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := f.Vanished(idA); ok {
+		t.Fatal("checkout-removed file reported vanished")
+	}
+	if data, err := os.ReadFile(hostA); err != nil || string(data) != "NEW-HOST-A-MUCH-LONGER" {
+		t.Fatalf("host file altered: %q, %v", data, err)
+	}
+
+	// Creating another file at b.rlib in the checkout shadows the vanished bottom entry.
+	fh, err := f.Create("target/deps/b.rlib")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fh.Close()
+	if _, _, ok := f.Vanished(idB); ok {
+		t.Fatal("upper-shadowed path still reported vanished for old id")
+	}
+}
+
 // BenchmarkCacheRootLstat measures Lstat of one entry below a cache root, in
 // a 30,000-entry folder directory, as NFS LOOKUP and GETATTR issue it.
 func BenchmarkCacheRootLstat(b *testing.B) {

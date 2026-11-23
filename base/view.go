@@ -98,6 +98,28 @@ func (v bottom) LocateAlias(id ident.ID, visible func(string) bool) bool {
 	return ok
 }
 
+// Vanished returns a remembered pre-fence cache-root entry for id that the
+// folder changed or removed after the snapshot's fence, matched by ok (which
+// rejects names shadowed or removed in the overlay). It returns false while
+// the entry is still shown by the fence or was never handed out.
+func (v bottom) Vanished(id ident.ID, ok func(string) bool) (string, os.FileInfo, bool) {
+	if id.Space() != ident.State || v.c == nil {
+		return "", nil, false
+	}
+	return v.c.seen.get(id, func(p string) bool {
+		if ok != nil && !ok(p) {
+			return false
+		}
+		info, err := v.Lstat(p)
+		if err == nil {
+			if got, known := ident.Of(info); known && got == id {
+				return false
+			}
+		}
+		return true
+	})
+}
+
 // ReadDir lists a directory: captured source names with the roots the cache
 // snapshot shows, a snapshot directory, or a folder directory below a cache
 // root.

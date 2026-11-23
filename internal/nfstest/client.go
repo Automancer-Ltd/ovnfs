@@ -135,6 +135,41 @@ func (c *Client) GetAttr(handle []byte) (client.Fattr, uint32, error) {
 	return attr, status, err
 }
 
+// SetSize performs NFSv3 SETATTR setting only size on handle.
+func (c *Client) SetSize(handle []byte, size uint64) (client.WccData, uint32, error) {
+	args := struct {
+		Handle []byte
+		Attr   client.Sattr3
+		Guard  bool
+	}{
+		Handle: handle,
+		Attr:   client.Sattr3{Size: client.SetSize{SetIt: true, Size: size}},
+	}
+	r, status, err := c.call(client.Nfs3Prog, client.NFSProc3SetAttr, args)
+	var wcc client.WccData
+	if err == nil && status == OK {
+		err = xdr.Read(r, &wcc)
+	}
+	return wcc, status, err
+}
+
+// Access performs NFSv3 ACCESS for mask on handle and returns the granted bits.
+func (c *Client) Access(handle []byte, mask uint32) (uint32, uint32, error) {
+	args := struct {
+		Handle []byte
+		Access uint32
+	}{handle, mask}
+	r, status, err := c.call(client.Nfs3Prog, client.NFSProc3Access, args)
+	var result struct {
+		Attr   client.PostOpAttr
+		Access uint32
+	}
+	if err == nil && status == OK {
+		err = xdr.Read(r, &result)
+	}
+	return result.Access, status, err
+}
+
 // Read reads a bounded range and reports the protocol EOF flag.
 func (c *Client) Read(handle []byte, offset uint64, count uint32) ([]byte, bool, uint32, error) {
 	args := struct {

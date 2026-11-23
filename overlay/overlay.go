@@ -47,14 +47,15 @@ type FS struct {
 	tmpSeq      uint64
 	pathIDs     map[string]inodeKey
 	aliases     map[inodeKey]inodeNames
-	paths       map[ident.ID]string // upper name holding each identity while the index is loaded, see [FS.Locate]
-	ids         *idStore            // identities of upper files; nil for a read-only stack
-	mem         *Memory             // nil: every write goes to upper on disk
-	files       map[string]*memFile // upper names whose data is in memory
-	hosts       map[*file]struct{}  // open descriptors of upper files, see [FS.CloseFiles]
-	writers     map[inodeKey]int    // open writable descriptors per upper inode, see [FS.upperInfo]
-	staging     sync.RWMutex        // shared by an unlocked writeback, see [FS.writeBack]
-	spillLogged atomic.Bool         // the first failed spill is logged, see [Memory.park]
+	paths       map[ident.ID]string   // upper name holding each identity while the index is loaded, see [FS.Locate]
+	removed     map[ident.ID]struct{} // State identities removed in this overlay; never revive via [FS.Vanished]
+	ids         *idStore              // identities of upper files; nil for a read-only stack
+	mem         *Memory               // nil: every write goes to upper on disk
+	files       map[string]*memFile   // upper names whose data is in memory
+	hosts       map[*file]struct{}    // open descriptors of upper files, see [FS.CloseFiles]
+	writers     map[inodeKey]int      // open writable descriptors per upper inode, see [FS.upperInfo]
+	staging     sync.RWMutex          // shared by an unlocked writeback, see [FS.writeBack]
+	spillLogged atomic.Bool           // the first failed spill is logged, see [Memory.park]
 
 	rootInfo      os.FileInfo         // root attributes while the index is cold
 	cold          coldDirs            // upper directories cold lookups listed, see [FS.lookupRead]
@@ -1219,10 +1220,19 @@ retry:
 		}
 		goto retry
 	}
+	markDead := func() {
+		if id, ok := ident.Of(info); ok && id.Space() == ident.State && !info.IsDir() && alias == "" {
+			f.markRemoved(id)
+		}
+	}
 	if !lower && f.queueable() {
 		switch {
 		case f.hostFile(p):
-			return f.queueRemove(p, info, alias)
+			err := f.queueRemove(p, info, alias)
+			if err == nil {
+				markDead()
+			}
+			return err
 		case s.upper && info.IsDir() && f.index.entries[p].Kind == KindDir:
 			if err := f.queueRmdir(p, info); !errors.Is(err, errNotQueued) {
 				return err
@@ -1237,8 +1247,13 @@ retry:
 		goto retry
 	}
 	if !lower && f.hostFile(p) && f.lazyDirs() {
-		return f.removeOutside(p, info, alias)
+		err := f.removeOutside(p, info, alias)
+		if err == nil {
+			markDead()
+		}
+		return err
 	}
+	markDead()
 	// A memory file's name may keep a marker on disk, which then stays.
 	marked := f.files[p] != nil && f.files[p].markedAt(p)
 	if s.upper {
@@ -1457,7 +1472,13 @@ retry:
 	}
 	inPlace := !lower && f.index.entries[parent(dst)].Kind == KindDir
 	if inPlace && f.hostFile(src) && (derr != nil || f.hostFile(dst) && dstAlias == "") && f.queueable() {
-		return f.queueRename(src, dst, dinfo)
+		err := f.queueRename(src, dst, dinfo)
+		if err == nil && derr == nil && !dinfo.IsDir() {
+			if id, ok := ident.Of(dinfo); ok && id.Space() == ident.State {
+				f.markRemoved(id)
+			}
+		}
+		return err
 	}
 	// Moving a memory file to a free name or over another changes the index alone.
 	indexOnly := inPlace && f.files[src] != nil && (derr != nil || f.files[dst] != nil)
@@ -1468,7 +1489,13 @@ retry:
 		goto retry
 	}
 	if inPlace && f.hostFile(src) && f.lazyDirs() && (derr != nil || f.hostFile(dst) && dstAlias == "") {
-		return f.renameOutside(src, dst, dinfo)
+		err := f.renameOutside(src, dst, dinfo)
+		if err == nil && derr == nil && !dinfo.IsDir() {
+			if id, ok := ident.Of(dinfo); ok && id.Space() == ident.State {
+				f.markRemoved(id)
+			}
+		}
+		return err
 	}
 	if !sinfo.IsDir() {
 		err = f.copyUp(src)
@@ -1511,6 +1538,11 @@ retry:
 		}
 		if linked {
 			goto retry // after the queued links of its other names
+		}
+	}
+	if derr == nil && !dinfo.IsDir() && dstAlias == "" {
+		if id, ok := ident.Of(dinfo); ok && id.Space() == ident.State {
+			f.markRemoved(id)
 		}
 	}
 	// Any other memory file moves only in the index.

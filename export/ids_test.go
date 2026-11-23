@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stencil-hq/ovnfs/api"
 	"github.com/stencil-hq/ovnfs/checkout"
@@ -376,4 +377,110 @@ func TestPathFollowsChanges(t *testing.T) {
 	if p, ok := nodes.Path(ids["app/dir/sub/file"]); ok {
 		t.Fatalf("file removed behind the export resolves to %q", p)
 	}
+}
+
+// TestVanishedCacheHandleNFS exercises a client holding NFSv3 handles of
+// fenced cache-root files (like cargo's target/) after the host rewrites or
+// removes them: GETATTR and ACCESS return the pre-fence metadata, SETATTR
+// size=0 materializes an empty upper file under the same handle so subsequent
+// WRITEs succeed, while LOOKUP hides the host's newer file and READ/WRITE
+// without truncate still fail STALE (preserving #58).
+func TestVanishedCacheHandleNFS(t *testing.T) {
+	f := newStack(t, map[string]string{
+		"source.rs":                    "fn main() {}",
+		"target/CACHEDIR.TAG":          "Signature: 8a477f597d28d172789f06886806bc55\n",
+		"target/release/deps/out":      "old-out",
+		"target/release/deps/lib.rlib": "old-rlib",
+		"target/release/deps/ro.out":   "old-ro",
+	})
+	oldTime := time.Now().Add(-time.Hour).Truncate(time.Second)
+	for _, rel := range []string{"target/release/deps/out", "target/release/deps/lib.rlib", "target/release/deps/ro.out"} {
+		host := filepath.Join(f.lower, filepath.FromSlash(rel))
+		if err := os.Chtimes(host, oldTime, oldTime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	roHost := filepath.Join(f.lower, "target", "release", "deps", "ro.out")
+	if err := os.Chmod(roHost, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(roHost, 0o644) })
+
+	f.create(t, "app")
+	c := nfstest.Start(t, f.export.NFS())
+	depsFH := lookup(t, c, "app/target/release/deps")
+	outFH, outAttr, st, err := c.Lookup(depsFH, "out")
+	nfsStatus(t, st, nfstest.OK, err)
+	rlibFH, rlibAttr, st, err := c.Lookup(depsFH, "lib.rlib")
+	nfsStatus(t, st, nfstest.OK, err)
+	roFH, _, st, err := c.Lookup(depsFH, "ro.out")
+	nfsStatus(t, st, nfstest.OK, err)
+
+	// Host rewrites out and ro.out in place and removes lib.rlib.
+	outHost := filepath.Join(f.lower, "target", "release", "deps", "out")
+	if err := os.WriteFile(outHost, []byte("NEW-HOST-OUTPUT-LONGER"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(f.lower, "target", "release", "deps", "lib.rlib")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(roHost, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(roHost, []byte("NEW-HOST-RO"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(roHost, 0o444); err != nil {
+		t.Fatal(err)
+	}
+
+	// LOOKUP must not expose the host's newer file (#58).
+	_, _, st, err = c.Lookup(depsFH, "out")
+	nfsStatus(t, st, nfstest.NoEnt, err)
+	_, _, st, err = c.Lookup(depsFH, "lib.rlib")
+	nfsStatus(t, st, nfstest.NoEnt, err)
+
+	// GETATTR and ACCESS on held handles return pre-fence metadata, never host's new size/mtime.
+	gotOut, st, err := c.GetAttr(outFH)
+	nfsStatus(t, st, nfstest.OK, err)
+	if gotOut.Filesize != outAttr.Filesize || gotOut.Mtime != outAttr.Mtime {
+		t.Fatalf("vanished GETATTR out = size %d mtime %v; want %d %v", gotOut.Filesize, gotOut.Mtime, outAttr.Filesize, outAttr.Mtime)
+	}
+	gotRlib, st, err := c.GetAttr(rlibFH)
+	nfsStatus(t, st, nfstest.OK, err)
+	if gotRlib.Filesize != rlibAttr.Filesize || gotRlib.Mtime != rlibAttr.Mtime {
+		t.Fatalf("vanished GETATTR rlib = size %d mtime %v; want %d %v", gotRlib.Filesize, gotRlib.Mtime, rlibAttr.Filesize, rlibAttr.Mtime)
+	}
+	if _, st, err := c.Access(outFH, 0x3f); err != nil || st != nfstest.OK {
+		t.Fatalf("vanished ACCESS out = st %d, err %v", st, err)
+	}
+
+	// READ and non-truncating WRITE/SETATTR still fail STALE (never serve host bytes).
+	_, _, st, err = c.Read(outFH, 0, 64)
+	nfsStatus(t, st, nfstest.Stale, err)
+	_, _, st, err = c.Write(outFH, 0, []byte("append"), nfstest.FileSync)
+	nfsStatus(t, st, nfstest.Stale, err)
+	_, st, err = c.SetSize(outFH, 3)
+	nfsStatus(t, st, nfstest.Stale, err)
+
+	// Read-only vanished file refuses SETATTR size=0 with EACCES.
+	_, st, err = c.SetSize(roFH, 0)
+	nfsStatus(t, st, nfstest.Access, err)
+
+	// SETATTR size=0 materializes an empty upper file under the same handle; WRITE then succeeds.
+	_, st, err = c.SetSize(outFH, 0)
+	nfsStatus(t, st, nfstest.OK, err)
+	_, _, st, err = c.Write(outFH, 0, []byte("checkout-out"), nfstest.FileSync)
+	nfsStatus(t, st, nfstest.OK, err)
+	nfsRead(t, c, outFH, "checkout-out")
+	if data, err := os.ReadFile(outHost); err != nil || string(data) != "NEW-HOST-OUTPUT-LONGER" {
+		t.Fatalf("host out modified: %q, %v", data, err)
+	}
+
+	// A retired or removed checkout's vanished handle must remain STALE.
+	if err := f.reg.Rm(context.Background(), api.RmArgs{Checkout: "app"}); err != nil {
+		t.Fatal(err)
+	}
+	_, st, err = c.GetAttr(rlibFH)
+	nfsStatus(t, st, nfstest.Stale, err)
 }

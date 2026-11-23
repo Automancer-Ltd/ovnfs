@@ -76,7 +76,8 @@ type Caches struct {
 	// in tree. The copies never change, so a proof never expires.
 	proofsMu sync.Mutex
 	proofs   map[string]bool
-	locator  locator // resolves State identities to view paths (platform)
+	locator  locator    // resolves State identities to view paths (platform)
+	seen     fencedMemo // pre-fence metadata of cache-root files handed out
 }
 
 // cacheRoot is a local root the snapshot holds, as the folder had it when the

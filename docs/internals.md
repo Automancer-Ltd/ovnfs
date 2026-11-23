@@ -377,7 +377,18 @@ changes in it. Each read checks the open inode's change time before handing
 back bytes, even if a writer restored the mtime. A host rewrite, unlink or
 replacement that advances that inode's change time makes the descriptor
 stale (`ESTALE`); NFSv3, which has no open, sees the name gone at its next
-`READ`. Removing a name in the checkout does not change the host inode.
+`READ`. Because an NFSv3 client keeps cached filehandles for entries it
+looked up before the host changed them, each cache snapshot remembers the
+pre-fence path and metadata of non-directory cache entries it handed out in
+a bounded lock-free table of 32,768 slots (`base/fenced_memo.go`). Once an
+entry vanishes behind the fence — without being removed or shadowed in the
+checkout — `GETATTR` and `ACCESS` on its held handle answer with those
+pre-fence attributes (never the host's newer mtime or size), and a
+truncating `SETATTR` (`size=0`, as `open(O_TRUNC)` sends) materializes an
+empty file in the checkout's upper under the same identity, so overwrites,
+renames over the name and deletes succeed while `LOOKUP` keeps hiding the
+host's newer entry and `READ` still returns `ESTALE`. Removing a name in the
+checkout does not change the host inode.
 There is no persistent per-entry state: nothing to build when a checkout
 opens and nothing to delete when it goes. A lookup
 below a cache root costs an `lstat` of the folder: 1.8 µs in a 30,000-entry

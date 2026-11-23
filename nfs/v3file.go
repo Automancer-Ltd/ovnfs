@@ -11,6 +11,19 @@ import (
 	"github.com/stencil-hq/ovnfs/internal/kept"
 )
 
+// vanishedInfo returns the pre-fence metadata of a fenced cache-root handle
+// whose host file changed or left after the checkout opened.
+func (s *Server) vanishedInfo(id, gen uint64, ok bool) (string, os.FileInfo, bool) {
+	if !ok || id == 0 || gen == legacyGen {
+		return "", nil, false
+	}
+	vb, has := s.FS.(VanishedBackend)
+	if !has {
+		return "", nil, false
+	}
+	return vb.VanishedInfo(id, gen)
+}
+
 // getattr3 answers GETATTR (RFC 1813 section 3.3.1).
 func (s *Server) getattr3(d *decoder, res *encoder) status {
 	id, gen, ok := d.fh(maxFH3)
@@ -19,13 +32,23 @@ func (s *Server) getattr3(d *decoder, res *encoder) status {
 	}
 	for {
 		res.sampleSizes()
+		var info os.FileInfo
 		p, st := s.path3(id, gen, ok)
+		if st == stOK {
+			var err error
+			_, info, err = s.describe(id, gen, p)
+			if err != nil {
+				st = statusOf(err)
+			}
+		}
+		if st == stStale {
+			var found bool
+			if _, info, found = s.vanishedInfo(id, gen, ok); found {
+				st = stOK
+			}
+		}
 		if st != stOK {
 			return st
-		}
-		_, info, err := s.describe(id, gen, p)
-		if err != nil {
-			return statusOf(err)
 		}
 		a := attrsOf(id, info)
 		if retry, st := s.admitSize3(res, &a, gen); retry {
@@ -55,13 +78,23 @@ func (s *Server) setattr3(d *decoder, res *encoder) status {
 	if d.err != nil {
 		return stInval
 	}
+	var info os.FileInfo
+	var vanished bool
 	p, st := s.path3(id, gen, ok)
+	if st == stOK {
+		var err error
+		p, info, err = s.describe(id, gen, p)
+		if err != nil {
+			st = statusOf(err)
+		}
+	}
+	if st == stStale && sa.setSize && sa.size == 0 {
+		if vp, vinfo, found := s.vanishedInfo(id, gen, ok); found && vinfo.Mode().IsRegular() {
+			p, info, vanished, st = vp, vinfo, true, stOK
+		}
+	}
 	if st != stOK {
 		return st
-	}
-	p, info, err := s.describe(id, gen, p)
-	if err != nil {
-		return statusOf(err)
 	}
 	pre := attrsOf(id, info)
 	if guard && (sec != uint32(pre.mtime.Unix()) || nsec != uint32(pre.mtime.Nanosecond())) {
@@ -71,7 +104,20 @@ func (s *Server) setattr3(d *decoder, res *encoder) status {
 		res.beginSize(id, sa.size)
 	}
 	s.recallAttrs(id, pre.typ)
-	st = s.applyTo3(id, p, info, &sa)
+	if vanished {
+		vb := s.FS.(VanishedBackend)
+		mp, minfo, err := vb.TruncateVanished(id, gen)
+		if err != nil {
+			s.recallAttrs(id, pre.typ)
+			return statusOf(err)
+		}
+		p, info = mp, minfo
+		rest := sa
+		rest.setSize = false
+		st = s.applyTo3(id, p, info, &rest)
+	} else {
+		st = s.applyTo3(id, p, info, &sa)
+	}
 	s.recallAttrs(id, pre.typ)
 	if st != stOK {
 		return st
@@ -153,13 +199,22 @@ func (s *Server) access3(d *decoder, res *encoder) status {
 	if d.err != nil {
 		return stInval
 	}
+	var info os.FileInfo
 	p, st := s.path3(id, gen, ok)
+	if st == stOK {
+		var err error
+		_, info, err = s.describe(id, gen, p)
+		if err != nil {
+			st = statusOf(err)
+		}
+	}
+	if st == stStale {
+		if _, vinfo, found := s.vanishedInfo(id, gen, ok); found {
+			info, st = vinfo, stOK
+		}
+	}
 	if st != stOK {
 		return st
-	}
-	_, info, err := s.describe(id, gen, p)
-	if err != nil {
-		return statusOf(err)
 	}
 	_, granted := accessOf(info, mask)
 	res.bool(false) // obj_attributes

@@ -58,6 +58,31 @@ func (n *nfsFS) Relocate(id, gen uint64) (string, bool) {
 	return p, true
 }
 
+// VanishedInfo returns the pre-fence attributes of a cache-root file handle
+// whose host file changed or left after the checkout opened, when gen is still
+// id's current handle generation.
+func (n *nfsFS) VanishedInfo(id, gen uint64) (string, os.FileInfo, bool) {
+	p, info, life, ok := n.rt.vanished(id)
+	if !ok || gen != uint64(life)<<32|uint64(n.handles.get(id)) {
+		return "", nil, false
+	}
+	return p, info, true
+}
+
+// TruncateVanished materializes a vanished fenced regular file handle as an
+// empty upper file under the same identity, when gen is still current.
+func (n *nfsFS) TruncateVanished(id, gen uint64) (string, os.FileInfo, error) {
+	wantLife := uint32(gen >> 32)
+	if uint32(gen) != n.handles.get(id) {
+		return "", nil, syscall.ESTALE
+	}
+	p, info, err := n.rt.truncateVanished(id, wantLife)
+	if err != nil {
+		return "", nil, err
+	}
+	return p, info, nil
+}
+
 // SyncFile commits a handle in its current checkout generation. A writer
 // kept across a freeze may be closed; sync the current backing without
 // reopening that writer, which would copy it into the new upper.

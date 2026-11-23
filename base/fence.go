@@ -145,6 +145,9 @@ func (v bottom) fenced(p, root string, n uint32) (entry, error) {
 		e.info = hostInfo{FileInfo: info, id: captureID(n)}
 	} else {
 		e.info = v.c.locator.lookupInfo(info, host, p)
+		if !info.IsDir() {
+			e.info = v.c.rememberFenced(p, e.info)
+		}
 	}
 	return e, nil
 }
@@ -178,7 +181,11 @@ func (v bottom) fencedDir(p string) ([]os.FileInfo, error) {
 			host = filepath.Join(dir, e.Name())
 		}
 		if info = hostfile.Linked(info, host); f.shows(host, info) {
-			out = append(out, v.c.locator.listedInfo(info, host, p))
+			li := v.c.locator.listedInfo(info, host, p)
+			if !info.IsDir() {
+				li = v.c.rememberFenced(p+"/"+info.Name(), li)
+			}
+			out = append(out, li)
 		}
 	}
 	return out, nil

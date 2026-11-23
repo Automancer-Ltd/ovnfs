@@ -57,6 +57,7 @@ type snapshotInfo struct {
 	host   string
 	view   string // the view path, or its parent for a listed entry
 	loc    *locator
+	seen   *fencedMemo
 	listed bool
 }
 
@@ -74,6 +75,19 @@ func (i snapshotInfo) Identity() ident.ID {
 			p += "/" + i.Name() // only directories below a root use listedInfo
 		}
 		i.loc.memo.put(id.Value(), p)
+		if i.seen != nil {
+			i.seen.put(id, p, i.FileInfo)
+		}
 	}
 	return id
+}
+
+// rememberFenced attaches c.seen to a Windows snapshotInfo so its pre-fence
+// metadata is recorded only if a frontend actually asks for its identity.
+func (c *Caches) rememberFenced(_ string, info os.FileInfo) os.FileInfo {
+	if si, ok := info.(snapshotInfo); ok {
+		si.seen = &c.seen
+		return si
+	}
+	return info
 }

@@ -38,6 +38,14 @@ type AliasLocator interface {
 	LocateAlias(id ident.ID, visible func(string) bool) bool
 }
 
+// VanishedLocator is implemented by a bottom whose fenced cache entries can
+// leave the view after the host changes them. Vanished returns a remembered
+// pre-fence path and metadata for id when ok accepts the path and the entry
+// is no longer shown by the fence.
+type VanishedLocator interface {
+	Vanished(id ident.ID, ok func(string) bool) (string, os.FileInfo, bool)
+}
+
 // Awaiter is implemented by bottoms whose first access to some paths waits
 // for background work (base cache snapshots). [FS] calls Await(p) before
 // taking its lock in every entry point taking a path (p clean,

@@ -61,3 +61,13 @@ type Backend interface {
 	// Statfs reports the capacity FSSTAT and the NFSv4 space attributes show.
 	Statfs() (smb.Statfs, error)
 }
+
+// VanishedBackend is optionally implemented by a Backend whose fenced cache
+// entries can leave the view when the host changes or removes them while
+// clients still hold their handles. VanishedInfo reports the pre-fence
+// attributes handed out for (id, gen); TruncateVanished materializes a
+// vanished regular file as an empty upper file under the same identity.
+type VanishedBackend interface {
+	VanishedInfo(id, gen uint64) (string, os.FileInfo, bool)
+	TruncateVanished(id, gen uint64) (string, os.FileInfo, error)
+}
