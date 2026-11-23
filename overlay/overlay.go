@@ -1165,13 +1165,27 @@ func (f *FS) Symlink(target, link string) error {
 }
 
 // Remove removes a file or merged-empty directory and masks all lower copies.
-func (f *FS) Remove(name string) error {
+// It fails with EIO, never ENOENT, when the upper on disk lacks what the
+// index shows of name.
+func (f *FS) Remove(name string) (err error) {
 	defer f.names.Add(1) // after the removal, see [FS.Names]
 	f.await(name)
 	p := Clean(name)
 	f.lockSync(p)
 	defer f.mu.Unlock()
+	// Once the lookup below finds p under f.mu, a host call that reports p
+	// or a directory above it missing means the upper lost what the index
+	// shows. The macOS NFS client takes ENOENT from REMOVE or RMDIR for the
+	// reply to a retransmission and reports success, so rm would go on as if
+	// the name were gone.
+	found := false
+	defer func() {
+		if found && errors.Is(err, fs.ErrNotExist) {
+			err = &fs.PathError{Op: "remove", Path: name, Err: syscall.EIO}
+		}
+	}()
 retry:
+	found = false
 	f.syncOps(p)
 	if err := f.mutable("remove", p); err != nil {
 		return err
@@ -1183,6 +1197,7 @@ retry:
 	if err != nil {
 		return err
 	}
+	found = true
 	if info.IsDir() {
 		items, err := f.readDir(p)
 		if err != nil {
@@ -1353,15 +1368,28 @@ retry:
 // moves without its tree, which the levels below keep: one showing part of
 // theirs takes a redirect to where they hold it (see [Entry.Redirect]), and
 // redirects below it move along. Either way a name the levels below hold is
-// whited out, and the cost is the upper's part of the tree.
-func (f *FS) Rename(from, to string) error {
+// whited out, and the cost is the upper's part of the tree. It fails with
+// EIO, never ENOENT, when the upper on disk lacks what the index shows of
+// from or of to's directory.
+func (f *FS) Rename(from, to string) (err error) {
 	defer f.names.Add(1) // after the move, see [FS.Names]
 	f.await(from)
 	f.await(to)
 	src, dst := Clean(from), Clean(to)
 	f.lockSync(src, dst)
 	defer f.mu.Unlock()
+	// As in [FS.Remove]: once the lookups below find src under f.mu, a host
+	// call that reports src, dst's directory or one above them missing means
+	// the upper lost what the index shows. The macOS NFS client takes ENOENT
+	// from RENAME for the reply to a retransmission and reports success.
+	found := false
+	defer func() {
+		if found && errors.Is(err, fs.ErrNotExist) {
+			err = &os.LinkError{Op: "rename", Old: from, New: to, Err: syscall.EIO}
+		}
+	}()
 retry:
+	found = false
 	f.syncOps(src, dst)
 	if err := f.mutable("rename", src); err != nil {
 		return err
@@ -1383,6 +1411,7 @@ retry:
 	if derr != nil && !errors.Is(derr, fs.ErrNotExist) {
 		return derr
 	}
+	found = true
 	if derr != nil {
 		if err := f.claimName("rename", dst, src); err != nil {
 			return err
@@ -1450,6 +1479,9 @@ retry:
 		return err
 	}
 	if err := f.ensureDir(parent(dst)); err != nil {
+		if _, _, lerr := f.lookup(parent(dst)); lerr != nil {
+			found = false // dst's directory is not there: the caller's error
+		}
 		return err
 	}
 	if origin != "" {

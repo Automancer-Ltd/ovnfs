@@ -103,6 +103,12 @@ writes only through that unbroken chain: when concurrent writes interleaved
 it, the client dropped every page it had just written and re-read the whole
 file at its next open.
 
+A removal or rename the daemon cannot make on disk fails with `EIO`, never
+`ENOENT`, once the checkout shows the name: the macOS client takes `ENOENT`
+from REMOVE, RMDIR or RENAME for the reply to a retransmission and reports
+success, so `rm` would leave the file and fail later with `Directory not
+empty`, and `mv` would leave the file where it was.
+
 The server also accepts NFSv4.0 clients on the same socket or port. These may receive
 read delegations, recalled on changes through another protocol, `pull`,
 reattach and checkout removal: edits in the source folder never change a

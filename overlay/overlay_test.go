@@ -329,6 +329,29 @@ func TestRecreatedDirectoryHidesOldLowerContents(t *testing.T) {
 	assertGone(t, f, "d/x")
 }
 
+// TestLostUpperIsAnIOError keeps a removal or rename the host cannot make
+// from reading as a missing name, which the macOS NFS client reports as done.
+func TestLostUpperIsAnIOError(t *testing.T) {
+	f := setup(t, map[string]string{"d/a": "a", "d/b": "b", "d/c": "c", "e": "e", "g": "g"})
+	for name, err := range map[string]error{
+		"remove of a missing name":     f.Remove("d/x"),
+		"rename of a missing name":     f.Rename("d/x", "d/y"),
+		"rename into a missing dir":    f.Rename("g", "missing/y"),
+		"rename into a file's subtree": f.Rename("d/b", "e/y"),
+	} {
+		if !missing(err) || errors.Is(err, syscall.EIO) {
+			t.Fatalf("%s: err = %v, want not-exist or ENOTDIR", name, err)
+		}
+	}
+	must(t, f.Remove("d/a"))
+	must(t, os.RemoveAll(filepath.Join(f.Upper(), "d")))
+	for name, err := range map[string]error{"remove": f.Remove("d/b"), "rename": f.Rename("d/c", "d/z")} {
+		if !errors.Is(err, syscall.EIO) || missing(err) {
+			t.Fatalf("%s with its upper directory gone: err = %v, want EIO", name, err)
+		}
+	}
+}
+
 // TestRemoveRefusesNonEmptyMergedDir checks emptiness in the merged view.
 func TestRemoveRefusesNonEmptyMergedDir(t *testing.T) {
 	f := setup(t, map[string]string{"d/x": "1"})
