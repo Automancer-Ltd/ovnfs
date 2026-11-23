@@ -6,6 +6,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"runtime"
 	"syscall"
 	"testing"
 )
@@ -133,6 +134,12 @@ func TestErrnoMapping(t *testing.T) {
 		}
 	}
 	path := func(err error) error { return &fs.PathError{Op: "op", Path: "p", Err: err} }
+	// Windows' syscall.ENOTDIR is ERROR_PATH_NOT_FOUND, which it also returns
+	// for a missing directory on the way: a missing path is what it says.
+	notDir := ENOTDIR
+	if runtime.GOOS == "windows" {
+		notDir = ENOENT
+	}
 	for _, c := range []struct {
 		err  error
 		want Errno
@@ -140,7 +147,7 @@ func TestErrnoMapping(t *testing.T) {
 		{path(syscall.ENOENT), ENOENT},
 		{path(fs.ErrNotExist), ENOENT},
 		{path(syscall.EEXIST), EEXIST},
-		{path(syscall.ENOTDIR), ENOTDIR},
+		{path(syscall.ENOTDIR), notDir},
 		{path(syscall.EISDIR), EISDIR},
 		{path(syscall.ENOTEMPTY), ENOTEMPTY},
 		{&os.LinkError{Op: "rename", Old: "a", New: "b", Err: syscall.EXDEV}, EXDEV},
