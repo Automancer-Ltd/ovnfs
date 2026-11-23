@@ -1397,6 +1397,8 @@ func (f *FS) Rename(from, to string) (err error) {
 	// call that reports src, dst's directory or one above them missing means
 	// the upper lost what the index shows. The macOS NFS client takes ENOENT
 	// from RENAME for the reply to a retransmission and reports success.
+	// Windows numbers ENOTDIR as ERROR_PATH_NOT_FOUND, which reads as
+	// not-exist, so each ENOTDIR that is the caller's clears found.
 	found := false
 	defer func() {
 		if found && errors.Is(err, fs.ErrNotExist) {
@@ -1439,6 +1441,7 @@ retry:
 	}
 	if derr == nil {
 		if sinfo.IsDir() && !dinfo.IsDir() {
+			found = false
 			return &os.LinkError{Op: "rename", Old: from, New: to, Err: syscall.ENOTDIR}
 		}
 		if !sinfo.IsDir() && dinfo.IsDir() {
@@ -1506,8 +1509,8 @@ retry:
 		return err
 	}
 	if err := f.ensureDir(parent(dst)); err != nil {
-		if _, _, lerr := f.lookup(parent(dst)); lerr != nil {
-			found = false // dst's directory is not there: the caller's error
+		if _, info, lerr := f.lookup(parent(dst)); lerr != nil || !info.IsDir() {
+			found = false // dst's directory is not there, or no directory: the caller's error
 		}
 		return err
 	}
