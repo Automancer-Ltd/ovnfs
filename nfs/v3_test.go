@@ -225,10 +225,10 @@ func (f *sampledStatFS) Lstat(p string) (os.FileInfo, error) {
 	return info, err
 }
 
-func (f *sampledStatFS) Open(p string) (billy.File, error) {
-	fd, err := f.testFS.Open(p)
-	if err != nil {
-		return nil, err
+func (f *sampledStatFS) OpenFile(p string, flag int, perm os.FileMode) (billy.File, error) {
+	fd, err := f.testFS.OpenFile(p, flag, perm)
+	if err != nil || flag != os.O_RDONLY {
+		return fd, err
 	}
 	return sampledReadFile{fd, f, p}, nil
 }
@@ -327,6 +327,57 @@ func TestV3SizeSampleOvertaken(t *testing.T) {
 				t.Fatalf("live handle after overlapping replies: status %d, want size %d", st, test.size)
 			}
 		})
+	}
+}
+
+// trailingPathFS answers Path for the ids in trail with the path of another
+// file, as an answer remembered from just before a rename can be; Relocate
+// is current.
+type trailingPathFS struct {
+	*testFS
+	trail map[uint64]string
+}
+
+func (f *trailingPathFS) Path(id, gen uint64) (string, bool) {
+	if p, ok := f.trail[id]; ok {
+		return p, true
+	}
+	return f.testFS.Path(id, gen)
+}
+
+// TestV3HandleFollowsItsFile resolves a handle to a path another file holds
+// now. Reads, writes, truncation and attributes must reach the handle's own
+// file, never the one in its old place, which must stay as it was.
+func TestV3HandleFollowsItsFile(t *testing.T) {
+	fs := &trailingPathFS{testFS: newTestFS(t)}
+	fs.write(t, "kept", "12345678")
+	fs.write(t, "other", "abc")
+	id := fs.FileID("kept")
+	fs.FileID("other")
+	fs.trail = map[uint64]string{id: "other"}
+	c := v3server(t, fs)
+	handle := func(e *encoder) { e.fh(id, 0) }
+
+	if st, d := c.v3call(v3GetAttr, handle); st != stOK || fattr3Of(d).size != 8 {
+		t.Fatalf("GETATTR: status %d, want the handle's 8 bytes", st)
+	}
+	st, d := c.v3call(v3Read, func(e *encoder) { handle(e); e.u64(0); e.u32(8) })
+	if st != stOK {
+		t.Fatalf("READ: status %d", st)
+	}
+	if a, ok := postOpOf(t, d); !ok || a.size != 8 || d.u32() != 8 || !d.bool() || string(d.opaque(8)) != "12345678" {
+		t.Fatal("READ did not return the handle's bytes")
+	}
+	if st, _ := c.v3call(v3Write, writeArgs(id, 0, []byte("XY"))); st != stOK {
+		t.Fatalf("WRITE: status %d", st)
+	}
+	if st, _ := c.v3call(v3SetAttr, sizeArgs(id, 0, 4)); st != stOK {
+		t.Fatalf("SETATTR: status %d", st)
+	}
+	for p, want := range map[string]string{"kept": "XY34", "other": "abc"} {
+		if got, err := os.ReadFile(fs.host(p)); err != nil || string(got) != want {
+			t.Fatalf("%s holds %q (%v), want %q", p, got, err, want)
+		}
 	}
 }
 

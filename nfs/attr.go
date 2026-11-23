@@ -5,6 +5,7 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/stencil-hq/ovnfs/internal/unixstat"
@@ -59,13 +60,24 @@ func attrsOf(id uint64, info os.FileInfo) attrs {
 	return a
 }
 
-// stat describes file id, at p, without following a final symlink.
+// stat describes file id, at p, without following a final symlink; ESTALE
+// when p holds another file ([Server.lstatID]).
 func (s *Server) stat(id uint64, p string) (attrs, error) {
-	info, err := s.FS.Lstat(p)
+	info, err := s.lstatID(id, p)
 	if err != nil {
 		return attrs{}, err
 	}
 	return attrsOf(id, info), nil
+}
+
+// lstatID is [Server.stat]'s FileInfo: ESTALE when p holds a file other than
+// id, as it does once a rename put another file in its place.
+func (s *Server) lstatID(id uint64, p string) (os.FileInfo, error) {
+	info, err := s.FS.Lstat(p)
+	if err == nil && s.FS.IDOf(p, info) != id {
+		return nil, syscall.ESTALE
+	}
+	return info, err
 }
 
 // statAt describes the file at p, without following a final symlink, for

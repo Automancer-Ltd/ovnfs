@@ -106,7 +106,18 @@ func (r *Router) id(p string) uint64 {
 // the life of its checkout (checkout.Registry.Slot); false when no visible
 // entry has that id. The virtual root's entries have life 0. An id resolved
 // before, with nothing moved or removed since, costs no syscall ([pathCache]).
-func (r *Router) locate(fid uint64) (p string, life uint32, ok bool) {
+func (r *Router) locate(fid uint64) (p string, life uint32, ok bool) { return r.find(fid, true) }
+
+// relocate is [Router.locate] for a caller that found the path locate
+// returned no longer holding fid's entry: it resolves fid afresh. A
+// resolution cached just before a rename is still served until the rename
+// advances the overlay's namespace generation ([overlay.FS.Names]), which it
+// does only once it is done. The fresh answer replaces the cached one.
+func (r *Router) relocate(fid uint64) (p string, life uint32, ok bool) { return r.find(fid, false) }
+
+// find resolves fid for [Router.locate] and [Router.relocate], answering
+// from the cache only when cached is set.
+func (r *Router) find(fid uint64, cached bool) (p string, life uint32, ok bool) {
 	switch fid {
 	case rootID:
 		return "", 0, true
@@ -125,8 +136,10 @@ func (r *Router) locate(fid uint64) (p string, life uint32, ok bool) {
 	defer s.Done()
 	// Read before resolving: a change from here on invalidates what is cached.
 	names, invalid := s.FS.Names(), r.paths.invalid.Load()
-	if p, ok := r.paths.get(fid, s.FS, life, names, invalid); ok {
-		return p, life, true
+	if cached {
+		if p, ok := r.paths.get(fid, s.FS, life, names, invalid); ok {
+			return p, life, true
+		}
 	}
 	rel, ok := s.FS.Locate(id)
 	if !ok {

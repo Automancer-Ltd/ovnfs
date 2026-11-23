@@ -183,7 +183,7 @@ func (s *Server) exists3(res *encoder, dirID uint64, dir string, pre *attrs, p s
 		id := s.FS.IDOf(p, info)
 		res.beginSize(id, sa.size)
 		s.Recall(id)
-		st := s.apply3(p, &sattr3{size: sa.size, setSize: true})
+		st := s.applyTo3(id, p, info, &sattr3{size: sa.size, setSize: true})
 		s.Recall(id)
 		if st != stOK {
 			return st

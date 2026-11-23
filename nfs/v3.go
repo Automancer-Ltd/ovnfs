@@ -1,7 +1,13 @@
 package nfs
 
 import (
+	"errors"
+	"io/fs"
+	"os"
 	"strings"
+	"syscall"
+
+	"github.com/go-git/go-billy/v5"
 
 	"github.com/stencil-hq/ovnfs/internal/kept"
 )
@@ -166,6 +172,86 @@ func (s *Server) resolve(id, gen uint64) (string, uint64, bool) {
 	}
 	p, live := s.FS.Path(id, gen)
 	return p, gen, live
+}
+
+// A handle names a file, and path3 returns where the file was then; a
+// rename can move it, or put another file at that path, before the request
+// uses the path. A client renaming a file over the name of one it keeps
+// open does both: the open file moves to a silly name, the new one takes
+// its place. describe3 and open3 check that the path still holds the
+// handle's file and follow it when not, so a request never reads, writes or
+// describes another file under the handle.
+
+// describe3 returns where the file handle (id, gen) names is and its
+// description, starting at p, the path path3 returned: ESTALE once the file
+// is gone.
+func (s *Server) describe3(id, gen uint64, p string) (string, os.FileInfo, error) {
+	info, err := s.lstatID(id, p)
+	if err == nil || !moved(err) {
+		return p, info, err
+	}
+	if p, err = s.relocate3(id, gen); err != nil {
+		return "", nil, err
+	}
+	info, err = s.lstatID(id, p)
+	return p, info, err
+}
+
+// open3 opens the file handle (id, gen) names, starting at p, the path
+// path3 returned, with flag, which neither creates nor truncates; it
+// returns where the file is and the open file's description, as
+// [Server.openID] does.
+func (s *Server) open3(id, gen uint64, p string, flag int) (billy.File, string, os.FileInfo, error) {
+	f, info, err := s.openID(id, p, flag)
+	if err == nil || !moved(err) {
+		return f, p, info, err
+	}
+	if p, err = s.relocate3(id, gen); err != nil {
+		return nil, "", nil, err
+	}
+	f, info, err = s.openID(id, p, flag)
+	return f, p, info, err
+}
+
+// openID opens file id, at p, with flag and describes the open file:
+// ESTALE when p holds another file. The description comes from the
+// descriptor, like any bytes read through it; a path stat after the open
+// may describe a replacement instead.
+func (s *Server) openID(id uint64, p string, flag int) (billy.File, os.FileInfo, error) {
+	f, err := s.FS.OpenFile(p, flag, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	var info os.FileInfo
+	if fd, ok := f.(interface{ Stat() (os.FileInfo, error) }); ok {
+		info, err = fd.Stat()
+	} else {
+		info, err = s.FS.Stat(p)
+	}
+	if err == nil && s.FS.IDOf(p, info) != id {
+		err = syscall.ESTALE
+	}
+	if err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+	return f, info, nil
+}
+
+// relocate3 resolves the handle (id, gen) afresh (Backend.Relocate). The
+// export root, the only file a legacy handle names, never moves.
+func (s *Server) relocate3(id, gen uint64) (string, error) {
+	p, live := s.FS.Relocate(id, gen)
+	if !live {
+		return "", syscall.ESTALE
+	}
+	return p, nil
+}
+
+// moved reports an error, from a call on the path a handle resolved to, that
+// a rename since explains: the file left the path or another took it.
+func moved(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.ESTALE)
 }
 
 // checkName3 vets a file name a client sends. Empty names and names with a

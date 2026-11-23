@@ -308,8 +308,17 @@ func decodeSetTime3(d *decoder) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// apply3 sets a on the file at p, as SETATTR and the creating procedures
-// do. The mode of a symlink is left alone: its permission bits
+// apply3 sets a on the entry at p, which a creating procedure just made.
+func (s *Server) apply3(p string, a *sattr3) status {
+	info, err := s.FS.Lstat(p)
+	if err != nil {
+		return statusOf(err)
+	}
+	return s.applyTo3(s.FS.IDOf(p, info), p, info, a)
+}
+
+// applyTo3 sets a on file id, at p, which info describes, as SETATTR and the
+// creating procedures do. The mode of a symlink is left alone: its permission bits
 // mean nothing, and billy's Chmod follows the link, changing the target or
 // failing ENOENT for a dangling one. Ownership changes the link itself
 // (Lchown); a size is refused on a symlink.
@@ -317,12 +326,7 @@ func decodeSetTime3(d *decoder) (time.Time, bool) {
 // The size goes first, so a truncate still works when the same call removes
 // write permission, and the mode after the owner, which a chown may strip
 // of setuid and setgid.
-func (s *Server) apply3(p string, a *sattr3) status {
-	info, err := s.FS.Lstat(p)
-	if err != nil {
-		return statusOf(err)
-	}
-	id := s.FS.IDOf(p, info)
+func (s *Server) applyTo3(id uint64, p string, info os.FileInfo, a *sattr3) status {
 	link := info.Mode()&os.ModeSymlink != 0
 	if a.setSize {
 		if link {
@@ -376,14 +380,16 @@ func (s *Server) keepWritable3(id uint64, p string) {
 	if s.v3.kept.Has(keptKey{id: id}) {
 		return
 	}
-	if f, err := s.FS.OpenFile(p, os.O_WRONLY, 0); err == nil {
+	if f, _, err := s.openID(id, p, os.O_WRONLY); err == nil {
 		s.v3.kept.Keep(keptKey{id: id}, f)
 	}
 }
 
 // truncate3 sets the size of file id, at p, through its kept file when the
 // backend refuses to open it for writing (v3State.kept). Size 0 opens with
-// O_TRUNC, so a file from a lower layer is not copied up only to be emptied.
+// O_TRUNC, so a file from a lower layer is not copied up only to be emptied;
+// that open truncates before it can tell whether a rename put another file
+// at p, so the caller has just checked that p holds id.
 func (s *Server) truncate3(id uint64, p string, size uint64) status {
 	if size > math.MaxInt64 {
 		return stInval
@@ -392,7 +398,7 @@ func (s *Server) truncate3(id uint64, p string, size uint64) status {
 	if size == 0 {
 		flag |= os.O_TRUNC
 	}
-	f, err := s.FS.OpenFile(p, flag, 0)
+	f, _, err := s.openID(id, p, flag)
 	if errors.Is(err, os.ErrPermission) {
 		if ok, kerr := s.v3.kept.With(keptKey{id: id}, func(f billy.File) error { return f.Truncate(int64(size)) }); ok {
 			return statusOf(kerr)

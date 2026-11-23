@@ -23,12 +23,9 @@ func (s *Server) getattr3(d *decoder, res *encoder) status {
 		if st != stOK {
 			return st
 		}
-		info, err := s.FS.Lstat(p)
+		_, info, err := s.describe3(id, gen, p)
 		if err != nil {
 			return statusOf(err)
-		}
-		if s.FS.IDOf(p, info) != id {
-			return stStale
 		}
 		a := attrsOf(id, info)
 		if retry, st := s.admitSize3(res, &a, gen); retry {
@@ -62,10 +59,11 @@ func (s *Server) setattr3(d *decoder, res *encoder) status {
 	if st != stOK {
 		return st
 	}
-	pre, err := s.stat(id, p)
+	p, info, err := s.describe3(id, gen, p)
 	if err != nil {
 		return statusOf(err)
 	}
+	pre := attrsOf(id, info)
 	if guard && (sec != uint32(pre.mtime.Unix()) || nsec != uint32(pre.mtime.Nanosecond())) {
 		return stNotSync
 	}
@@ -73,7 +71,7 @@ func (s *Server) setattr3(d *decoder, res *encoder) status {
 		res.beginSize(id, sa.size)
 	}
 	s.recallAttrs(id, pre.typ)
-	st = s.apply3(p, &sa)
+	st = s.applyTo3(id, p, info, &sa)
 	s.recallAttrs(id, pre.typ)
 	if st != stOK {
 		return st
@@ -159,7 +157,7 @@ func (s *Server) access3(d *decoder, res *encoder) status {
 	if st != stOK {
 		return st
 	}
-	info, err := s.FS.Lstat(p)
+	_, info, err := s.describe3(id, gen, p)
 	if err != nil {
 		return statusOf(err)
 	}
@@ -257,28 +255,15 @@ func (s *Server) openRead3(id, gen uint64, ok bool) (billy.File, attrs, status) 
 	if st != stOK {
 		return nil, attrs{}, st
 	}
-	f, err := s.FS.Open(p)
+	f, _, info, err := s.open3(id, gen, p, os.O_RDONLY)
 	if err != nil {
 		return nil, attrs{}, statusOf(err)
 	}
-	var info os.FileInfo
-	if fd, ok := f.(interface{ Stat() (os.FileInfo, error) }); ok {
-		info, err = fd.Stat()
-	} else {
-		info, err = s.FS.Stat(p)
+	if info.IsDir() {
+		f.Close()
+		return nil, attrs{}, stIsDir
 	}
-	switch {
-	case err != nil:
-		st = statusOf(err)
-	case info.IsDir():
-		st = stIsDir
-	case s.FS.IDOf(p, info) != id:
-		st = stStale
-	default:
-		return f, attrsOf(id, info), stOK
-	}
-	f.Close()
-	return nil, attrs{}, st
+	return f, attrsOf(id, info), stOK
 }
 
 // stable_how3 values. DATA_SYNC is implemented as FILE_SYNC.
@@ -309,7 +294,7 @@ func (s *Server) write3(d *decoder, res *encoder) status {
 		return stFBig
 	}
 	// The filehandle names the object to write, not a path to follow.
-	info, err := s.FS.Lstat(p)
+	p, info, err := s.describe3(id, gen, p)
 	if err != nil {
 		return statusOf(err)
 	}
@@ -333,8 +318,9 @@ func (s *Server) write3(d *decoder, res *encoder) status {
 	return stOK
 }
 
-// writeAt3 reuses the writer for id at p, falling back to a descriptor kept
-// before write permission was removed when a fresh open is denied.
+// writeAt3 reuses the writer for id at p, or opens one where id is now
+// (open3), falling back to a descriptor kept before write permission was
+// removed when a fresh open is denied.
 func (s *Server) writeAt3(id, gen uint64, p string, data []byte, off int64, stable bool) (int, error) {
 	key := keptKey{id: id, path: p}
 	var n int
@@ -348,7 +334,7 @@ func (s *Server) writeAt3(id, gen uint64, p string, data []byte, off int64, stab
 	if ok, err := s.v3.kept.With(key, write); ok {
 		return n, err
 	}
-	f, err := s.FS.OpenFile(p, os.O_WRONLY, 0)
+	f, at, _, err := s.open3(id, gen, p, os.O_WRONLY)
 	if err != nil {
 		if errors.Is(err, os.ErrPermission) {
 			if ok, kerr := s.v3.kept.With(keptKey{id: id}, write); ok {
@@ -357,11 +343,12 @@ func (s *Server) writeAt3(id, gen uint64, p string, data []byte, off int64, stab
 		}
 		return 0, err
 	}
+	p = at // the stable write syncs the file where it is
 	if err := write(f); err != nil {
 		f.Close()
 		return n, err
 	}
-	return n, s.v3.kept.Keep(key, f)
+	return n, s.v3.kept.Keep(keptKey{id: id, path: p}, f)
 }
 
 // commit3 answers COMMIT (section 3.3.21), syncing the whole file even when

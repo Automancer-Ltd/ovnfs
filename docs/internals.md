@@ -298,6 +298,16 @@ its fileid; a restart forgets these retirements. Handles of earlier builds
 (8 bytes) are stale, except the export root's, so a mount kept across the
 upgrade keeps working and looks everything below the root up again.
 
+A path resolved for a handle can stop holding its file before the request
+uses it: a rename moves the file or puts another one there. A client that
+renames a file over the name of one it keeps open does both, moving the open
+file to a silly name (`.nfs…`) whose handle must keep working, as a page-in
+of a mapped file needs. So NFSv3 GETATTR, SETATTR, ACCESS, READ and WRITE
+take a file's attributes and bytes only from an entry, or descriptor, with
+the handle's identity, and resolve the id again, past the export's cache of
+resolutions, when the path holds another file or none. Other replies leave
+out attributes of a path that no longer holds the handle's file.
+
 Builds that kept a node id table left `STATE/nodes.log*` behind; the daemon
 deletes those files in the background when it starts.
 

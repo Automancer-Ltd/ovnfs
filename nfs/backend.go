@@ -40,6 +40,13 @@ type Backend interface {
 	// false, when the file is gone or gen is not id's current generation,
 	// makes the handle stale.
 	Path(id, gen uint64) (string, bool)
+	// Relocate is Path without trusting an earlier answer the backend
+	// remembers. The server calls it when the path Path returned no longer
+	// holds the handle's file: a rename can move the file, or put another
+	// in its place, between the two. (A client renaming a file over the name
+	// of one it keeps open moves that one to a silly name first; its handle
+	// must keep working there.)
+	Relocate(id, gen uint64) (string, bool)
 	// RetireHandle bumps id's generation so its handles go stale while its
 	// path and fileid stay; clients then look the name up again. The server
 	// calls it when a client caches attributes the file can no longer have.

@@ -99,6 +99,9 @@ func (f *testFS) Path(id, gen uint64) (string, bool) {
 	return p, ok && f.gens[id] == gen
 }
 
+// Relocate is Path: the map is always current.
+func (f *testFS) Relocate(id, gen uint64) (string, bool) { return f.Path(id, gen) }
+
 func (f *testFS) OpenFile(p string, flag int, perm os.FileMode) (billy.File, error) {
 	return f.files.OpenFile(p, flag, perm)
 }

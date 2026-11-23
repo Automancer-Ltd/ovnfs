@@ -48,6 +48,16 @@ func (n *nfsFS) Path(id, gen uint64) (string, bool) {
 	return p, true
 }
 
+// Relocate is Path resolving id afresh, for the server when the path Path
+// returned no longer holds the handle's file.
+func (n *nfsFS) Relocate(id, gen uint64) (string, bool) {
+	p, life, ok := n.rt.relocate(id)
+	if !ok || gen != uint64(life)<<32|uint64(n.handles.get(id)) {
+		return "", false
+	}
+	return p, true
+}
+
 // SyncFile commits a handle in its current checkout generation. A writer
 // kept across a freeze may be closed; sync the current backing without
 // reopening that writer, which would copy it into the new upper.
