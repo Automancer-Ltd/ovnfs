@@ -28,14 +28,16 @@ func TestNamesTheVolumeCannotHoldApart(t *testing.T) {
 
 	expect("create of invalid UTF-8", create("d/\xff\xfe"), rule.rejectInvalid, syscall.EILSEQ)
 	expect("mkdir of invalid UTF-8", f.MkdirAll("d/\xfe\xff", 0o755), rule.rejectInvalid, syscall.EILSEQ)
+	// Each name below is free unless the volume folds it onto an existing one.
 	must(t, create("d/\u00e9"))
 	expect("create of the NFD form", create("d/e\u0301"), rule.foldNorm, syscall.EEXIST)
-	expect("symlink at the NFD form", f.Symlink("t", "d/e\u0301"), rule.foldNorm, syscall.EEXIST)
+	must(t, create("d/\u00fc"))
+	expect("symlink at the NFD form", f.Symlink("t", "d/u\u0308"), rule.foldNorm, syscall.EEXIST)
 	must(t, create("d/Case"))
 	expect("create of the other case", create("d/case"), rule.foldCase, syscall.EEXIST)
 	must(t, create("d/x"))
-	expect("rename onto the other case", f.Rename("d/x", "d/CASE"), rule.foldCase, syscall.EEXIST)
 	expect("link at the other case", f.Link("d/x", "d/cASE"), rule.foldCase, syscall.EEXIST)
+	expect("rename onto the other case", f.Rename("d/x", "d/CASE"), rule.foldCase, syscall.EEXIST)
 	// A file may change the case of its own name.
 	must(t, f.Rename("d/Case", "d/CASE"))
 	if _, err := f.Lstat("d/CASE"); err != nil {
