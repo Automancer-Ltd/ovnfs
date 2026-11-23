@@ -110,6 +110,15 @@ func (f *FS) queuedOn(paths ...string) *hostOp {
 // wait for the queue ([FS.queuedOn]).
 func (f *FS) lockSync(paths ...string) {
 	f.mu.Lock()
+	f.syncOps(paths...)
+}
+
+// syncOps waits, holding f.mu exclusively, until no operation is in flight on
+// paths, their ancestors or descendants. A call that waited since [FS.lockSync]
+// (any [FS.waitOp] releases f.mu) runs it again before going on: meanwhile
+// another call, or the writeback worker ([FS.writeBack]), may have started a
+// host change on those names outside f.mu.
+func (f *FS) syncOps(paths ...string) {
 	for {
 		op := f.find(paths, func(op *hostOp) bool { return !op.queued })
 		if op == nil {
@@ -214,6 +223,13 @@ func (f *FS) stuck(op *hostOp) error {
 // the parked queue's failure that holds up a change on paths ([FS.waitOp]).
 func (f *FS) lockPaths(paths ...string) error {
 	f.mu.Lock()
+	return f.idleOps(paths...)
+}
+
+// idleOps waits, holding f.mu exclusively, until no operation is in flight or
+// queued on paths; like [FS.syncOps], a call that waited since
+// [FS.lockPaths] runs it again before going on.
+func (f *FS) idleOps(paths ...string) error {
 	for {
 		op := f.busyAny(paths)
 		if op == nil {

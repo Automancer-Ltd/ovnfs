@@ -712,13 +712,7 @@ func (f *FS) OpenFile(name string, flag int, perm os.FileMode) (billy.File, erro
 	defer f.mu.Unlock()
 retry:
 	p := Clean(name)
-	if op := f.busySync(p); op != nil {
-		// Released mu while copying up; another call's host change runs on p.
-		if err := f.waitOp(op); err != nil {
-			return nil, err
-		}
-		goto retry
-	}
+	f.syncOps(p) // a copy-up released mu, and another call's host change may run on p
 	if !writing && f.index == nil {
 		if h, ok, err := f.openUpperCold(p, flag); ok {
 			return h, err
@@ -1013,6 +1007,7 @@ func (f *FS) MkdirAll(name string, perm os.FileMode) error {
 	f.lockSync(p)
 	defer f.mu.Unlock()
 retry:
+	f.syncOps(p)
 	if err := f.mutable("mkdir", p); err != nil {
 		return err
 	}
@@ -1176,6 +1171,7 @@ func (f *FS) Remove(name string) error {
 	f.lockSync(p)
 	defer f.mu.Unlock()
 retry:
+	f.syncOps(p)
 	if err := f.mutable("remove", p); err != nil {
 		return err
 	}
@@ -1283,6 +1279,7 @@ func (f *FS) Link(oldname, newname string) error {
 	f.lockSync(src, dst)
 	defer f.mu.Unlock()
 retry:
+	f.syncOps(src, dst)
 	if err := f.mutable("link", dst); err != nil {
 		return err
 	}
@@ -1364,6 +1361,7 @@ func (f *FS) Rename(from, to string) error {
 	f.lockSync(src, dst)
 	defer f.mu.Unlock()
 retry:
+	f.syncOps(src, dst)
 	if err := f.mutable("rename", src); err != nil {
 		return err
 	}
@@ -1621,6 +1619,9 @@ func (f *FS) change(name, op string, host func(string) error, mem func(*memFile)
 		return err
 	}
 retry:
+	if err := f.idleOps(p); err != nil {
+		return err
+	}
 	if err := f.mutable(op, p); err != nil {
 		return err
 	}

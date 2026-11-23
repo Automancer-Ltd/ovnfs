@@ -60,6 +60,7 @@ func (f *FS) CreateFile(name string, perm os.FileMode, id ident.ID, mtime time.T
 	f.lockSync(p)
 	defer f.mu.Unlock()
 retry:
+	f.syncOps(p)
 	if err := f.mutable("create", p); err != nil {
 		return nil, err
 	}
@@ -136,6 +137,7 @@ func (f *FS) MkdirID(name string, perm os.FileMode, id ident.ID, mtime time.Time
 	f.lockSync(p)
 	defer f.mu.Unlock()
 retry:
+	f.syncOps(p)
 	if err := f.mutable("mkdir", p); err != nil {
 		return nil, err
 	}

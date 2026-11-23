@@ -634,9 +634,9 @@ func (f *FS) writeBack(m *memFile) {
 	if m.marked && markerErr == nil {
 		m.marked = false
 	}
-	if m.version != version || len(m.handles) != 0 {
-		// Changed during the rename after all: m stays in memory, which
-		// keeps no file at its name on disk.
+	if m.version != version || len(m.handles) != 0 || m.path != p || f.files[p] != m {
+		// Changed or renamed during the rename after all: m stays in memory,
+		// or holds p no longer, and keeps no file of this copy on disk.
 		ids.discard(real)
 		return
 	}
