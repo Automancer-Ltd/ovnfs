@@ -27,7 +27,10 @@ func TestNamesTheVolumeCannotHoldApart(t *testing.T) {
 	}
 
 	expect("create of invalid UTF-8", create("d/\xff\xfe"), rule.rejectInvalid, syscall.EILSEQ)
-	expect("mkdir of invalid UTF-8", f.MkdirAll("d/\xfe\xff", 0o755), rule.rejectInvalid, syscall.EILSEQ)
+	expect("mkdir of invalid UTF-8", f.MkdirAll("d/x\xfe", 0o755), rule.rejectInvalid, syscall.EILSEQ)
+	if !rule.rejectInvalid {
+		expect("create of other invalid bytes", create("d/\xfe\xff"), rule.foldInvalid, syscall.EEXIST)
+	}
 	// Each name below is free unless the volume folds it onto an existing one.
 	must(t, create("d/\u00e9"))
 	expect("create of the NFD form", create("d/e\u0301"), rule.foldNorm, syscall.EEXIST)

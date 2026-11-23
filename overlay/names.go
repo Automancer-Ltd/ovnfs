@@ -32,14 +32,20 @@ type nameRule struct {
 	foldCase      bool // names differing only in case are one entry
 	foldNorm      bool // names differing only in Unicode normalization are one entry
 	rejectInvalid bool // names that are not valid UTF-8 are refused
+	// foldInvalid: names that are not valid UTF-8 are one entry with every
+	// invalid byte read as U+FFFD, as Go spells them in UTF-16 on Windows.
+	foldInvalid bool
 }
 
 // folds reports whether the volume takes some different names for one entry.
-func (r nameRule) folds() bool { return r.foldCase || r.foldNorm }
+func (r nameRule) folds() bool { return r.foldCase || r.foldNorm || r.foldInvalid }
 
 // key returns the form of name under which the volume finds an entry:
 // equal keys name one entry.
 func (r nameRule) key(name string) string {
+	if r.foldInvalid && !utf8.ValidString(name) {
+		name = string([]rune(name)) // U+FFFD for each invalid byte, as ranging over name reads it
+	}
 	if r.foldNorm {
 		name = norm.NFD.String(name)
 	}
@@ -80,7 +86,9 @@ func probeNames(dir string) (nameRule, error) {
 	case err != nil:
 		return r, err
 	default:
-		if err := os.Remove(filepath.Join(dir, "probe-\xff\xfe")); err != nil {
+		_, err := os.Lstat(filepath.Join(dir, "probe-\xfe\xff"))
+		r.foldInvalid = err == nil
+		if err := errors.Join(os.Remove(filepath.Join(dir, "probe-\xff\xfe")), ignoreMissing(err)); err != nil {
 			return r, err
 		}
 	}
