@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"syscall"
 	"unicode/utf8"
 
@@ -29,23 +30,20 @@ import (
 // nameRule is what the upper's volume does with names, found by
 // [probeNames] when the overlay opens.
 type nameRule struct {
-	foldCase      bool // names differing only in case are one entry
-	foldNorm      bool // names differing only in Unicode normalization are one entry
-	rejectInvalid bool // names that are not valid UTF-8 are refused
-	// foldInvalid: names that are not valid UTF-8 are one entry with every
-	// invalid byte read as U+FFFD, as Go spells them in UTF-16 on Windows.
-	foldInvalid bool
+	foldCase bool // names differing only in case are one entry
+	foldNorm bool // names differing only in Unicode normalization are one entry
+	// rejectInvalid: names that are not valid UTF-8 are refused (APFS), or
+	// kept as other names (Windows, where Go writes each invalid byte as
+	// U+FFFD), which would come back changed and meet each other.
+	rejectInvalid bool
 }
 
 // folds reports whether the volume takes some different names for one entry.
-func (r nameRule) folds() bool { return r.foldCase || r.foldNorm || r.foldInvalid }
+func (r nameRule) folds() bool { return r.foldCase || r.foldNorm }
 
 // key returns the form of name under which the volume finds an entry:
 // equal keys name one entry.
 func (r nameRule) key(name string) string {
-	if r.foldInvalid && !utf8.ValidString(name) {
-		name = string([]rune(name)) // U+FFFD for each invalid byte, as ranging over name reads it
-	}
 	if r.foldNorm {
 		name = norm.NFD.String(name)
 	}
@@ -86,9 +84,12 @@ func probeNames(dir string) (nameRule, error) {
 	case err != nil:
 		return r, err
 	default:
-		_, err := os.Lstat(filepath.Join(dir, "probe-\xfe\xff"))
-		r.foldInvalid = err == nil
-		if err := errors.Join(os.Remove(filepath.Join(dir, "probe-\xff\xfe")), ignoreMissing(err)); err != nil {
+		items, err := os.ReadDir(dir)
+		if err != nil {
+			return r, err
+		}
+		r.rejectInvalid = !slices.ContainsFunc(items, func(e os.DirEntry) bool { return e.Name() == "probe-\xff\xfe" })
+		if err := os.Remove(filepath.Join(dir, "probe-\xff\xfe")); err != nil {
 			return r, err
 		}
 	}
