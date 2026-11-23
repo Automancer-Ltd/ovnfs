@@ -58,8 +58,10 @@ write. Larger buffers make 4 KiB writes disproportionately expensive.
 When a regular file shrinks through another frontend or a folder change,
 NFSv3 retires its existing handle instead of reporting the smaller size on
 that handle. The client receives `ESTALE`; a fresh lookup gets a new handle
-with the current attributes. A resize requested by that client keeps its
-handle.
+with the current attributes. A resize requested on that connection keeps its
+handle. A concurrent GETATTR or READ that sampled an earlier size rechecks
+it; replies with optional attributes can omit them instead. READ never uses
+a previously reported larger size to fill out the end of a smaller file.
 
 On macOS, startup and `restart` keep a retained NFS mount when its options
 match, but retire every non-root handle so cached files are recovered through

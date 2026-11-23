@@ -15,10 +15,12 @@ type memo struct {
 	slots atomic.Pointer[[1 << memoBits]atomic.Pointer[located]]
 }
 
-// located is one remembered identity: the entry with inode ino was at path.
+// located is one observed name of ino. Different names of one inode are
+// hard links; keep all of them until another inode takes the slot.
 type located struct {
 	ino  uint64
 	path string
+	next *located
 }
 
 // slot returns where ino's entry goes; nil while nothing was ever put,
@@ -37,13 +39,32 @@ func (m *memo) slot(ino uint64, make bool) *atomic.Pointer[located] {
 }
 
 // put remembers that the entry with inode ino is at view path p.
-func (m *memo) put(ino uint64, p string) { m.slot(ino, true).Store(&located{ino: ino, path: p}) }
+func (m *memo) put(ino uint64, p string) {
+	slot := m.slot(ino, true)
+	for {
+		old := slot.Load()
+		var next *located
+		if old != nil && old.ino == ino {
+			for e := old; e != nil; e = e.next {
+				if e.path == p {
+					return
+				}
+			}
+			next = old
+		}
+		if slot.CompareAndSwap(old, &located{ino: ino, path: p, next: next}) {
+			return
+		}
+	}
+}
 
-// get returns the view path the entry with inode ino was last put at.
-func (m *memo) get(ino uint64) (string, bool) {
+// find tries each remembered name of ino until shown accepts one.
+func (m *memo) find(ino uint64, shown func(string) bool) (string, bool) {
 	if slot := m.slot(ino, false); slot != nil {
-		if e := slot.Load(); e != nil && e.ino == ino {
-			return e.path, true
+		for e := slot.Load(); e != nil && e.ino == ino; e = e.next {
+			if shown(e.path) {
+				return e.path, true
+			}
 		}
 	}
 	return "", false

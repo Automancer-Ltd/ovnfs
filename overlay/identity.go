@@ -472,31 +472,27 @@ func statHost(name string, s *idStore) (os.FileInfo, error) {
 	return describe(name, info, s)
 }
 
-// inherited returns the identity a copy of lower entry info, served by s,
-// takes over: the entry's own, except for one of several hard links of a
-// frozen layer file, whose other names keep it while the copy gets its own.
-// 0 leaves the copy its own inode's.
-func inherited(s source, info os.FileInfo) ident.ID {
-	if s.layer != nil && !info.IsDir() && hardLinks(info) > 1 {
-		return 0
-	}
-	id, _ := ident.Of(info)
-	return id
-}
-
-// inherit is [inherited] for a copy made at upper name p, which leaves the
-// identity where an upper file at another name holds it already. Two names
-// of one bottom file share its inode's identity (a folder's build artifact
-// that cargo links into deps/ and beside it): the first one copied up takes
-// the identity along, so a handle a client holds follows the file through a
-// rename or a write, and a second copy is a file of its own, as the first
-// is by then. The caller holds f.mu with the index loaded.
+// inherit returns the identity an upper copy made at p takes from source s;
+// 0 leaves the copy its own identity. A frozen file with other hard links
+// keeps its identity under them. Cargo, for example, can link a bottom
+// artifact into deps/ and beside it; the first copy takes the shared ID,
+// and a later copy gets its own, even if the first was frozen in between.
+// The caller holds f.mu with the index loaded.
 func (f *FS) inherit(s source, p string, info os.FileInfo) ident.ID {
-	id := inherited(s, info)
-	if id == 0 || s.layer != nil || info.IsDir() || hardLinks(info) < 2 {
+	id, _ := ident.Of(info)
+	if id == 0 || info.IsDir() || hardLinks(info) < 2 {
 		return id
 	}
+	// Copy-up parts this name from the other hard links. A cached path for
+	// their shared ID may no longer be the one that serves its bytes.
+	f.names.Add(1)
+	if s.layer != nil {
+		return 0
+	}
 	if holder, held := f.paths[id]; held && holder != p {
+		return 0
+	}
+	if _, held := f.locateLayers(id); held {
 		return 0
 	}
 	return id

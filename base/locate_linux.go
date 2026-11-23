@@ -31,9 +31,7 @@ func (l *locator) listed(info os.FileInfo, dir string) {
 	}
 }
 
-// locate returns the view path the entry with inode ino was last seen at, if
-// the view still shows it there.
+// locate returns a remembered name of ino that the view still shows.
 func (c *Caches) locate(_ *Base, ino uint64, shown func(p string) bool) (string, bool) {
-	p, ok := c.locator.memo.get(ino)
-	return p, ok && shown(p)
+	return c.locator.memo.find(ino, shown)
 }

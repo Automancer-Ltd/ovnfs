@@ -374,6 +374,7 @@ func (c *conn) answer(rec []byte, cl *call, e *encoder) {
 		sizes:    &c.v3sizes,
 		maxSizes: &c.srv.v3.maxSizes,
 	}
+	e.sampleSizes()
 	e.u32(0) // record mark, set below
 	e.u32(xid)
 	e.u32(msgReply)

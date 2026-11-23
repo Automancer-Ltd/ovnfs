@@ -17,23 +17,28 @@ func (s *Server) getattr3(d *decoder, res *encoder) status {
 	if d.err != nil {
 		return stInval
 	}
-	p, st := s.path3(id, gen, ok)
-	if st != stOK {
-		return st
-	}
-	a, err := s.stat(id, p)
-	if err != nil {
-		return statusOf(err)
-	}
-	if res.sizeRegressed(&a) {
-		s.Recall(id)
-		if s.FS.RetireHandle(id) {
-			s.v3.maxSizes.retire(id)
+	for {
+		res.sampleSizes()
+		p, st := s.path3(id, gen, ok)
+		if st != stOK {
+			return st
 		}
-		return stStale
+		info, err := s.FS.Lstat(p)
+		if err != nil {
+			return statusOf(err)
+		}
+		if s.FS.IDOf(p, info) != id {
+			return stStale
+		}
+		a := attrsOf(id, info)
+		if retry, st := s.admitSize3(res, &a, gen); retry {
+			continue
+		} else if st != stOK {
+			return st
+		}
+		fattr3(res, &a)
+		return stOK
 	}
-	fattr3(res, &a)
-	return stOK
 }
 
 // setattr3 answers SETATTR (section 3.3.2). The guard compares the client's
@@ -193,46 +198,87 @@ func (s *Server) read3(d *decoder, res *encoder) status {
 	if d.err != nil {
 		return stInval
 	}
-	p, st := s.path3(id, gen, ok)
-	if st != stOK {
-		return st
-	}
-	f, err := s.FS.Open(p)
-	if err != nil {
-		return statusOf(err)
-	}
-	defer f.Close()
-	info, err := s.FS.Stat(p)
-	if err != nil {
-		return statusOf(err)
-	}
-	if info.IsDir() {
-		return stIsDir
-	}
-	size := uint64(max(info.Size(), 0))
-	var n uint64
-	if off < size {
-		n = min(uint64(count), size-off, maxIO)
-	}
-	a := attrsOf(id, info)
-	postAttrs3(res, &a)
-	at := res.len()
-	res.u32(0) // count, set below
-	res.u32(0) // eof, set below
-	var got int
-	if n == 0 {
-		res.u32(0)
-	} else {
-		got, err = res.opaqueFrom(int(n), func(b []byte) (int, error) { return f.ReadAt(b, int64(off)) })
+	start := res.len()
+	shortEOF := false
+	for {
+		res.sampleSizes()
+		f, a, st := s.openRead3(id, gen, ok)
+		if st != stOK {
+			return st
+		}
+		var n uint64
+		if off < a.size {
+			n = min(uint64(count), a.size-off, maxIO)
+		}
+		res.bool(true)
+		fattr3(res, &a)
+		at := res.len()
+		res.u32(0) // count
+		res.u32(0) // eof
+		var got int
+		var err error
+		if n == 0 {
+			res.u32(0)
+		} else {
+			got, err = res.opaqueFrom(int(n), func(b []byte) (int, error) { return f.ReadAt(b, int64(off)) })
+		}
+		f.Close()
 		if err != nil && !errors.Is(err, io.EOF) {
 			return statusOf(err)
 		}
+		if retry, st := s.admitSize3(res, &a, gen); retry {
+			res.truncate(start)
+			continue
+		} else if st != stOK {
+			return st
+		}
+		if errors.Is(err, io.EOF) && uint64(got) < n {
+			// The file may have shrunk between Stat and ReadAt. Never pair
+			// an early EOF with attributes promising data beyond it.
+			if shortEOF {
+				return stIO
+			}
+			shortEOF = true
+			res.truncate(start)
+			continue
+		}
+		res.put32(at, uint32(got))
+		if off+uint64(got) >= a.size {
+			res.put32(at+4, 1)
+		}
+		return stOK
 	}
-	res.put32(at, uint32(got))
-	if errors.Is(err, io.EOF) || off+uint64(got) >= size {
-		res.put32(at+4, 1)
+}
+
+// openRead3 samples the size and identity of the descriptor supplying the
+// bytes. A path stat after open may describe a replacement instead.
+func (s *Server) openRead3(id, gen uint64, ok bool) (billy.File, attrs, status) {
+	p, st := s.path3(id, gen, ok)
+	if st != stOK {
+		return nil, attrs{}, st
 	}
-	return stOK
+	f, err := s.FS.Open(p)
+	if err != nil {
+		return nil, attrs{}, statusOf(err)
+	}
+	var info os.FileInfo
+	if fd, ok := f.(interface{ Stat() (os.FileInfo, error) }); ok {
+		info, err = fd.Stat()
+	} else {
+		info, err = s.FS.Stat(p)
+	}
+	switch {
+	case err != nil:
+		st = statusOf(err)
+	case info.IsDir():
+		st = stIsDir
+	case s.FS.IDOf(p, info) != id:
+		st = stStale
+	default:
+		return f, attrsOf(id, info), stOK
+	}
+	f.Close()
+	return nil, attrs{}, st
 }
 
 // stable_how3 values. DATA_SYNC is implemented as FILE_SYNC.

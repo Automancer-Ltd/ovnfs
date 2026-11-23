@@ -81,9 +81,10 @@ type FS struct {
 
 // Names returns the generation of the overlay's namespace, which advances
 // after every change that may move or remove a visible entry: Remove,
-// Rename, Rebase and Discard. Creating an entry moves none, nor does
-// copy-up, spill or freeze. A path [FS.Locate] returned for an identity
-// stays that identity's while Names, read before the Locate, is unchanged:
+// Rename, Rebase, Discard and a copy-up that separates hard links. Creating
+// an entry moves none, nor does an ordinary copy-up, spill or freeze.
+// A path [FS.Locate] returned for an identity stays that identity's while
+// Names, read before the Locate, is unchanged:
 // the export caches resolutions on it.
 func (f *FS) Names() uint64 { return f.names.Load() }
 
@@ -1368,7 +1369,7 @@ retry:
 	if src == "" || dst == "" || reserved(src) || reserved(dst) {
 		return &os.LinkError{Op: "rename", Old: from, New: to, Err: syscall.EPERM}
 	}
-	_, sinfo, err := f.lookup(src)
+	ss, sinfo, err := f.lookup(src)
 	if err != nil {
 		return err
 	}
@@ -1387,7 +1388,9 @@ retry:
 			return err
 		}
 	}
-	if derr == nil && sameEntry(sinfo, dinfo) {
+	// A copied-up bottom hard link keeps its exported ID but is no longer
+	// the same file as an untouched alias on a lower level.
+	if derr == nil && ss.layer == ds.layer && sameEntry(sinfo, dinfo) {
 		return nil
 	}
 	if derr == nil {
@@ -1887,7 +1890,7 @@ func (f *FS) ensureDir(p string) error {
 		}
 		return nil
 	}
-	s, info, err := f.lookup(p)
+	_, info, err := f.lookup(p)
 	if err != nil {
 		return err
 	}
@@ -1901,7 +1904,8 @@ func (f *FS) ensureDir(p string) error {
 		if err := os.Mkdir(f.up(p), info.Mode().Perm()); err != nil {
 			return err
 		}
-		if err := f.ids.persist(f.up(p), inherited(s, info)); err != nil {
+		id, _ := ident.Of(info)
+		if err := f.ids.persist(f.up(p), id); err != nil {
 			return err
 		}
 		if err := os.Chmod(f.up(p), info.Mode().Perm()); err != nil {
@@ -1923,7 +1927,8 @@ func (f *FS) ensureDir(p string) error {
 // OpenFile to resolve the name again if another operation changed its source.
 func (f *FS) copyUpBottomForOpen(p, q string, info os.FileInfo) (bool, error) {
 	bottom, epoch, ids := f.bottom, f.bottomEpoch, f.ids
-	id := f.inherit(source{}, p, info)
+	id, _ := ident.Of(info)
+	linked := hardLinks(info) > 1
 	inMemory := f.mem != nil && info.Size() <= f.mem.fileMax
 	for {
 		var tmp string
@@ -1942,7 +1947,7 @@ func (f *FS) copyUpBottomForOpen(p, q string, info os.FileInfo) (bool, error) {
 			}
 		} else {
 			err = bottom.CopyTo(q, tmp)
-			if err == nil {
+			if err == nil && !linked {
 				err = ids.persist(tmp, id)
 			}
 			if err == nil {
@@ -1968,6 +1973,17 @@ func (f *FS) copyUpBottomForOpen(p, q string, info os.FileInfo) (bool, error) {
 				ids.discard(tmp)
 			}
 			return false, err
+		}
+		// Another name of this bottom inode may have been copied up while
+		// staging. Only one copy can take its identity into the upper.
+		if linked {
+			id = f.inherit(source{}, p, info)
+			if !inMemory {
+				if err := ids.persist(tmp, id); err != nil {
+					ids.discard(tmp)
+					return false, err
+				}
+			}
 		}
 		if inMemory {
 			if int64(len(data)) <= f.mem.fileMax {

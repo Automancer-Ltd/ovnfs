@@ -19,7 +19,7 @@ func (f *FS) Locate(id ident.ID) (string, bool) {
 	f.mu.RLock()
 	p, ok := f.locate(id)
 	cold := f.index == nil && f.upper != ""
-	bottom := f.bottom
+	bottom, epoch := f.bottom, f.bottomEpoch
 	f.mu.RUnlock()
 	if ok {
 		return p, true
@@ -37,20 +37,39 @@ func (f *FS) Locate(id ident.ID) (string, bool) {
 			return p, true
 		}
 	}
-	if !cold {
-		return "", false
+	if cold {
+		f.mu.Lock()
+		if f.loadIndex() != nil {
+			f.mu.Unlock()
+			return "", false
+		}
+		// The upper's redirects, known now, may show a lower entry elsewhere.
+		p, ok = f.locate(id)
+		if !ok && inBottom && f.bottomEpoch == epoch {
+			p, ok = f.locateBottom(below, id)
+		}
+		f.mu.Unlock()
+		if ok {
+			return p, true
+		}
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.loadIndex() != nil {
-		return "", false
-	}
-	// The upper's redirects, known now, may show a lower entry elsewhere.
-	if p, ok := f.locate(id); ok {
-		return p, true
-	}
-	if inBottom && f.bottom == bottom {
-		return f.locateBottom(below, id)
+	if aliases, has := bottom.(AliasLocator); inBottom && has {
+		ok = aliases.LocateAlias(id, func(q string) bool {
+			if q == below {
+				return false // the lookup above already rejected it
+			}
+			f.mu.RLock()
+			defer f.mu.RUnlock()
+			if f.bottomEpoch != epoch {
+				return false
+			}
+			var visible bool
+			p, visible = f.locateBottom(q, id)
+			return visible
+		})
+		if ok {
+			return p, true
+		}
 	}
 	return "", false
 }
@@ -59,7 +78,20 @@ func (f *FS) Locate(id ident.ID) (string, bool) {
 // q. The caller holds f.mu.
 func (f *FS) locateBottom(q string, id ident.ID) (string, bool) {
 	p := f.above(len(f.layers), q)
-	return p, f.shows(p, id)
+	_, info, err := f.lookupRead(p)
+	if err != nil {
+		return "", false
+	}
+	got, ok := ident.Of(info)
+	if !ok || got != id {
+		return "", false
+	}
+	// Another name of this bottom inode may have taken the ID into the
+	// upper. Load its index before accepting an unchanged hard link.
+	if f.index == nil && f.upper != "" && !info.IsDir() && hardLinks(info) > 1 {
+		return "", false
+	}
+	return p, true
 }
 
 // above translates path q of the i-th frozen layer (len(f.layers): the
@@ -85,6 +117,11 @@ func (f *FS) locate(id ident.ID) (string, bool) {
 	if p, ok := f.locateUpper(id); ok {
 		return p, true
 	}
+	return f.locateLayers(id)
+}
+
+// locateLayers finds a visible holder of id in the frozen layers.
+func (f *FS) locateLayers(id ident.ID) (string, bool) {
 	for i, l := range f.layers {
 		if q, ok := l.locate(id, func(q string) bool { return f.shows(f.above(i, q), id) }); ok {
 			return f.above(i, q), true

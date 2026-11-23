@@ -87,7 +87,9 @@ Opening a folder classifies every path into one of four classes:
 Nothing is copied to make the source view. A source file is the folder's own
 file while its size, mtime and inode still match the capture, and its
 captured content (from the store or the repository's objects) once they do
-not; a file the user adds later stays out.
+not; a file the user adds later stays out. If the folder truncates the file
+after a checkout reader opened it, the reader continues at the same offset
+in the captured content. Copy-up uses the same check.
 
 Cache and local paths never show the folder as it is now either. A *cache
 snapshot*, taken when the checkout opens, fixes what the checkout sees of

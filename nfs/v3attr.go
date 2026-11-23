@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-git/go-billy/v5"
@@ -16,55 +17,28 @@ import (
 // retire, after which clients see the file through new handles and its
 // history starts afresh.
 type maxReportedSizes struct {
-	mu   sync.Mutex
-	byID map[uint64]uint64
-	// epochs counts each file id's retires, so that a size a connection
-	// requested before one (clientReportedSizes) no longer applies.
-	epochs map[uint64]uint64
+	mu     sync.Mutex
+	retire sync.Mutex // serializes generation changes, never held on a normal stat
+	clock  atomic.Uint64
+	byID   map[uint64]reportedSize
 }
 
-func (s *maxReportedSizes) observe(id, size uint64) uint64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if previous, ok := s.byID[id]; ok && previous > size {
-		return previous
+type reportedSize struct {
+	size, epoch uint64
+	changed     uint64 // clock at the last change in the size clients may be told
+}
+
+// store records a new size fence; the caller holds mu.
+func (m *maxReportedSizes) store(id uint64, r reportedSize) {
+	if m.byID == nil {
+		m.byID = make(map[uint64]reportedSize)
 	}
-	if s.byID == nil {
-		s.byID = make(map[uint64]uint64)
-	}
-	s.byID[id] = size
-	return size
+	r.changed = m.clock.Add(1)
+	m.byID[id] = r
 }
 
-func (s *maxReportedSizes) previous(id uint64) (uint64, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	size, ok := s.byID[id]
-	return size, ok
-}
-
-// epoch is the number of times id was retired.
-func (s *maxReportedSizes) epoch(id uint64) uint64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.epochs[id]
-}
-
-// retire forgets the sizes reported of file id, whose handles getattr3 has
-// just retired: the file ids stay, so without this the new handles would
-// inherit the sizes the regression was measured against.
-func (s *maxReportedSizes) retire(id uint64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.byID, id)
-	if s.epochs == nil {
-		s.epochs = make(map[uint64]uint64)
-	}
-	s.epochs[id]++
-}
-
-// clientReportedSizes orders size regressions with the operation that caused
-// them; an unexpected regression retires the handle before it is reported.
+// clientReportedSizes lets only the connection that requested a truncate
+// observe the smaller size on the same handle.
 type clientReportedSizes struct {
 	mu      sync.Mutex
 	changed *sync.Cond
@@ -72,51 +46,49 @@ type clientReportedSizes struct {
 	pending map[uint64]bool
 }
 
-// requestedSize is a size this connection's client set, recorded in epoch
-// (maxReportedSizes.epoch) of its file.
 type requestedSize struct{ size, epoch uint64 }
 
-// requested returns the size this connection's client set for id, dropping
-// one recorded before id was last retired.
-func (s *clientReportedSizes) requested(maximum *maxReportedSizes, id uint64) (uint64, bool) {
-	r, ok := s.byID[id]
-	if !ok {
-		return 0, false
-	}
-	if r.epoch != maximum.epoch(id) {
-		delete(s.byID, id)
-		return 0, false
-	}
-	return r.size, true
-}
+type sizeCheck uint8
 
-func (s *clientReportedSizes) report(maximum *maxReportedSizes, id, size uint64) uint64 {
+const (
+	sizeCurrent sizeCheck = iota
+	sizeRaced             // a newer observation or a resize overtook the stat
+	sizeShrank            // a current sample is below the permitted size
+)
+
+// check both validates and records one sample. A stat collected before a
+// completed truncate must not restore the old high-water mark; equally, an
+// older GETATTR overtaken by a growing WRITE is not evidence of shrinkage.
+func (s *clientReportedSizes) check(m *maxReportedSizes, id, size, sampled uint64) sizeCheck {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.wait(id)
-	if previous, ok := s.requested(maximum, id); ok {
-		if previous > size {
-			return previous
-		}
-		if maximum.observe(id, size) <= size {
-			delete(s.byID, id)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r := m.byID[id]
+	floor := r.size
+	if req, ok := s.byID[id]; ok {
+		if req.epoch == r.epoch {
+			floor = req.size
 		} else {
-			s.byID[id] = requestedSize{size, maximum.epoch(id)}
+			delete(s.byID, id)
 		}
-		return size
 	}
-	return maximum.observe(id, size)
-}
-
-func (s *clientReportedSizes) regressed(maximum *maxReportedSizes, id, size uint64) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.wait(id)
-	if previous, ok := s.requested(maximum, id); ok {
-		return size < previous
+	switch {
+	case r.changed > sampled:
+		return sizeRaced
+	case size == floor:
+		return sizeCurrent
+	case size < floor:
+		return sizeShrank
+	case size < r.size:
+		s.byID[id] = requestedSize{size, r.epoch}
+	default:
+		r.size = size
+		delete(s.byID, id)
 	}
-	previous, ok := maximum.previous(id)
-	return ok && size < previous
+	m.store(id, r)
+	return sizeCurrent
 }
 
 func (s *clientReportedSizes) wait(id uint64) {
@@ -146,10 +118,19 @@ func (s *clientReportedSizes) begin(id uint64) {
 func (s *clientReportedSizes) finish(maximum *maxReportedSizes, id, size uint64, accepted bool) {
 	s.mu.Lock()
 	if accepted {
-		if s.byID == nil {
-			s.byID = make(map[uint64]requestedSize)
+		maximum.mu.Lock()
+		r := maximum.byID[id]
+		if size < r.size {
+			if s.byID == nil {
+				s.byID = make(map[uint64]requestedSize)
+			}
+			s.byID[id] = requestedSize{size, r.epoch}
+		} else {
+			r.size = size
+			delete(s.byID, id)
 		}
-		s.byID[id] = requestedSize{size, maximum.epoch(id)}
+		maximum.store(id, r)
+		maximum.mu.Unlock()
 	}
 	delete(s.pending, id)
 	if s.changed != nil {
@@ -176,27 +157,58 @@ func (e *encoder) finishSize(sent bool) {
 		return
 	}
 	accepted := sent && e.sizeAccepted
-	if accepted {
-		e.maxSizes.observe(e.sizeID, e.size)
-	}
 	e.sizes.finish(e.maxSizes, e.sizeID, e.size, accepted)
 	e.sizePending = false
 }
 
-func (e *encoder) reportSize(a *attrs) {
-	if a.typ != typeReg || e.sizes == nil || e.sizePending && e.sizeID == a.fileid {
-		return
+// sampleSizes fences attributes collected from here on against later size changes.
+func (e *encoder) sampleSizes() {
+	if e.maxSizes != nil {
+		e.sampled = e.maxSizes.clock.Load()
 	}
-	a.size = e.sizes.report(e.maxSizes, a.fileid, a.size)
 }
 
-func (e *encoder) sizeRegressed(a *attrs) bool {
-	return a.typ == typeReg && e.sizes != nil && e.sizes.regressed(e.maxSizes, a.fileid, a.size)
+func (e *encoder) checkSize(a *attrs) sizeCheck {
+	if a.typ != typeReg || e.sizes == nil || e.sizePending && e.sizeID == a.fileid {
+		return sizeCurrent
+	}
+	return e.sizes.check(e.maxSizes, a.fileid, a.size, e.sampled)
 }
 
-// fattr3 appends a as an fattr3.
+// admitSize3 retries a raced sample. Only an unexpected shrink in the same
+// live generation retires it; two concurrent page-ins must not retire the
+// new handle issued after the first one.
+func (s *Server) admitSize3(e *encoder, a *attrs, gen uint64) (retry bool, st status) {
+	switch e.checkSize(a) {
+	case sizeCurrent:
+		return false, stOK
+	case sizeRaced:
+		return true, stOK
+	}
+	id, m := a.fileid, e.maxSizes
+	m.retire.Lock()
+	defer m.retire.Unlock()
+	if s.FS.Generation(id) != gen {
+		return false, stStale
+	}
+	// Another observer may have published a change since checkSize.
+	m.mu.Lock()
+	changed := m.byID[id].changed
+	m.mu.Unlock()
+	if changed > e.sampled {
+		return true, stOK
+	}
+	s.Recall(id)
+	if s.FS.RetireHandle(id) {
+		m.mu.Lock()
+		m.store(id, reportedSize{epoch: m.byID[id].epoch + 1})
+		m.mu.Unlock()
+	}
+	return false, stStale
+}
+
+// fattr3 encodes attributes; callers admit the size before publishing the reply.
 func fattr3(e *encoder, a *attrs) {
-	e.reportSize(a)
 	e.u32(uint32(a.typ))
 	e.u32(a.mode)
 	e.u32(a.nlink)
@@ -219,10 +231,13 @@ func time3(e *encoder, t time.Time) {
 	e.u32(uint32(t.Nanosecond()))
 }
 
-// postAttrs3 appends a present post_op_attr.
+// postAttrs3 omits optional attributes rather than advertising bytes past EOF.
 func postAttrs3(e *encoder, a *attrs) {
-	e.bool(true)
-	fattr3(e, a)
+	ok := e.checkSize(a) == sizeCurrent
+	e.bool(ok)
+	if ok {
+		fattr3(e, a)
+	}
 }
 
 // postOp3 appends the post_op_attr of file id at p, absent when p cannot

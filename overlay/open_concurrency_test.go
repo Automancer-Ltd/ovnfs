@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -95,6 +96,47 @@ func TestSlowCopyUpRechecksSource(t *testing.T) {
 			})
 		}
 	}
+}
+
+// A copy that finishes staging second leaves the original ID with the alias
+// that was already copied up, even if both began with the same lower inode.
+func TestConcurrentBottomHardlinkCopyUp(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows metadata has no link count")
+	}
+	memories(t, func(t *testing.T, mem func() *Memory) {
+		lower := tree(t, map[string]string{"slow": "original"})
+		must(t, os.Link(filepath.Join(lower, "slow"), filepath.Join(lower, "artifact")))
+		b := &gatedBottom{dirBottom: dirBottom{lower}, started: make(chan struct{}), release: make(chan struct{})}
+		release := sync.OnceFunc(func() { close(b.release) })
+		defer release()
+		f, err := New(t.TempDir(), nil, b, mem())
+		must(t, err)
+		shared := idOf(t, f, "slow")
+		done := make(chan error, 1)
+		go func() { done <- writeFile(f, "slow", []byte("+"), os.O_WRONLY|os.O_APPEND) }()
+		select {
+		case <-b.started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("copy-up did not reach the bottom")
+		}
+		names := f.Names()
+		write(t, f, "artifact", "rebuilt", os.O_WRONLY|os.O_TRUNC)
+		if f.Names() == names {
+			t.Error("a handle resolution cached before the split still looks current")
+		}
+		release()
+		must(t, <-done)
+		if got := idOf(t, f, "slow"); got == shared {
+			t.Fatal("both independently writable copies claim the shared handle")
+		} else {
+			assertLocated(t, f, got, "slow", true)
+		}
+		assertLocated(t, f, shared, "artifact", true)
+		if got := read(t, f, "slow"); got != "original+" {
+			t.Fatalf("second copy = %q", got)
+		}
+	})
 }
 
 func TestSlowBottomOpenDoesNotBlockOtherOperations(t *testing.T) {

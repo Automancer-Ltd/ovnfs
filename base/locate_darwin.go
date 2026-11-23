@@ -34,16 +34,20 @@ func (l *locator) seen(info os.FileInfo, p string) {
 	}
 }
 
-// listed remembers nothing: fsgetpath finds a listed entry, and a listed
-// name of a file with several may be one the overlay shadows.
-func (*locator) listed(os.FileInfo, string) {}
+// listed remembers hard links too: a listing can issue a file handle even
+// when no client looks the name up separately.
+func (l *locator) listed(info os.FileInfo, dir string) {
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Nlink > 1 && !info.IsDir() {
+		l.memo.put(st.Ino, dir+"/"+info.Name())
+	}
+}
 
 // locate returns a view path of the entry with inode ino that the view
 // shows, as shown reports: a file of a local root, in the snapshot's tree, or
 // the folder's own file below a cache root.
 func (c *Caches) locate(b *Base, ino uint64, shown func(p string) bool) (string, bool) {
 	l := &c.locator
-	if p, ok := l.memo.get(ino); ok && shown(p) {
+	if p, ok := l.memo.find(ino, shown); ok {
 		return p, true
 	}
 	l.once.Do(func() {

@@ -31,6 +31,13 @@ type Bottom interface {
 	Locate(id ident.ID) (string, bool)
 }
 
+// AliasLocator is implemented by a bottom that can give a file several
+// names. When its first answer to Bottom.Locate is hidden, the overlay
+// tries the others with their merged visibility (including redirects).
+type AliasLocator interface {
+	LocateAlias(id ident.ID, visible func(string) bool) bool
+}
+
 // Awaiter is implemented by bottoms whose first access to some paths waits
 // for background work (base cache snapshots). [FS] calls Await(p) before
 // taking its lock in every entry point taking a path (p clean,

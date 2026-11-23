@@ -437,6 +437,59 @@ func TestBaseIdentities(t *testing.T) {
 	}
 }
 
+// A handle issued by READDIR remains resolvable after an overlay rename
+// and unlink, without a client first looking up the surviving hard link.
+func TestLocateListedCacheHardlinkAfterWhiteout(t *testing.T) {
+	repo, dir := repository(t)
+	a := filepath.Join(dir, "target", "deps", "a")
+	writeTestFile(t, a, "artifact")
+	if err := os.Link(a, filepath.Join(filepath.Dir(a), "b")); err != nil {
+		t.Skipf("cannot create a hard link: %v", err)
+	}
+	b, _ := createTestBase(t, repo, nil)
+	c := b.TakeCaches("c1")
+	c.Wait()
+	view := b.Bottom(c)
+	f, err := overlay.New(t.TempDir(), nil, view, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Rename("target", "moved"); err != nil {
+		t.Fatal(err)
+	}
+	items, err := f.ReadDir("moved/deps")
+	if err != nil || len(items) != 2 {
+		t.Fatalf("ReadDir = %v, %v", items, err)
+	}
+	id, ok := ident.Of(items[0])
+	other, ok2 := ident.Of(items[1])
+	if !ok || !ok2 || id != other {
+		t.Fatalf("listed aliases lack a shared handle: %v and %v", id, other)
+	}
+	first, ok := view.Locate(id)
+	if !ok {
+		t.Fatal("listed handle did not resolve")
+	}
+	gone, want := "moved/deps/a", "moved/deps/b"
+	if first == "target/deps/b" {
+		gone, want = want, gone
+	} else if first != "target/deps/a" {
+		t.Fatalf("unexpected bottom path %q", first)
+	}
+	if err := f.Remove(gone); err != nil {
+		t.Fatal(err)
+	}
+	if p, ok := f.Locate(id); !ok || p != want {
+		t.Fatalf("Locate after removing %s = %q, %v; want %s", gone, p, ok, want)
+	}
+	if err := f.Remove(want); err != nil {
+		t.Fatal(err)
+	}
+	if p, ok := f.Locate(id); ok {
+		t.Fatalf("both aliases removed but ID still resolves to %s", p)
+	}
+}
+
 // TestLinksIntoTheFolderAreRelative serves the absolute target of a link
 // below a cache root, when it lies inside the folder, relative to the link, so
 // a checkout's link names the checkout's copy; targets outside the folder and

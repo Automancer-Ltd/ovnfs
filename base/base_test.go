@@ -118,6 +118,48 @@ func readBase(t *testing.T, b *Base, p string) string {
 	return string(data)
 }
 
+// TestOpenSourceSurvivesShrink holds both a reader and copy-up input open
+// across an in-place rewrite. Neither may publish the shorter host file.
+func TestOpenSourceSurvivesShrink(t *testing.T) {
+	const original = "fork source\n"
+	repo, dir := repository(t)
+	b, _ := createTestBase(t, repo, nil)
+	view := b.Bottom(nil)
+	reader, err := view.Open("source.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	copyInput, err := view.Open("source.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer copyInput.Close()
+
+	var buf [4]byte
+	if _, err := io.ReadFull(reader, buf[:]); err != nil || string(buf[:]) != original[:4] {
+		t.Fatalf("initial read = %q, %v", buf, err)
+	}
+	writeTestFile(t, filepath.Join(dir, "source.txt"), "x")
+	if n, err := reader.ReadAt(buf[:], 0); err != nil || n != len(buf) || string(buf[:]) != original[:4] {
+		t.Fatalf("read after rewrite = %q (%d), %v", buf, n, err)
+	}
+	if tail, err := io.ReadAll(reader); err != nil || string(tail) != original[4:] {
+		t.Fatalf("sequential read after rewrite = %q, %v", tail, err)
+	}
+	if end, err := reader.Seek(0, io.SeekEnd); err != nil || end != int64(len(original)) {
+		t.Fatalf("seek to end = %d, %v", end, err)
+	}
+
+	dst := filepath.Join(t.TempDir(), "copy")
+	if err := copyContent(copyInput, dst, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(dst); err != nil || string(data) != original {
+		t.Fatalf("copy after rewrite = %q, %v", data, err)
+	}
+}
+
 // TestSourceFallbackPreservesCapturedMtime covers modified and deleted source fallback.
 func TestSourceFallbackPreservesCapturedMtime(t *testing.T) {
 	repo, dir := repository(t)

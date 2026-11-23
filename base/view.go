@@ -87,6 +87,17 @@ func (v bottom) Locate(id ident.ID) (string, bool) {
 	return "", false
 }
 
+// LocateAlias tries the other names of a hard-linked snapshot or cache
+// file when the overlay hides the path Locate returned. visible checks
+// the identity in the merged view, not just in the bottom.
+func (v bottom) LocateAlias(id ident.ID, visible func(string) bool) bool {
+	if id.Space() != ident.State || v.c == nil {
+		return false
+	}
+	_, ok := v.c.locate(v.b, id.Value(), visible)
+	return ok
+}
+
 // ReadDir lists a directory: captured source names with the roots the cache
 // snapshot shows, a snapshot directory, or a folder directory below a cache
 // root.
@@ -182,15 +193,20 @@ func (v bottom) Open(p string) (overlay.Content, error) {
 			// Between lstat and open the folder may have changed; the open
 			// file must be the inode that matched.
 			if opened, statErr := f.Stat(); statErr == nil && os.SameFile(e.info.(hostInfo).FileInfo, opened) && opened.Size() == e.info.Size() && opened.ModTime().Equal(e.info.ModTime()) {
-				return f, nil
+				return &sourceFile{b: b, path: p, node: e.n, host: f, info: opened}, nil
 			}
 			f.Close()
 		}
 	}
-	if b.index.lfs(e.n) {
-		return b.lfsFile(p, b.index.oid(e.n))
+	return b.capturedFile(p, e.n)
+}
+
+// capturedFile opens the immutable backing for a source leaf.
+func (b *Base) capturedFile(p string, n uint32) (overlay.Content, error) {
+	if b.index.lfs(n) {
+		return b.lfsFile(p, b.index.oid(n))
 	}
-	return b.blobFile(p, b.index.oid(e.n))
+	return b.blobFile(p, b.index.oid(n))
 }
 
 // Readlink returns a symlink's target from the folder, the snapshot or the
@@ -409,6 +425,8 @@ func copyContent(c overlay.Content, dst string, mode os.FileMode) error {
 	switch f := c.(type) {
 	case *os.File:
 		return clone.FD(f, dst, mode)
+	case *sourceFile:
+		return f.copyTo(dst, mode)
 	case *fencedFile:
 		// A clone takes the folder's blocks as they are now: they must still
 		// be the ones opened.

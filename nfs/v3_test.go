@@ -10,8 +10,11 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/go-git/go-billy/v5"
 )
 
 // v3call calls NFSv3 procedure proc and returns the result's status and a
@@ -202,6 +205,131 @@ func TestV3Lookup(t *testing.T) {
 	}
 }
 
+// sampledStatFS pauses one RPC after it sampled the file's attributes.
+type sampledStatFS struct {
+	*testFS
+	hold             atomic.Bool
+	sampled, release chan struct{}
+}
+
+func (f *sampledStatFS) pause(p string) {
+	if p == "f" && f.hold.CompareAndSwap(true, false) {
+		close(f.sampled)
+		<-f.release
+	}
+}
+
+func (f *sampledStatFS) Lstat(p string) (os.FileInfo, error) {
+	info, err := f.testFS.Lstat(p)
+	f.pause(p)
+	return info, err
+}
+
+func (f *sampledStatFS) Open(p string) (billy.File, error) {
+	fd, err := f.testFS.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	return sampledReadFile{fd, f, p}, nil
+}
+
+type sampledReadFile struct {
+	billy.File
+	fs   *sampledStatFS
+	path string
+}
+
+func (f sampledReadFile) ReadAt(b []byte, off int64) (int, error) {
+	n, err := f.File.ReadAt(b, off)
+	f.fs.pause(f.path)
+	return n, err
+}
+
+func sizeArgs(id, gen, size uint64) func(*encoder) {
+	return func(e *encoder) {
+		e.fh(id, gen)
+		e.u32(0) // mode
+		e.u32(0) // uid
+		e.u32(0) // gid
+		e.bool(true)
+		e.u64(size)
+		e.u32(0) // atime
+		e.u32(0) // mtime
+		e.bool(false)
+	}
+}
+
+// A delayed reply cannot restore the size from before a truncate or mistake
+// an earlier, smaller observation for a shrink after a successful WRITE.
+func TestV3SizeSampleOvertaken(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		proc uint32
+		size uint64
+	}{
+		{"getattr-then-truncate", v3GetAttr, 2},
+		{"lookup-then-truncate", v3Lookup, 2},
+		{"read-then-truncate", v3Read, 2},
+		{"getattr-then-grow", v3GetAttr, 9},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fs := &sampledStatFS{testFS: newTestFS(t), sampled: make(chan struct{}), release: make(chan struct{})}
+			fs.write(t, "f", "12345678")
+			c := dial(t, startServer(t, &Server{FS: fs, Concurrency: 4}))
+			unblock := sync.OnceFunc(func() { close(fs.release) })
+			defer unblock()
+			id := fs.FileID("f")
+			handle := func(e *encoder) { e.fh(id, 0) }
+			if st, d := c.v3call(v3GetAttr, handle); st != stOK || fattr3Of(d).size != 8 {
+				t.Fatal("initial GETATTR did not report size 8")
+			}
+			fs.hold.Store(true)
+			switch test.proc {
+			case v3Lookup:
+				c.send(10, v3Lookup, func(e *encoder) { dirop(e, 1, "f") })
+			case v3Read:
+				c.send(10, v3Read, func(e *encoder) { handle(e); e.u64(0); e.u32(8) })
+			default:
+				c.send(10, v3GetAttr, handle)
+			}
+			select {
+			case <-fs.sampled:
+			case <-time.After(5 * time.Second):
+				t.Fatal("no attribute sample")
+			}
+			if test.size < 8 {
+				c.send(11, v3SetAttr, sizeArgs(id, 0, test.size))
+			} else {
+				c.send(11, v3Write, writeArgs(id, 8, []byte("9")))
+			}
+			if d := c.replies(1)[11]; d == nil {
+				t.Fatal("file change did not finish first")
+			}
+			unblock()
+			d := c.replies(1)[10]
+			switch test.proc {
+			case v3Read:
+				a, ok := postOpOf(t, d)
+				if !ok || a.size != test.size || uint64(d.u32()) != test.size || !d.bool() || string(d.opaque(8)) != "12" {
+					t.Fatal("late READ did not return the two bytes at the new EOF")
+				}
+			case v3Lookup:
+				d.fh(maxFH3)
+				if a, ok := postOpOf(t, d); ok && a.size != test.size {
+					t.Fatalf("late LOOKUP advertised size %d", a.size)
+				}
+			default:
+				if a := fattr3Of(d); a.size != test.size {
+					t.Fatalf("late GETATTR reported %d, want %d", a.size, test.size)
+				}
+			}
+			if st, d := c.v3call(v3GetAttr, handle); st != stOK || fattr3Of(d).size != test.size {
+				t.Fatalf("live handle after overlapping replies: status %d, want size %d", st, test.size)
+			}
+		})
+	}
+}
+
 // TestV3SizeRegressionRetiresHandle checks that an unexpected shrink makes
 // the old handle stale while a fresh LOOKUP returns a working handle with
 // the same fileid, and that a client-requested truncate preserves it.
@@ -252,8 +380,16 @@ func TestV3SizeRegressionRetiresHandle(t *testing.T) {
 	if err := os.Truncate(fs.host("f"), 3); err != nil {
 		t.Fatal(err)
 	}
-	if st, _ := getattr(first, gen); st != stStale {
-		t.Fatalf("GETATTR after shrink: %d, want STALE", st)
+	if st, d := first.v3call(v3Lookup, func(e *encoder) { dirop(e, 1, "f") }); st != stOK {
+		t.Fatalf("LOOKUP after shrink: %d", st)
+	} else {
+		d.fh(maxFH3)
+		if a, ok := postOpOf(t, d); ok {
+			t.Fatalf("LOOKUP advertised size %d on regressed handle", a.size)
+		}
+	}
+	if st, _, _ := first.read3(id, 0, 8); st != stStale {
+		t.Fatalf("READ after shrink: %d, want STALE instead of an EOF with stale size", st)
 	}
 	if st, _ := getattr(second, gen); st != stStale {
 		t.Fatalf("old handle on another connection: %d, want STALE", st)
@@ -267,17 +403,7 @@ func TestV3SizeRegressionRetiresHandle(t *testing.T) {
 		t.Fatalf("fresh handle: %d, size %d", st, a.size)
 	}
 
-	st, d := first.v3call(v3SetAttr, func(e *encoder) {
-		e.fh(id, gen)
-		e.u32(0) // mode
-		e.u32(0) // uid
-		e.u32(0) // gid
-		e.bool(true)
-		e.u64(2)
-		e.u32(0) // atime
-		e.u32(0) // mtime
-		e.bool(false)
-	})
+	st, d := first.v3call(v3SetAttr, sizeArgs(id, gen, 2))
 	if st != stOK || !d.bool() {
 		t.Fatalf("SETATTR size: %d with absent pre-op attributes", st)
 	}

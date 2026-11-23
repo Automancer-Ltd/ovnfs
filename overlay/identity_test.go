@@ -2,10 +2,12 @@ package overlay
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/stencil-hq/ovnfs/internal/ident"
 )
@@ -288,6 +290,52 @@ func TestHardLinkCopyLeavesIdentity(t *testing.T) {
 		t.Fatalf("b has identity %#x, had %#x", id, shared)
 	}
 	assertLocated(t, f, shared, "b", true)
+}
+
+func TestRenameOverSplitBottomHardlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows metadata has no link count")
+	}
+	memories(t, func(t *testing.T, mem func() *Memory) {
+		lower := tree(t, map[string]string{"target/app": "original"})
+		for _, alias := range []string{"target/deps", "other"} {
+			must(t, os.Link(filepath.Join(lower, "target/app"), filepath.Join(lower, alias)))
+		}
+		f, err := New(t.TempDir(), nil, dirBottom{lower}, mem())
+		must(t, err)
+		shared := idOf(t, f, "target/app")
+		held, err := f.Open("target/deps")
+		must(t, err)
+		defer held.Close()
+		must(t, f.Rename("target", "old"))
+		write(t, f, "old/app", "rebuilt", os.O_WRONLY|os.O_TRUNC)
+		must(t, f.Rename("old/app", "old/deps"))
+		assertGone(t, f, "old/app")
+		assertLocated(t, f, shared, "old/deps", true)
+		if got := read(t, f, "old/deps"); got != "rebuilt" {
+			t.Fatalf("replacement = %q", got)
+		}
+		data, err := io.ReadAll(held)
+		must(t, err)
+		if string(data) != "original" {
+			t.Fatalf("descriptor on replaced file reads %q", data)
+		}
+
+		// A cold index must not resolve the shared ID to an unchanged alias
+		// just because the bottom happens to return that name.
+		must(t, f.Flush())
+		f.Cool(time.Now().Add(time.Hour))
+		assertLocated(t, f, shared, "old/deps", true)
+
+		// A freeze must not make the shared ID available for another copy.
+		next, err := New(t.TempDir(), []*Layer{freezeForTest(t, f)}, dirBottom{lower}, mem())
+		must(t, err)
+		write(t, next, "other", "third", os.O_WRONLY|os.O_TRUNC)
+		if got := idOf(t, next, "other"); got == shared {
+			t.Fatal("new copy claimed the identity of the frozen replacement")
+		}
+		assertLocated(t, next, shared, "old/deps", true)
+	})
 }
 
 // imitateReuse makes overlays opened during the test treat their volume as

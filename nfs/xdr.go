@@ -97,7 +97,7 @@ type encoder struct {
 	// NFSv3 reply state; nil for callback and test encoders.
 	sizes                     *clientReportedSizes
 	maxSizes                  *maxReportedSizes
-	sizeID, size              uint64
+	sizeID, size, sampled     uint64
 	sizePending, sizeAccepted bool
 }
 

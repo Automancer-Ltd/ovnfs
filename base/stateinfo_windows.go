@@ -48,8 +48,7 @@ func (l *locator) listedInfo(info os.FileInfo, host, dir string) os.FileInfo {
 
 // locate checks the remembered name against the current fenced or snapshot view.
 func (c *Caches) locate(_ *Base, ino uint64, shown func(string) bool) (string, bool) {
-	p, ok := c.locator.memo.get(ino)
-	return p, ok && shown(p)
+	return c.locator.memo.find(ino, shown)
 }
 
 // snapshotInfo is the metadata of an entry below a root with its identity read on demand.
