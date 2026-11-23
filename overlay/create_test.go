@@ -31,7 +31,7 @@ func TestCreateWithChosenID(t *testing.T) {
 				t.Fatalf("AllocIDs = %v, %d", first, n)
 			}
 			id := func(i uint64) ident.ID { v, _ := ident.New(ident.Synthetic, first.Value()+i); return v }
-			mtime := time.Unix(1_700_000_000, 123456789)
+			mtime := time.Unix(1_700_000_000, 123456700) // in 100 ns steps, as NTFS keeps times
 			info, err := f.CreateFile("d/a", 0o640, id(0), mtime, []byte("contents"))
 			must(t, err)
 			if got, _ := ident.Of(info); got != id(0) || info.Size() != 8 || !info.ModTime().Equal(mtime) || info.Mode().Perm() != 0o640 {
