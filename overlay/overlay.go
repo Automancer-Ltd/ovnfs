@@ -1438,17 +1438,6 @@ retry:
 	if inPlace && f.hostFile(src) && f.lazyDirs() && (derr != nil || f.hostFile(dst) && dstAlias == "") {
 		return f.renameOutside(src, dst, dinfo)
 	}
-	if origin != "" {
-		// What a memory file below src shadows of the levels below would show
-		// under the new name after a crash: such files go to disk first.
-		linked, err := f.spillBelow(src)
-		if err != nil {
-			return err
-		}
-		if linked {
-			goto retry // after the queued links of their other names
-		}
-	}
 	if !sinfo.IsDir() {
 		err = f.copyUp(src)
 	} else {
@@ -1461,7 +1450,10 @@ retry:
 		return err
 	}
 	if origin != "" {
-		// The marker moves with the directory: a crash leaves it at either name.
+		// The markers move with the directory: a crash leaves them at either name.
+		if err := f.markBelow(src); err != nil {
+			return err
+		}
 		if err := f.setRedirect(src, origin); err != nil {
 			return err
 		}
@@ -1769,28 +1761,40 @@ func (f *FS) setRedirect(p, origin string) error {
 	})
 }
 
-// spillBelow moves every memory file named at or below directory p to disk
-// under that name, reporting whether one had other names, which follow as
-// queued links. The caller waited for the host changes on p.
-func (f *FS) spillBelow(p string) (bool, error) {
-	var below []string
-	for q := range f.files {
-		if q == p || strings.HasPrefix(q, p+"/") {
-			below = append(below, q)
+// markBelow gives each name at or below directory p of a memory file that
+// a lower level also holds a deletion marker on disk, kept until the file
+// spills ([memFile.marked]): a crash would otherwise show what the file
+// shadows, and under a directory renamed with a redirect at a name it never
+// had. Unlike a spill it opens no host file below p, which Windows would
+// refuse to rename then. The caller waited for the host changes on p.
+func (f *FS) markBelow(p string) error {
+	for q, m := range f.files {
+		if q != p && !strings.HasPrefix(q, p+"/") || m.markedAt(q) {
+			continue
 		}
+		lower, err := f.lowerHas(q)
+		if err != nil {
+			return err
+		}
+		if !lower {
+			continue
+		}
+		if err := f.ensureDir(parent(q)); err != nil {
+			return err
+		}
+		err = f.preserveDirTime(parent(q), func() error {
+			fh, err := os.OpenFile(f.whiteoutPath(q), os.O_CREATE|os.O_WRONLY, 0o644)
+			if err != nil {
+				return err
+			}
+			return fh.Close()
+		})
+		if err != nil {
+			return err
+		}
+		m.setMarked(q, true)
 	}
-	linked := false
-	for _, q := range below {
-		m := f.files[q]
-		if m == nil {
-			continue // spilled under another of its names
-		}
-		linked = linked || len(m.others) != 0
-		if err := f.spillAs(m, q); err != nil {
-			return linked, err
-		}
-	}
-	return linked, nil
+	return nil
 }
 
 // placeRedirect settles directory p, renamed with its redirect, at its new
