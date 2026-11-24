@@ -650,3 +650,32 @@ func TestSpecialNodes(t *testing.T) {
 		}
 	}
 }
+
+// TestListingDoesNotUndoWrites checks that READDIRPLUS reports attributes as
+// they are when the kernel asks, not as they were when the directory was
+// opened: a watcher that opens a new directory, then lists it after a file in
+// it was written, must not reset the kernel's cached size, or the writer's
+// next read of its own file comes back empty (Vite's manifest read by astro).
+func TestListingDoesNotUndoWrites(t *testing.T) {
+	f := newFixture(t, map[string]string{"file": "lower"})
+	if err := os.Mkdir(f.path("alpha/out"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	name := f.path("alpha/out/manifest.json")
+	if err := os.WriteFile(name, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.Open(f.path("alpha/out")) // the listing is taken now, at size 0
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	want := `{"entry":{"file":"entry.js"}}`
+	if err := os.WriteFile(name, []byte(want), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dir.ReadDir(-1); err != nil { // first read at offset 0: READDIRPLUS
+		t.Fatal(err)
+	}
+	f.read(t, "alpha/out/manifest.json", want)
+}
