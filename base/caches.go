@@ -76,10 +76,13 @@ type Caches struct {
 	// in tree. The copies never change, so a proof never expires.
 	proofsMu  sync.Mutex
 	proofs    map[string]bool
-	locator   locator       // resolves State identities to view paths (platform)
-	seen      fencedMemo    // pre-fence metadata of cache-root files handed out
-	heldFiles heldRecord    // the cache-root files the fence showed, with their sums, for a link change past it (held.go)
-	walked    chan struct{} // closed once the walk of the cache roots ended
+	locator   locator    // resolves State identities to view paths (platform)
+	seen      fencedMemo // pre-fence metadata of cache-root files handed out
+	heldFiles heldRecord // the cache-root files the fence showed, with their sums, for a link change past it (held.go)
+	// walked is closed once the walk of the cache roots ended; walking says
+	// a walk was started, as [Base.TakeCaches] does for a shared folder.
+	walking atomic.Bool
+	walked  chan struct{}
 }
 
 // cacheRoot is a local root the snapshot holds, as the folder had it when the
@@ -125,6 +128,9 @@ func (b *Base) TakeCaches(id string) *Caches {
 			b.fault(fmt.Sprintf("cache snapshot %s: %v; cache roots start empty", id, err))
 		}
 		c.fence.at = at
+	}
+	if c.shared() {
+		c.walking.Store(true)
 	}
 	b.serve(c)
 	go c.take(b)

@@ -426,7 +426,9 @@ func (b *Base) Close() error {
 			// the cache roots its record, below the base's storage: both end
 			// before its files close.
 			c.Wait()
-			<-c.walked
+			if c.walking.Load() {
+				<-c.walked
+			}
 			c.files.close()
 		}
 		b.closeErr = errors.Join(errs...)
