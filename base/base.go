@@ -422,9 +422,13 @@ func (b *Base) Close() error {
 		}
 		b.objectsMu.Unlock()
 		for _, c := range b.served() {
-			// A snapshot being taken still writes its tree, below the
-			// base's storage: it ends before its files close.
+			// A snapshot being taken still writes its tree, and its walk of
+			// the cache roots its record, below the base's storage: both end
+			// before its files close.
 			c.Wait()
+			if c.walking.Load() {
+				<-c.walked
+			}
 			c.files.close()
 		}
 		b.closeErr = errors.Join(errs...)

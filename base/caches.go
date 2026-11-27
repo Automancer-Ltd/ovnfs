@@ -74,10 +74,15 @@ type Caches struct {
 	roots map[string]cacheRoot // the local roots the snapshot holds; written before listed closes
 	// proofs holds directories below a local root proven real (no symlink)
 	// in tree. The copies never change, so a proof never expires.
-	proofsMu sync.Mutex
-	proofs   map[string]bool
-	locator  locator    // resolves State identities to view paths (platform)
-	seen     fencedMemo // pre-fence metadata of cache-root files handed out
+	proofsMu  sync.Mutex
+	proofs    map[string]bool
+	locator   locator    // resolves State identities to view paths (platform)
+	seen      fencedMemo // pre-fence metadata of cache-root files handed out
+	heldFiles heldRecord // the cache-root files the fence showed, with their sums, for a link change past it (held.go)
+	// walked is closed once the walk of the cache roots ended; walking says
+	// a walk was started, as [Base.TakeCaches] does for a shared folder.
+	walking atomic.Bool
+	walked  chan struct{}
 }
 
 // cacheRoot is a local root the snapshot holds, as the folder had it when the
@@ -99,7 +104,7 @@ func (c *Caches) Wait() { <-c.done }
 func (b *Base) newCaches(id string) *Caches {
 	dir := filepath.Join(b.config.StateDir, cachesDir, id)
 	t := filepath.Join(dir, treeDir)
-	c := &Caches{id: id, dir: dir, tree: t, files: newTree(t), locator: newLocator(b.config.StateDir), listed: make(chan struct{}), done: make(chan struct{})}
+	c := &Caches{id: id, dir: dir, tree: t, files: newTree(t), locator: newLocator(b.config.StateDir), listed: make(chan struct{}), done: make(chan struct{}), walked: make(chan struct{})}
 	folder, errFolder := volumeID(b.meta.Dir)
 	if state, errState := volumeID(b.config.StateDir); errFolder == nil && errState == nil && folder == state {
 		c.fence.volume = folder
@@ -124,8 +129,16 @@ func (b *Base) TakeCaches(id string) *Caches {
 		}
 		c.fence.at = at
 	}
+	if c.shared() {
+		c.walking.Store(true)
+	}
 	b.serve(c)
 	go c.take(b)
+	if c.shared() {
+		go c.walk(b)
+	} else {
+		close(c.walked)
+	}
 	return c
 }
 
@@ -219,8 +232,10 @@ func (b *Base) OpenCaches(id string) *Caches {
 	}
 	if c.shared() {
 		c.fence.at = c.stamped()
+		c.heldLoad()
 	}
 	close(c.listed)
+	close(c.walked)
 	c.ready.Store(true)
 	close(c.done)
 	b.serve(c)

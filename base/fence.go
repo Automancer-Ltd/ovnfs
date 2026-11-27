@@ -30,7 +30,10 @@ import (
 //     so its change time says nothing;
 //   - an entry the folder rewrites, replaces or removes afterwards leaves
 //     the checkout, as an evicted cache entry would. It never changes there,
-//     and nothing the folder makes later appears.
+//     and nothing the folder makes later appears. Another name linked to a
+//     file, or unlinked from it, changes no byte of it: the snapshot's record
+//     of the files it showed keeps such a file in the checkout (see
+//     [heldRecord]).
 //
 // So a host build never hands a checkout output newer than the checkout's own
 // sources, which build tools that trust mtimes, such as cargo, would take for
@@ -135,9 +138,12 @@ func (v bottom) fenced(p, root string, n uint32) (entry, error) {
 	host := b.lower(p)
 	info, err := hostfile.Lstat(host)
 	if err != nil {
+		if os.IsNotExist(err) && f.at != 0 {
+			v.c.forget(p)
+		}
 		return entry{}, inView("lstat", p, err)
 	}
-	if f.at == 0 && !info.IsDir() || f.at != 0 && !f.shows(host, info) {
+	if f.at == 0 && !info.IsDir() || f.at != 0 && !v.shows(p, host, info) {
 		return entry{}, absent(p)
 	}
 	e := entry{host: host, folder: info, n: n, fenced: true}
@@ -150,6 +156,14 @@ func (v bottom) fenced(p, root string, n uint32) (entry, error) {
 		}
 	}
 	return e, nil
+}
+
+// shows reports whether the view shows the folder's entry that info, its lstat
+// data, describes at host, at view path p below a cache root: the fence does,
+// or the record does, for a file past it that is still the one it summed (see
+// [heldRecord]).
+func (v bottom) shows(p, host string, info os.FileInfo) bool {
+	return v.c.fence.shows(host, info) || v.c.held(p, host, info, nil)
 }
 
 // fencedDir lists directory p, at or below a cache root: the folder's
@@ -186,6 +200,14 @@ func (v bottom) fencedDir(p string) ([]os.FileInfo, error) {
 				li = v.c.rememberFenced(p+"/"+info.Name(), li)
 			}
 			out = append(out, li)
+			continue
+		}
+		if info.IsDir() {
+			continue
+		}
+		child := p + "/" + info.Name()
+		if v.c.held(child, filepath.Join(dir, e.Name()), info, nil) {
+			out = append(out, v.c.rememberFenced(child, v.c.locator.listedInfo(info, host, p)))
 		}
 	}
 	return out, nil
@@ -193,30 +215,52 @@ func (v bottom) fencedDir(p string) ([]os.FileInfo, error) {
 
 // openFenced opens the regular folder file that e, from [bottom.fenced] of
 // p, describes. The folder may have changed it since that lookup: the open
-// file must be the one looked up and still shown.
+// file must be the one looked up and still shown, its bytes summed through
+// the descriptor itself when it is past the fence.
 func (v bottom) openFenced(p string, e entry) (overlay.Content, error) {
-	f := v.c.fence
 	file, err := hostfile.Open(e.host)
 	if err != nil {
 		return nil, inView("open", p, err)
 	}
 	opened, err := file.Stat()
-	if err != nil || !os.SameFile(e.folder, opened) || !f.shows(e.host, opened) {
+	if err != nil || !os.SameFile(e.folder, opened) {
 		file.Close()
 		return nil, absent(p)
 	}
-	return &fencedFile{file: file, path: p, before: f.at}, nil
+	f := &fencedFile{file: file, path: p, before: v.c.fence.at}
+	if !v.c.fence.shows(e.host, opened) && !v.c.held(p, e.host, opened, file) {
+		file.Close()
+		return nil, absent(p)
+	}
+	// A read past the fence is whole only as the record has the open file.
+	if old, there := v.c.heldFiles.get(p); there && old.same(heldEntryOfOrZero(opened)) {
+		f.held = &heldState{entry: old, sum: old.sum}
+		f.held.answered, _ = fsys.FileChangeTime(file)
+	}
+	return f, nil
 }
 
 // fencedFile is an open folder file below a cache root. Its entry leaves the
 // view when the folder changes it. Once its inode crosses the fence a read
-// fails with ESTALE, even if a writer restored the size and mtime.
+// fails with ESTALE, even if a writer restored the size and mtime, unless the
+// record sums the descriptor's bytes to the file it showed (see [heldRecord]).
 type fencedFile struct {
 	// file is no embedded field: none of its methods may reach the content
 	// past the checks below, as its WriteTo would for an io.Copy.
 	file   *os.File
 	path   string // in the view, for errors
 	before int64  // exclusive change-time fence
+	// held is set when the record holds the open file; then a read past the
+	// fence may still be whole (see [heldState]).
+	held *heldState
+}
+
+// heldState is what the record holds for an open file: its entry and sum, and
+// the change time its reads answered at last.
+type heldState struct {
+	entry    heldEntry
+	sum      [sumSize]byte
+	answered int64
 }
 
 // Read reads at the file's offset; see [fencedFile.intact].
@@ -246,11 +290,28 @@ func (f *fencedFile) Seek(offset int64, whence int) (int64, error) {
 func (f *fencedFile) Close() error { return f.file.Close() }
 
 // intact checks the open inode after reading or cloning, before publishing
-// any bytes. An unlink that advances ctime invalidates the handle too.
+// any bytes. An unlink that advances ctime invalidates the handle too, unless
+// the record holds the file: then it is whole while it is still that entry
+// with the bytes the record summed, at the change time answered last or
+// summed again from this descriptor (see [heldRecord]).
 func (f *fencedFile) intact() error {
-	if changed, err := fsys.FileChangeTime(f.file); err != nil || changed >= f.before {
+	changed, err := fsys.FileChangeTime(f.file)
+	if err != nil {
 		return &fs.PathError{Op: "read", Path: f.path, Err: syscall.ESTALE}
 	}
+	if changed < f.before {
+		return nil
+	}
+	if f.held == nil {
+		return &fs.PathError{Op: "read", Path: f.path, Err: syscall.ESTALE}
+	}
+	if changed == f.held.answered {
+		return nil
+	}
+	if sum, err := sumOf(f.file, f.held.entry); err != nil || sum != f.held.sum {
+		return &fs.PathError{Op: "read", Path: f.path, Err: syscall.ESTALE}
+	}
+	f.held.answered = changed
 	return nil
 }
 
