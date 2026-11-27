@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sync"
 	"syscall"
@@ -178,6 +179,121 @@ func TestFencedFileNeverChangesUnderAReader(t *testing.T) {
 		t.Errorf("read of a replaced file = %q, %v; want the opened bytes or ESTALE", buf[:n], err)
 	}
 	gone(t, view, "changed after the fence", "target/rewritten", "target/replaced", "target/replaced.tmp")
+}
+
+// TestFencedFileStaysWhenTheFolderRelinks keeps a cache-root file in the
+// view while the folder only links another name to it or unlinks one: read
+// before the link or never read, through an open handle, in listings, and
+// after a restart from the snapshot's kept record (t27557; a package tree is
+// hard-linked, so a backup or a removed worktree moves every change time).
+// Nothing else changes: a file made after the fence stays out, a replaced or
+// rewritten file leaves, and a link count that returns to the last one
+// answered before the view looks again explains nothing.
+func TestFencedFileStaysWhenTheFolderRelinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a Windows stat carries no link count")
+	}
+	repo, dir := repository(t)
+	pkg := filepath.Join(dir, "node_modules", "pkg")
+	for _, name := range []string{"index.js", "never-read.js", "net.js", "replaced.js", "both.js", "stored.js", "rewritten.js"} {
+		writeTestFile(t, filepath.Join(pkg, name), "v1")
+	}
+	links := filepath.Join(dir, "links")
+	writeTestFile(t, filepath.Join(links, ".keep"), "")
+	b, config := createTestBase(t, repo, nil)
+	c := b.TakeCaches("c1")
+	<-c.walked
+	c.Wait()
+	view := b.Bottom(c)
+	if got := read(t, view, "node_modules/pkg/index.js"); got != "v1" {
+		t.Fatalf("index.js before the link = %q", got)
+	}
+	handle, err := view.Open("node_modules/pkg/net.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+
+	for _, name := range []string{"index.js", "never-read.js", "net.js"} {
+		if err := os.Link(filepath.Join(pkg, name), filepath.Join(links, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	buf := make([]byte, 8)
+	if n, err := handle.ReadAt(buf, 0); string(buf[:n]) != "v1" || err != io.EOF {
+		t.Errorf("read of a file linked to after the open = %q, %v; want v1, EOF", buf[:n], err)
+	}
+	for _, name := range []string{"index.js", "never-read.js", "net.js"} {
+		if got := read(t, view, "node_modules/pkg/"+name); got != "v1" {
+			t.Errorf("%s after the folder linked another name to it = %q, want v1", name, got)
+		}
+	}
+
+	// The other name goes again: the count differs from the one answered last.
+	if err := os.Remove(filepath.Join(links, "index.js")); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, view, "node_modules/pkg/index.js"); got != "v1" {
+		t.Errorf("index.js after the other name was unlinked = %q, want v1", got)
+	}
+	writeTestFile(t, filepath.Join(pkg, "added.js"), "added")
+	writeTestFile(t, filepath.Join(pkg, "replaced.tmp"), "v2")
+	if err := hostfile.Rename(filepath.Join(pkg, "replaced.tmp"), filepath.Join(pkg, "replaced.js")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(filepath.Join(pkg, "both.js"), filepath.Join(links, "both.js")); err != nil {
+		t.Fatal(err)
+	}
+	// A rewrite in place that restores the size and mtime, with a link change
+	// beside it, still leaves the view: the bytes are not the ones the snapshot summed.
+	inPlace := filepath.Join(pkg, "rewritten.js")
+	info, err := os.Stat(inPlace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stamp := info.ModTime()
+	if err := os.WriteFile(inPlace, []byte("v2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := hostfile.Lchtimes(inPlace, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(inPlace, filepath.Join(links, "rewritten.js")); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"index.js", "never-read.js", "net.js", "both.js"} {
+		if got := names(t, view, "node_modules/pkg"); !slices.Contains(got, name) {
+			t.Errorf("listing after the links lacks %s: %v", name, got)
+		}
+	}
+	// The other name goes again before the view ever looked: the bytes are the same.
+	if err := os.Remove(filepath.Join(links, "both.js")); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, view, "node_modules/pkg/both.js"); got != "v1" {
+		t.Errorf("both.js, linked and unlinked again before the view looked = %q, want v1", got)
+	}
+	gone(t, view, "added, replaced, or rewritten in place with the size and mtime restored",
+		"node_modules/pkg/added.js", "node_modules/pkg/replaced.js", "node_modules/pkg/replaced.tmp", "node_modules/pkg/rewritten.js")
+	if got := names(t, view, "node_modules/pkg"); slices.Contains(got, "added.js") || slices.Contains(got, "rewritten.js") || slices.Contains(got, "replaced.js") {
+		t.Errorf("listing shows an added, replaced or rewritten file: %v", got)
+	}
+
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, err = Open(config, b.Meta())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	view = b.Bottom(b.OpenCaches("c1"))
+	if err := os.Link(filepath.Join(pkg, "stored.js"), filepath.Join(links, "stored.js")); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, view, "node_modules/pkg/stored.js"); got != "v1" {
+		t.Errorf("stored.js, linked after a restart and never read before it = %q, want v1", got)
+	}
 }
 
 // TestCacheRootsOnAnotherVolume starts cache roots empty and copies local
